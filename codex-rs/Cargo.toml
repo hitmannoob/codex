@@ -5,6 +5,7 @@ members = [
     "agent-graph-store",
     "agent-identity",
     "agent-roles",
+    "agents-api",
     "backend-client",
     "bwrap",
     "build-info",
