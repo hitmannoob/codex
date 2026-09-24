@@ -3,14 +3,38 @@ use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use serde::Deserialize;
+use serde::Serialize;
 use std::fs::File;
 use std::process::ExitStatus;
 use std::process::Stdio;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::process::Child;
 use tokio::process::Command;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+const RECLAIM_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+/// File in the worker home that records which process currently owns it, so a
+/// worker orphaned by an API-process crash can be found and reclaimed.
+const WORKER_RECORD: &str = "agents-api-worker.json";
+
+/// Durable identity of the managed worker owning a home. The PID alone is
+/// insufficient to reclaim an orphan because PIDs are reused; `start_time`
+/// authenticates that a live PID is still the same process we spawned.
+#[derive(Serialize, Deserialize)]
+struct OwnershipRecord {
+    pid: u32,
+    start_time: u64,
+}
+
+/// Liveness and identity of a probed process. `zombie` distinguishes a process
+/// still executing from one that has exited but is not yet reaped; a zombie no
+/// longer runs and so no longer touches the home.
+struct ProcessInfo {
+    start_time: u64,
+    zombie: bool,
+}
 
 /// Owns one local harness process, its private socket, and its persistent-home lock.
 pub(crate) struct Worker {
@@ -56,6 +80,18 @@ impl Worker {
         let child = command
             .spawn()
             .with_context(|| format!("failed to start app-server at {}", executable.display()))?;
+        // Record this worker's authenticated identity so a later API process can
+        // reclaim it if this one crashes before shutting it down. Best-effort:
+        // a missing record only forgoes reclaim, never correctness while live.
+        if let Some(pid) = child.id()
+            && let Some(info) = probe(pid)
+            && let Ok(bytes) = serde_json::to_vec(&OwnershipRecord {
+                pid,
+                start_time: info.start_time,
+            })
+        {
+            let _ = std::fs::write(home.join(WORKER_RECORD).as_path(), bytes);
+        }
         Ok(Self {
             child,
             socket,
@@ -173,3 +209,93 @@ pub(crate) async fn worker_exit(worker: &mut Option<Worker>) -> anyhow::Result<(
         None => std::future::pending().await,
     }
 }
+
+/// Reclaim a worker orphaned by an API-process crash before starting a new one.
+///
+/// A crash (for example SIGKILL of the API) skips graceful shutdown, so the
+/// managed worker keeps running against this home with no owner and its home
+/// lock is released; starting a second worker would then let two app-servers
+/// write one home. The ownership record authenticates the orphan by PID and
+/// start time: a live match is SIGKILLed and awaited until it no longer runs,
+/// so the home is exclusively ours before we spawn. A missing, stale, or
+/// PID-reused record signals no process and is simply cleared. Only managed
+/// startup calls this; an externally owned worker is never recorded or touched.
+pub(crate) async fn reclaim_orphan(home: &AbsolutePathBuf) -> anyhow::Result<()> {
+    let record_path = home.join(WORKER_RECORD);
+    let Ok(bytes) = std::fs::read(record_path.as_path()) else {
+        return Ok(());
+    };
+    if let Ok(record) = serde_json::from_slice::<OwnershipRecord>(&bytes)
+        && probe(record.pid)
+            .is_some_and(|info| !info.zombie && info.start_time == record.start_time)
+    {
+        eprintln!(
+            "agents-api: reclaiming worker pid={} orphaned by a prior API crash",
+            record.pid
+        );
+        terminate(record.pid);
+        let deadline = Instant::now() + RECLAIM_TIMEOUT;
+        while Instant::now() < deadline
+            && probe(record.pid)
+                .is_some_and(|info| !info.zombie && info.start_time == record.start_time)
+        {
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 50)).await;
+        }
+    }
+    let _ = std::fs::remove_file(record_path.as_path());
+    Ok(())
+}
+
+/// Read a process's start time and whether it has become a zombie, or `None`
+/// when no such process exists. Start time authenticates against PID reuse.
+#[cfg(target_os = "linux")]
+fn probe(pid: u32) -> Option<ProcessInfo> {
+    // /proc/<pid>/stat: fields after the final ')' start at the state field;
+    // start time is field 22 overall, i.e. index 19 among those fields.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some(ProcessInfo {
+        start_time: fields.get(/*starttime*/ 19)?.parse().ok()?,
+        zombie: fields.first().is_some_and(|state| *state == "Z"),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn probe(pid: u32) -> Option<ProcessInfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: fills a zeroed proc_bsdinfo of the size passed for the given pid.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            /*arg*/ 0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (written == size).then_some(ProcessInfo {
+        start_time: info.pbi_start_tvsec,
+        zombie: info.pbi_status == libc::SZOMB,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe(_pid: u32) -> Option<ProcessInfo> {
+    // Without an authenticated probe this platform cannot safely reclaim an
+    // orphan; startup falls back to the home lock alone.
+    None
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: sends SIGKILL to a PID authenticated as our orphaned worker.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate(_pid: u32) {}

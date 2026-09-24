@@ -12,26 +12,11 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub(crate) async fn initialize(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS public_sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL)",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS public_records (seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, turn_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(session_id, kind, id))").execute(pool).await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS public_records_page ON public_records(session_id, kind, seq)",
-    )
-    .execute(pool)
-    .await?;
-    disconnected(pool).await
-}
-
 pub(crate) async fn disconnected(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("UPDATE public_sessions SET data = json_set(data, '$.status', 'failed', '$.error', 'backend connection lost') WHERE json_extract(data, '$.status') IN ('in_progress', 'requires_action')").execute(&mut *tx).await?;
     sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'failed', '$.completed_at', ?, '$.error', json(?)) WHERE kind = 'turn' AND json_extract(data, '$.status') IN ('queued', 'in_progress', 'waiting')")
-        .bind(crate::contract::now() as i64).bind(json!({"code":"connection_failed","message":"backend connection lost"}).to_string()).execute(&mut *tx).await?;
+        .bind(crate::contract::now() as i64).bind(json!({"code":crate::reconcile::CONNECTION_LOST_CODE,"message":"backend connection lost"}).to_string()).execute(&mut *tx).await?;
     sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'incomplete') WHERE kind = 'item' AND json_extract(data, '$.status') = 'in_progress'").execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

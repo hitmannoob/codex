@@ -37,8 +37,8 @@ pub(crate) async fn submit(
         ));
     }
     let (reply, received) = oneshot::channel();
-    state
-        .submissions
+    let submissions = state.submissions().ok_or_else(crate::disconnected_error)?;
+    submissions
         .send(Submission {
             session_id,
             turn_id,
@@ -46,12 +46,7 @@ pub(crate) async fn submit(
             reply,
         })
         .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "app-server disconnected".into(),
-            )
-        })?;
+        .map_err(|_| crate::disconnected_error())?;
     received
         .await
         .map_err(|_| {
@@ -113,6 +108,10 @@ pub(crate) async fn resolve(state: &State, client: &AppServerClient, submission:
     let _ = submission.reply.send(result);
 }
 
+// Runs inside the connection's pump task, which is the sole processor of its
+// submissions and holds the matching `client`. The pump exits before any
+// replacement connection is installed, so this delivery cannot cross into a
+// different backend generation.
 async fn deliver(
     state: &State,
     client: &AppServerClient,

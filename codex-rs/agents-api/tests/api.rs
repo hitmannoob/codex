@@ -330,3 +330,9 @@ mod capabilities;
 
 #[path = "suite/contract.rs"]
 mod contract;
+
+#[path = "suite/reconnect.rs"]
+mod reconnect;
+
+#[path = "suite/reconcile_functions.rs"]
+mod reconcile_functions;

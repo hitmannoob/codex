@@ -2,11 +2,13 @@
 
 A local HTTP facade over a dedicated Codex app-server from this checkout.
 Agent definitions and session bindings live in `agents-api.sqlite`; Codex owns
-the execution history. Normalized API turns and items also live in SQLite. Run one API process per data directory and retain the
-app-server's `CODEX_HOME` alongside it. The text/function session path implements a subset of the OpenAI wire contract,
-pinned to the official Python SDK 3.17.0. Full compatibility remains incomplete. The target is documented function-for-function parity; see
-[the parity plan](PARITY.md) for the contract and gaps, and
-[GOALS.md](GOALS.md) for detailed implementation steps and acceptance criteria.
+the execution history. Normalized API turns and items also live in SQLite. Run
+one API process per data directory and retain the app-server's `CODEX_HOME`
+alongside it. The text/function session path implements a subset of the OpenAI
+wire contract, pinned to the official Python SDK 3.17.0. Full compatibility
+remains incomplete. The target is documented function-for-function parity; see
+the [contract inventory](CONTRACT_INVENTORY.md), [parity plan](PARITY.md), and
+[implementation goals](GOALS.md).
 
 Build both binaries, then start the API. It launches one app-server shared by its sessions:
 
@@ -32,10 +34,26 @@ worker grace period before forced termination and reaping. Shutdown can interrup
 active turns; it does not promise to finish them. Completed sessions can resume
 using the retained API data directory and worker home.
 
-Unexpected managed-worker exit stops the API with an error. This stage does not
-restart workers or replay interrupted work. OS-forced API termination (for example,
-SIGKILL), orphan adoption, and crash recovery are not yet managed. This worker is
-the Codex harness; it does not provision a sandbox or launch a separate executor.
+Unexpected managed-worker exit no longer stops the CLI. A supervisor reaps the
+crashed worker and respawns it with bounded attempts and exponential backoff,
+completes the initialization handshake, and reattaches it via
+`AgentsApi::reconnect`; the process exits only if restarts are exhausted.
+Throughout the gap, saved history stays readable, mutations return 503
+`app-server disconnected`, pending function calls become `unresolvedActions`,
+and stale callbacks cannot resolve the replacement's work. Interrupted work is
+not replayed. Externally managed workers are never restarted.
+
+An API-process crash (for example SIGKILL of the API itself) skips graceful
+shutdown, orphaning the managed worker. On Unix, the next managed start reclaims
+it before spawning: an ownership record written at spawn time
+(`agents-api-worker.json` in the worker home, holding the worker PID and its
+process start time) is re-read, and a live process matching both PID and start
+time — the start time defeats PID reuse — is terminated and awaited so two
+app-servers never share one home. A stale or reused record is cleared without
+signaling anything. Windows orphan containment is not yet implemented, and this
+reclaim applies only to managed workers, never to an external worker. This worker
+is the Codex harness; it does not provision a sandbox or launch a separate
+executor.
 
 To use an externally managed worker, retain the explicit socket mode:
 
@@ -90,10 +108,12 @@ The runtime tests require the real `codex-app-server` binary: build it with the
 command above before `just test -p codex-agents-api`. They exercise the actual
 socket handshake, readiness timeout, process exit, home ownership, and shutdown.
 Unix CLI tests additionally cover managed session execution and resume across
-process restarts, and preservation of external workers.
+process restarts, managed-worker crash recovery with automatic restart, and
+preservation of external workers.
 
-The Python SDK acceptance test is optional in the default Rust suite because it
-requires an external Python environment. Run it explicitly with:
+The Python SDK inventory and lifecycle tests are optional in the default Rust
+suite because they require an external Python environment. Run them explicitly
+with:
 
 ```sh
 uv venv /tmp/codex-agents-api-sdk
@@ -101,9 +121,11 @@ uv pip install --python /tmp/codex-agents-api-sdk/bin/python openai==3.17.0
 CODEX_AGENTS_API_SDK_PYTHON=/tmp/codex-agents-api-sdk/bin/python just test -p codex-agents-api --run-ignored all
 ```
 
-It uses strict SDK response validation against real in-process Codex with a mock
-model, and covers reconnect, function success/error, pagination, cancellation,
-snapshot overrides, and completed-session resume after service restart.
+The inventory test detects drift in the pinned SDK resource surface. The
+lifecycle test uses strict SDK response validation against real in-process Codex
+with a mock model, and covers reconnect, function success/error, pagination,
+cancellation, snapshot overrides, and completed-session resume after service
+restart.
 
 ## Original prototype routes
 
@@ -120,9 +142,10 @@ snapshot overrides, and completed-session resume after service restart.
 | POST | `/v1/sessions/{id}/turns/{turnId}/tool-results` | `{ "callId": "…", "success": true, "output": { "status": "shipped" } }` → submission receipt |
 
 Subscribe before submitting input. Streams are live-only, with a 128-event
-buffer; `stream/lagged` means retrieve saved turns. A disconnect requires
-restarting the API connection and reading saved outcomes before retrying input.
-Input requests are not deduplicated. Canceling a turn does not undo tool effects.
+buffer; `stream/lagged` means retrieve saved turns. After `stream/disconnected`,
+saved reads keep working and mutations return 503 until a replacement backend
+is attached; read saved outcomes before retrying input. Input requests are not
+deduplicated. Canceling a turn does not undo tool effects.
 
 Agents are immutable. An Agent can additionally specify:
 
@@ -175,8 +198,13 @@ cancelled, or unavailable calls return 409. Wrong session/turn/call IDs return 4
 `submitted` means the result was handed to the app-server connection, not that
 the turn completed or external side effects executed exactly once. Pending calls
 whose connection is lost appear in `unresolvedActions`, including after restart;
-their old JSON-RPC waiters cannot be restored from SQLite. Reconcile saved turn
-history before issuing more work. No tool call or result is automatically replayed.
+their old JSON-RPC waiters cannot be restored from SQLite. No tool call or result
+is automatically replayed. On reconnect, calls left uncertain by a disconnect are
+reconciled against authoritative rollout history: a call whose turn is now
+`completed` must have delivered (a turn cannot complete with an unresolved call),
+so its stored receipt is restored and it leaves `unresolvedActions`; any other
+turn status keeps the call unresolved for you to reconcile before issuing more
+work, and it is never claimed as delivered on incomplete evidence.
 
 `{ "type": "local", "cwd": "/absolute/workspace" }` selects the app-server's
 local executor with read-only sandboxing. `none` disables execution-environment

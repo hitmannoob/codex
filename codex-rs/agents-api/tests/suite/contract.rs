@@ -1,13 +1,34 @@
 use super::*;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use codex_utils_cargo_bin::find_resource;
 use pretty_assertions::assert_eq;
+
+#[test]
+#[ignore = "requires CODEX_AGENTS_API_SDK_PYTHON pointing to a Python with openai==3.17.0"]
+fn pinned_sdk_matches_operation_inventory() -> anyhow::Result<()> {
+    let python = std::env::var("CODEX_AGENTS_API_SDK_PYTHON")?;
+    let script = find_resource!("tests/sdk_inventory.py")?;
+    let inventory = find_resource!("CONTRACT_INVENTORY.json")?;
+    let output = std::process::Command::new(python)
+        .arg(script)
+        .arg(inventory)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "SDK inventory check failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires CODEX_AGENTS_API_SDK_PYTHON pointing to a Python with openai==3.17.0"]
 async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(/*secs*/ 45), async {
         let python = std::env::var("CODEX_AGENTS_API_SDK_PYTHON")?;
+        let script = find_resource!("tests/sdk_lifecycle.py")?;
         let home = tempfile::tempdir()?;
         let data = tempfile::tempdir()?;
         let done = create_final_assistant_message_sse_response("Done")?;
@@ -41,10 +62,7 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             .await?;
             let (base, server) = capabilities::serve(&api).await?;
             let mut command = tokio::process::Command::new(&python);
-            command
-                .arg("-c")
-                .arg(include_str!("../sdk_lifecycle.py"))
-                .arg(&base);
+            command.arg(&script).arg(&base);
             if let Some(id) = &session_id {
                 command.arg(id);
             }

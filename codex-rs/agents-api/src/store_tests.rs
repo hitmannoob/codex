@@ -49,3 +49,36 @@ async fn empty_sessions_survive_restart_with_independent_configuration() -> anyh
     reopened.0.close().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = AbsolutePathBuf::from_absolute_path(directory.path())?;
+    let store = Store::open(path.clone()).await?;
+    let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&store.0)
+        .await?;
+    assert!(applied >= 1, "baseline migration must be recorded");
+    let agent = store
+        .create_agent(AgentConfig {
+            model: "legacy-model".into(),
+            instructions: "keep me".into(),
+            ..Default::default()
+        })
+        .await?;
+    // Simulate a pre-migration database: the tables and rows exist, but there
+    // is no migration ledger. Reopening must adopt the baseline in place
+    // without recreating tables or dropping the existing row.
+    sqlx::query("DROP TABLE _sqlx_migrations")
+        .execute(&store.0)
+        .await?;
+    store.0.close().await;
+    let adopted = Store::open(path).await?;
+    let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&adopted.0)
+        .await?;
+    assert!(applied >= 1, "adoption must re-record the baseline");
+    assert_eq!(adopted.agent(&agent.id).await?, Some(agent));
+    adopted.0.close().await;
+    Ok(())
+}

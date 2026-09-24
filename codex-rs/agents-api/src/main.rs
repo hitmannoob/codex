@@ -44,10 +44,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let directory = AbsolutePathBuf::relative_to_current_dir(args.data_directory)?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let startup_timeout = Duration::from_secs(args.worker_startup_timeout_secs);
     // Register SIGTERM before starting the child, including during readiness.
     let stopping = shutdown_signal();
     tokio::pin!(stopping);
     let mut worker = None;
+    // Managed executable/home are retained so a crashed worker can be respawned;
+    // external-socket mode leaves this `None` and is never restarted.
+    let mut managed = None;
     let socket = match args.app_server_socket {
         Some(socket) => AbsolutePathBuf::relative_to_current_dir(socket)?,
         None => {
@@ -62,19 +66,23 @@ async fn main() -> anyhow::Result<()> {
                 Some(path) => AbsolutePathBuf::relative_to_current_dir(path)?,
                 None => directory.join("codex-home"),
             };
-            let owned = runtime::Worker::spawn(executable, home).await?;
+            // Reclaim a worker orphaned by a prior API-process crash before
+            // starting our own, so two app-servers never share this home.
+            runtime::reclaim_orphan(&home).await?;
+            let owned = runtime::Worker::spawn(executable.clone(), home.clone()).await?;
             eprintln!(
                 "agents-api managed worker pid={}",
                 owned.id().context("worker process ID")?
             );
             let socket = owned.socket().clone();
             worker = Some(owned);
+            managed = Some((executable, home));
             socket
         }
     };
     let serving = async {
         let client = tokio::select! {
-            result = runtime::connect(socket, Duration::from_secs(args.worker_startup_timeout_secs)) => result?,
+            result = runtime::connect(socket, startup_timeout) => result?,
             result = runtime::worker_exit(&mut worker) => return result,
             result = &mut stopping => return result,
         };
@@ -86,10 +94,30 @@ async fn main() -> anyhow::Result<()> {
                 .with_graceful_shutdown(async { let _ = stopping_http.await; })
                 .into_future(),
         );
-        let result = tokio::select! {
-            result = &mut http => result.context("HTTP server task failed").and_then(|result| result.map_err(Into::into)),
-            result = runtime::worker_exit(&mut worker) => result,
-            result = &mut stopping => result,
+        // Keep serving durable reads while a crashed managed worker is replaced.
+        // A lost worker no longer stops the process; only http failure, restart
+        // exhaustion, or a shutdown signal ends the loop.
+        let http_result = |result: Result<std::io::Result<()>, tokio::task::JoinError>| {
+            result
+                .context("HTTP server task failed")
+                .and_then(|result| result.map_err(Into::into))
+        };
+        let result: anyhow::Result<()> = loop {
+            tokio::select! {
+                result = &mut http => break http_result(result),
+                result = &mut stopping => break result,
+                _ = runtime::worker_exit(&mut worker) => {
+                    eprintln!("agents-api: managed worker exited; attempting restart");
+                    let restarted = tokio::select! {
+                        result = restart_worker(&mut worker, &api, &managed, startup_timeout) => result,
+                        result = &mut http => break http_result(result),
+                        result = &mut stopping => break result,
+                    };
+                    if let Err(error) = restarted {
+                        break Err(error);
+                    }
+                }
+            }
         };
         let _ = stop_http.send(());
         let cleanup = tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
@@ -112,6 +140,84 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("agents-api: worker cleanup failed: {error:#}");
     }
     serving.and(cleanup)
+}
+
+/// Bounded restarts prevent an unrecoverable worker from spinning forever;
+/// exhaustion ends the process so the failure is visible to an operator.
+const WORKER_RESTART_ATTEMPTS: usize = 5;
+const WORKER_RESTART_BACKOFF: Duration = Duration::from_millis(/*millis*/ 200);
+const WORKER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(/*secs*/ 5);
+
+/// Reap the crashed worker, then respawn and reattach with bounded backoff.
+///
+/// The dead worker is dropped first so its home lock and socket are released
+/// before a replacement claims them. Each replacement completes the app-server
+/// initialization handshake (via `connect`) before `reconnect` routes requests
+/// to it. Only managed workers are restarted; an external worker returns an
+/// error rather than being respawned.
+async fn restart_worker(
+    worker: &mut Option<runtime::Worker>,
+    api: &AgentsApi,
+    managed: &Option<(AbsolutePathBuf, AbsolutePathBuf)>,
+    startup_timeout: Duration,
+) -> anyhow::Result<()> {
+    let (executable, home) = match managed {
+        Some(managed) => managed,
+        None => anyhow::bail!("cannot restart an externally managed worker"),
+    };
+    if let Some(dead) = worker.take()
+        && let Err(error) = dead.shutdown().await
+    {
+        eprintln!("agents-api: reaping crashed worker failed: {error:#}");
+    }
+    let mut backoff = WORKER_RESTART_BACKOFF;
+    let mut last_error = None;
+    for attempt in 1..=WORKER_RESTART_ATTEMPTS {
+        tokio::time::sleep(backoff).await;
+        match respawn(executable, home, startup_timeout).await {
+            Ok((replacement, client)) => {
+                let pid = replacement.id().context("worker process ID")?;
+                api.reconnect(client).await?;
+                *worker = Some(replacement);
+                eprintln!("agents-api managed worker restarted pid={pid} attempt={attempt}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("agents-api: worker restart attempt {attempt} failed: {error:#}");
+                last_error = Some(error);
+                backoff = (backoff * 2).min(WORKER_RESTART_BACKOFF_MAX);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("worker restart produced no error")))
+        .context("managed worker restart attempts exhausted")
+}
+
+/// Spawn one replacement worker and connect an initialized client to it,
+/// failing fast if the fresh process exits before the handshake completes.
+async fn respawn(
+    executable: &AbsolutePathBuf,
+    home: &AbsolutePathBuf,
+    startup_timeout: Duration,
+) -> anyhow::Result<(runtime::Worker, AppServerClient)> {
+    let mut worker = Some(runtime::Worker::spawn(executable.clone(), home.clone()).await?);
+    let socket = match &worker {
+        Some(worker) => worker.socket().clone(),
+        None => anyhow::bail!("worker missing after spawn"),
+    };
+    let client = tokio::select! {
+        result = runtime::connect(socket, startup_timeout) => result?,
+        result = runtime::worker_exit(&mut worker) => {
+            return Err(result
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("worker exited during restart"))
+                .context("managed worker exited before initialization"));
+        }
+    };
+    match worker {
+        Some(worker) => Ok((worker, AppServerClient::Remote(client))),
+        None => anyhow::bail!("worker vanished during initialization"),
+    }
 }
 
 fn shutdown_signal() -> impl Future<Output = anyhow::Result<()>> {

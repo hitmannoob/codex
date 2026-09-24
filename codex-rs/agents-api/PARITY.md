@@ -5,9 +5,12 @@ using this Codex checkout as the execution engine. The existing HTTP facade is
 an implementation prototype, not the target public contract.
 
 Baseline reviewed: 2026-09-22, official Python SDK `openai==3.17.0` and the
-HTML Agents API reference. The text/function session slice now has an executable
-SDK contract check (`tests/sdk_lifecycle.py`) with strict response validation.
-This is a version-pinned acceptance baseline, not a complete schema inventory.
+official Agents API guides. The [contract inventory](CONTRACT_INVENTORY.md)
+establishes a 59-operation denominator: 43 Agents API operations and 16 Files
+and Skills operations required by documented workflows. The text/function
+session slice has an executable SDK contract check (`tests/sdk_lifecycle.py`)
+with strict response validation; `tests/sdk_inventory.py` detects drift in the
+pinned SDK resource surface.
 
 Detailed implementation steps, dependencies, and acceptance gates are maintained
 in [GOALS.md](GOALS.md).
@@ -42,7 +45,7 @@ in [GOALS.md](GOALS.md).
 | Harness features | Configurable multi-agent execution, context compaction, programmatic tool calling, skills/plugins | Codex has underlying machinery; API integration and parity tests missing |
 | Environments | None, service-hosted, self-hosted executor; connection actions and lifecycle | None or read-only local workspace |
 | Files/artifacts | Documented upload, publication, retrieval and cleanup behavior | No public implementation |
-| Webhooks, credentials, usage | Documented webhook, vault and observability operations | No corresponding public implementation; detailed inventory still required |
+| Webhooks, credentials, usage | Documented webhook, vault and observability operations | Inventoried in G00; no corresponding public implementation |
 | Service operation | Service owns the harness and saved progress | API-owned local worker startup, initialization deadline and shutdown; optional external worker; automatic restart and crash reconciliation still missing |
 
 ## Implementation sequence

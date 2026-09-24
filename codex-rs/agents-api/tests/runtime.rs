@@ -91,3 +91,11 @@ async fn missing_worker_executable_is_reported() -> anyhow::Result<()> {
 #[cfg(unix)]
 #[path = "suite/runtime_cli.rs"]
 mod runtime_cli;
+
+#[cfg(unix)]
+#[path = "suite/worker_loss.rs"]
+mod worker_loss;
+
+#[cfg(unix)]
+#[path = "suite/reconcile_recovery.rs"]
+mod reconcile_recovery;

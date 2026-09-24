@@ -301,11 +301,8 @@ async fn events(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let receiver = state.events.subscribe();
     let _ = read_session(Extract(Arc::clone(&state)), Path(id.clone())).await?;
-    if !state.connected.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "app-server disconnected".into(),
-        ));
+    if !state.connected() {
+        return Err(crate::disconnected_error());
     }
     let stream = BroadcastStream::new(receiver).filter_map(move |result| {
         let state = Arc::clone(&state);

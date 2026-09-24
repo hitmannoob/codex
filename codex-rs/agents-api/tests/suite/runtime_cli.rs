@@ -143,17 +143,105 @@ async fn api_shutdown_preserves_external_worker() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn worker_crash_stops_the_api() -> anyhow::Result<()> {
+async fn managed_worker_restarts_after_crash_and_service_continues() -> anyhow::Result<()> {
     let data = tempfile::tempdir()?;
-    let (mut api, _, pid) = start_api(data.path(), /*socket*/ None).await?;
+    let home = data.path().join("codex-home");
+    std::fs::create_dir_all(&home)?;
+    let model = create_mock_responses_server_repeating_assistant("finished").await;
+    MockResponsesConfig::new(&model.uri())
+        .with_root_config("features.plugins = false")
+        .write(&home)?;
+    let client = reqwest::Client::new();
+    let (mut api, base, pid) = start_api(data.path(), /*socket*/ None).await?;
     let pid = i32::try_from(pid.context("managed worker PID")?)?;
+    let session: Value = client
+        .post(format!("{base}/agents/sessions"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"agent":{"model":"mock-model"},"environment":{"type":"none"},"input":"Remember orange-731"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let id = session["id"].as_str().context("session id")?;
+    let url = format!("{base}/agents/sessions/{id}");
+    turns(&client, &url, /*count*/ 1).await?;
     // SAFETY: the API owns this live worker and has not reaped it.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    let status = tokio::time::timeout(DEADLINE, api.wait()).await??;
+    // The supervisor respawns the worker; mutations return 503 until it
+    // reattaches, then the saved session keeps serving on the replacement.
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let response = client
+                .post(format!("{url}/events"))
+                .bearer_auth(TOKEN)
+                .json(&json!({"events":[{"type":"agent.session.input.message","input":"What code did I ask you to remember?"}]}))
+                .send()
+                .await?;
+            if response.status().is_success() {
+                return anyhow::Ok(());
+            }
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 50)).await;
+        }
+    })
+    .await??;
+    turns(&client, &url, /*count*/ 2).await?;
     assert!(
-        !status.success(),
-        "worker loss must not report a successful API exit"
+        api.try_wait()?.is_none(),
+        "the API must survive a managed worker crash"
     );
+    stop_api(api).await?;
+    let requests = model.received_requests().await.context("model requests")?;
+    let last: Value = serde_json::from_slice(&requests.last().context("last request")?.body)?;
+    assert!(last["input"].to_string().contains("orange-731"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphaned_worker_is_reclaimed_after_api_crash() -> anyhow::Result<()> {
+    let data = tempfile::tempdir()?;
+    let (mut api, _base, worker1) = start_api(data.path(), /*socket*/ None).await?;
+    let worker1 = i32::try_from(worker1.context("first worker PID")?)?;
+    // Simulate an API-process crash: SIGKILL skips graceful shutdown and
+    // kill_on_drop, so the worker is orphaned against the shared home.
+    let api_pid = i32::try_from(api.id().context("API PID")?)?;
+    // SAFETY: this PID belongs to our live, unreaped API child process.
+    assert_eq!(unsafe { libc::kill(api_pid, libc::SIGKILL) }, 0);
+    api.wait().await?;
+    // The worker outlives the crashed API.
+    // SAFETY: kill(pid, 0) probes existence without delivering a signal.
+    assert_eq!(
+        unsafe {
+            libc::kill(worker1, /*sig*/ 0)
+        },
+        0
+    );
+    // A second API on the same data directory reclaims the orphan, then spawns
+    // a fresh worker and serves normally.
+    let (api, base, worker2) = start_api(data.path(), /*socket*/ None).await?;
+    let worker2 = i32::try_from(worker2.context("second worker PID")?)?;
+    assert_ne!(worker1, worker2, "a fresh worker must replace the orphan");
+    tokio::time::timeout(DEADLINE, async {
+        // SAFETY: kill(pid, 0) probes existence without delivering a signal.
+        while unsafe {
+            libc::kill(worker1, /*sig*/ 0)
+        } == 0
+        {
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 50)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    let client = reqwest::Client::new();
+    let agent = client
+        .post(format!("{base}/agents"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "mock-model", "instructions": "x"}))
+        .send()
+        .await?;
+    assert!(agent.status().is_success(), "reclaimed API must serve");
+    stop_api(api).await?;
     Ok(())
 }
 

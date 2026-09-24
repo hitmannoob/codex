@@ -5,7 +5,14 @@ use crate::resources::SessionCreateParams;
 use codex_state::SqliteConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sqlx::SqlitePool;
+use sqlx::migrate::Migrator;
 use uuid::Uuid;
+
+/// Ordered, transactional schema migrations for this crate's own database.
+/// Migration `0001` adopts the pre-migration schema in place; later migrations
+/// evolve it. Each runs in its own transaction, so a partial upgrade resumes
+/// from the last committed migration.
+static MIGRATOR: Migrator = sqlx_macros::migrate!("./migrations");
 
 pub(crate) struct Store(pub SqlitePool);
 
@@ -16,17 +23,14 @@ impl Store {
         let pool = SqliteConfig::from_sqlite_home(directory)
             .open_read_write_pool(path.as_path())
             .await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
-            .execute(&pool)
-            .await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, thread_id TEXT UNIQUE)")
-            .execute(&pool).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS tool_calls (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, call_id TEXT NOT NULL, request_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, result TEXT, PRIMARY KEY(session_id, turn_id, call_id))")
-            .execute(&pool).await?;
-        // JSON-RPC request waiters belong to the old connection, not the database.
+        MIGRATOR.run(&pool).await?;
+        // Startup recovery, not schema: a previous process may have exited with
+        // in-flight work. JSON-RPC request waiters belong to the lost
+        // connection, not the database, and interrupted public turns must not
+        // appear healthy.
         sqlx::query("UPDATE tool_calls SET status = 'unavailable' WHERE status IN ('pending', 'submitting')")
             .execute(&pool).await?;
-        crate::records::initialize(&pool).await?;
+        crate::records::disconnected(&pool).await?;
         Ok(Self(pool))
     }
 

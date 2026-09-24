@@ -2,10 +2,15 @@ load("//:defs.bzl", "codex_rust_crate")
 
 codex_rust_crate(
     name = "agents-api",
+    compile_data = glob(["migrations/**"]),
     crate_name = "codex_agents_api",
     extra_binaries = ["//codex-rs/app-server:codex-app-server"],
     integration_compile_data_extra = [
+        "CONTRACT_INVENTORY.json",
         "src/runtime.rs",
+        "tests/fixtures/sdk_contract.json",
+        "tests/sdk_helpers.py",
+        "tests/sdk_inventory.py",
         "tests/sdk_lifecycle.py",
     ],
 )

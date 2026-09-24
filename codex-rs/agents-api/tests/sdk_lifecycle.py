@@ -6,14 +6,12 @@ import time
 
 import openai
 
-assert openai.__version__ == "3.17.0", openai.__version__
-client = openai.OpenAI(
-    base_url=sys.argv[1],
-    api_key="test-token-for-the-local-agents-api",
-    max_retries=0,
-    timeout=20,
-    _strict_response_validation=True,
-)
+from sdk_helpers import client as sdk_client
+from sdk_helpers import fixture
+from sdk_helpers import message
+
+
+client = sdk_client(sys.argv[1])
 sessions = client.beta.agents.sessions
 
 
@@ -28,13 +26,6 @@ def finish(stream):
     raise AssertionError("stream ended before completion")
 
 
-def message(text):
-    return {
-        "type": "agent.session.input.message",
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
-    }
-
-
 if len(sys.argv) == 3:
     session_id = sys.argv[2]
     assert sessions.retrieve(session_id).status == "idle"
@@ -47,25 +38,11 @@ if len(sys.argv) == 3:
     print(json.dumps({"session_id": session_id, "restarted": True}))
     sys.exit(0)
 
-agent = client.beta.agents.create(
-    model="mock-model",
-    instructions="Use the lookup tool.",
-    tools=[
-        {
-            "type": "function",
-            "name": "lookup",
-            "description": "Look up a code",
-            "parameters": {"type": "object", "properties": {}},
-        }
-    ],
-)
+agent = client.beta.agents.create(**fixture("agent_create_request"))
 assert client.beta.agents.retrieve(agent.id) == agent
-with sessions.create(
-    agent_id=agent.id,
-    environment={"type": "none"},
-    input="Remember orange-731",
-    stream=True,
-) as stream:
+session_request = fixture("session_create_request")
+session_request["agent_id"] = agent.id
+with sessions.create(**session_request, stream=True) as stream:
     for event in stream:
         assert event.event_id
         if event.type == "agent.session.requires_action":

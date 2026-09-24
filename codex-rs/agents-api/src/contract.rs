@@ -383,11 +383,8 @@ async fn stream(
 ) -> Result<Response, ApiError> {
     let receiver = state.public_events.subscribe();
     crate::records::session(&state, &id).await?;
-    if !state.connected.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "app-server disconnected".into(),
-        ));
+    if !state.connected() {
+        return Err(crate::disconnected_error());
     }
     Ok(sse(receiver, id))
 }

@@ -11,8 +11,8 @@ official SDK operations by changing the base URL and credentials.
 This is the implementation plan for the gaps summarized in [PARITY.md](PARITY.md).
 [README.md](README.md) describes behavior available today. The contract baseline
 is the previously reviewed Agents API reference and Python SDK `openai==3.17.0`.
-That baseline is incomplete: G00 must establish the full operation inventory
-before we can claim full parity or calculate a meaningful completion percentage.
+G00 pins the full known operation inventory in `CONTRACT_INVENTORY.json`; its
+open rows now establish the denominator for parity tracking.
 
 Proposed module names below are implementation suggestions, not existing files
 or commitments to create scaffolding before it is needed. Exact public field
@@ -33,16 +33,45 @@ These capabilities already exist; extend them rather than rebuilding them:
   private socket, home locking, shutdown, forced termination, and process reaping.
 - External-worker mode, where API shutdown leaves the caller's worker running.
 - Completed-session continuation after restarting both API and worker.
+- Replaceable backend connection: HTTP and durable retrieval survive backend
+  loss, mutations report the documented recovery error, and
+  `AgentsApi::reconnect` retires the old connection (its pump exits and records
+  its disconnect bookkeeping) before attaching a replacement, so stale
+  notifications and function callbacks cannot resolve the new connection's work.
+- Managed-worker supervisor: a crashed owned worker is reaped, respawned with
+  bounded attempts/backoff, reinitialized, and reattached via `reconnect`; the
+  CLI keeps serving durable reads throughout and only exits when restarts are
+  exhausted. External workers are never restarted.
+- Ordered, transactional schema migrations via an sqlx `Migrator`; a
+  pre-migration database is adopted in place without data loss.
+- Turn and function reconciliation after reconnect: turns and tool-result
+  deliveries failed only by a connection loss are re-checked against
+  authoritative rollout history and recovered when the worker actually
+  completed them, without falsely recovering interrupted work or re-driving a
+  lost waiter.
+- API-process crash recovery on Unix: a worker orphaned by an API SIGKILL is
+  authenticated (PID plus process start time) and reclaimed on the next managed
+  startup before a replacement spawns, so two app-servers never share a home.
 
-Latest verification: 14 tests passed, including the strict SDK test and actual
-local process/socket lifecycle tests. Scoped Clippy and formatting passed.
-Execution was on macOS with a mock provider. Windows execution, real-provider
-acceptance, and full API parity remain unverified.
+Latest verification (2026-09-24): 19 tests passed via
+`just test -p codex-agents-api`, including backend-replacement fencing,
+worker-SIGKILL/reconnect at the library, the managed-worker crash-and-restart
+CLI test, the migration ledger/legacy-adoption test, the turn- and
+function-reconciliation recovery tests, and the API-crash orphan-reclaim test;
+the two pinned-SDK tests were skipped (no `CODEX_AGENTS_API_SDK_PYTHON`
+configured) and were last run for G00. `just fmt` and
+`just fix -p codex-agents-api` passed. Execution was on macOS with a mock
+provider. Windows execution, real-provider acceptance, and full API parity
+remain unverified.
 
 Current boundaries:
 
-- One managed app-server serves this API process's sessions. Worker death stops
-  the API. There is no automatic worker restart or orphan adoption.
+- One managed app-server serves this API process's sessions. A crashed managed
+  worker is restarted with bounded backoff while durable reads keep serving (the
+  CLI exits only when restart attempts are exhausted), and a worker orphaned by
+  an API-process crash is authenticated and reclaimed on the next Unix startup.
+  Windows orphan containment and the brief spawn-to-record window are not yet
+  covered.
 - Official-style sessions currently accept environment `none`. The original
   prototype also supports a read-only local workspace; that is not managed
   sandbox provisioning or self-hosted environment parity.
@@ -61,7 +90,7 @@ fixture design may start earlier.
 
 | ID | Goal | Dependencies | Suggested landing units |
 | --- | --- | --- | --- |
-| G00 | Complete and pin the contract inventory | None | Inventory, fixtures, coverage mapping |
+| G00 | Complete and pin the contract inventory (complete) | None | Inventory, fixtures, coverage mapping |
 | G01 | Keep the service available through worker failure | G00 recovery/error contract | Replaceable connection, supervisor, reconciliation, process-crash handling |
 | G02 | Version persistence and define ownership | Existing store; coordinate with G01 | Migrations, durable identity, transactional updates |
 | G03 | Complete saved agents and configuration | G00, G02 | List, update/delete, field families |
@@ -80,31 +109,40 @@ public-schema expansion, and sandbox provider integration into one change.
 Prefer changes under 500 lines for complex logic and under 800 changed lines
 unless a documented exception is justified.
 
-## G00 — Complete and pin the contract inventory
+## G00 — Complete and pin the contract inventory (complete)
 
 **Outcome:** every required public behavior has a source, implementation status,
 and an acceptance test or an explicit uncovered gap.
 
 Implementation:
 
-- [ ] Enumerate every operation and resource from the official reference and the
+- [x] Enumerate every operation and resource from the official reference and the
   pinned SDK: methods, paths, beta headers, parameters, responses, and errors.
-- [ ] Enumerate event/item unions, lifecycle transitions, pagination behavior,
+- [x] Enumerate event/item unions, lifecycle transitions, pagination behavior,
   supported content types, size limits, and omitted/null/update semantics.
-- [ ] Investigate the currently incomplete vault, webhook, environment, file,
+- [x] Investigate the currently incomplete vault, webhook, environment, file,
   usage, and provider-specific capability inventory. Do not implement guessed
   endpoints or signing formats.
-- [ ] Record an inventory entry per operation or meaningful behavior: source URL,
+- [x] Record an inventory entry per operation or meaningful behavior: source URL,
   review date, SDK version, implementation location, test name, evidence type,
   status (`missing`, `partial`, `implemented`, `verified`), and remaining issue.
-- [ ] Capture small request/response fixtures and add reusable SDK test helpers.
+- [x] Capture small request/response fixtures and add reusable SDK test helpers.
   Validate errors and returned objects, not just successful HTTP status codes.
-- [ ] Define how intentional compatibility changes update the pinned baseline
+- [x] Define how intentional compatibility changes update the pinned baseline
   without silently changing existing tests.
 
 Acceptance: no known public operation is omitted from the inventory; unsupported
 variants are named explicitly; each subsequent implementation change updates its
 coverage entry. This goal establishes the denominator for parity tracking.
+
+Completion evidence (2026-09-22): `CONTRACT_INVENTORY.json` records 43 Agents
+API operations plus 16 required Files/Skills operations, the documented unions,
+and 18 cross-cutting behavior rows. `tests/sdk_inventory.py` resolved all 58
+SDK-backed operations against `openai==3.17.0`; trace export is the one documented
+raw-HTTP operation absent from that SDK. The full crate run passed 15 tests with
+ignored tests enabled, including strict fixture parsing and the SDK lifecycle.
+Execution used macOS and a mock model; platform and real-provider evidence remain
+separate G12 work.
 
 ## G01 — Worker supervision, reconnect, and reconciliation
 
@@ -116,28 +154,28 @@ Starting points: `src/runtime.rs`, `src/main.rs`, `src/lib.rs`, `src/actions.rs`
 
 Implementation, in order:
 
-- [ ] Introduce an internal owner for the current backend connection and its
+- [x] Introduce an internal owner for the current backend connection and its
   generation. Replace the fixed request handle in application state with access
   to a ready generation; do not hold a shared lock across backend I/O.
-- [ ] Separate HTTP/store lifetime from backend notification-pump lifetime. Keep
+- [x] Separate HTTP/store lifetime from backend notification-pump lifetime. Keep
   durable retrieval available while the backend reconnects. Define mutation
   responses during recovery from the documented error contract; do not silently
   enqueue or retry execution-changing requests.
-- [ ] Add bounded restart attempts/backoff to the owned worker supervisor. Each
+- [x] Add bounded restart attempts/backoff to the owned worker supervisor. Each
   replacement must complete initialization before accepting execution requests.
   Expose exhausted restart attempts operationally instead of spinning forever.
-- [ ] Fence old-generation notifications, request IDs, and function callbacks so
+- [x] Fence old-generation notifications, request IDs, and function callbacks so
   they cannot update or resolve work belonging to a replacement connection.
-- [ ] Reconcile persisted sessions and active turns with authoritative Codex thread
+- [x] Reconcile persisted sessions and active turns with authoritative Codex thread
   history. Recover completed outcomes where evidence exists. Mark interrupted
   work according to the contract when completion cannot be established.
-- [ ] Treat functions in pending, submitting, and submitted states separately.
+- [x] Treat functions in pending, submitting, and submitted states separately.
   Preserve known receipts; never recreate a waiter from its saved numeric ID or
   replay an external side effect merely because its acknowledgment was lost.
-- [ ] Handle API-process crashes separately from worker crashes. Choose and test
+- [x] Handle API-process crashes separately from worker crashes. Choose and test
   an OS-appropriate child-containment or authenticated ownership protocol before
   reclaiming an orphan. A PID file alone is insufficient because PIDs are reused.
-- [ ] Preserve external ownership: reconnect may attach to an external worker,
+- [x] Preserve external ownership: reconnect may attach to an external worker,
   but the API must not start, replace, or terminate that caller-owned process.
 
 Acceptance: inject failure while idle, during generation, while waiting for a
@@ -146,6 +184,88 @@ recovery is bounded, stale callbacks cannot cross generations, and no tool call
 is automatically executed twice. Test SIGKILL/API restart separately from graceful
 shutdown. Automatic continuation of an interrupted turn is not assumed.
 
+Slice evidence (2026-09-23, connection ownership): `src/lib.rs` owns the backend
+behind a `std::sync::Mutex` never held across backend I/O; exactly one pump task
+serves a connection, and `reconnect` awaits the old pump's exit and disconnect
+bookkeeping before installing a replacement, so `src/actions.rs` delivery (run
+only by that pump, holding the matching client) cannot cross into a new
+connection. Tests:
+`replacement_backend_fences_stale_function_calls_and_serves_new_work`
+(tests/suite/reconnect.rs) replaces a live backend under an outstanding
+function waiter and verifies the stale result is rejected with a conflict
+while new sessions run on the replacement;
+`store_reads_survive_worker_loss_and_reconnect_restores_service`
+(tests/suite/worker_loss.rs) SIGKILLs a real worker, verifies saved history
+stays readable and mutations return 503 `app-server disconnected`, then
+reconnects a replacement worker and continues the saved session with context.
+Run via `cargo nextest run -p codex-agents-api` on macOS with a mock provider.
+
+Slice evidence (2026-09-23, worker supervisor): `src/main.rs` replaces fatal
+`worker_exit` handling with a supervision loop. On managed-worker exit it reaps
+the dead worker (releasing its home lock and socket), respawns with bounded
+attempts (`WORKER_RESTART_ATTEMPTS`) and exponential backoff capped at
+`WORKER_RESTART_BACKOFF_MAX`, completes the app-server handshake via
+`runtime::connect`, and reattaches with `AgentsApi::reconnect`; durable reads
+keep serving throughout and the process exits only when restarts are exhausted.
+External-socket mode retains no managed identity, so `restart_worker` refuses to
+respawn it. `rpc` now maps a transport failure to 503 `app-server disconnected`
+(a request racing a crash) and reserves 502 for genuine upstream JSON-RPC
+errors. Test: `managed_worker_restarts_after_crash_and_service_continues`
+(tests/suite/runtime_cli.rs) SIGKILLs the managed worker mid-session, observes
+503 during the gap, and confirms the saved session continues with context and
+the CLI stays alive; `api_shutdown_preserves_external_worker` still passes.
+
+Slice evidence (2026-09-24, turn reconciliation): `src/reconcile.rs` runs after
+every backend (re)connect (from `AgentsApi::reconnect`, so both fresh startup
+and worker restart). It finds turns that `records::disconnected` failed only
+because the connection dropped — tagged with the shared
+`reconcile::CONNECTION_LOST_CODE` marker — and re-reads authoritative outcomes
+via `thread/turns/list`, which serves from persisted rollout history and so
+needs no prior resume. A turn the rollout records completed is recovered to
+`completed` (interrupted → `cancelled`, failed → `failed` with the real
+message); a turn still unfinished keeps its provisional failure, because an
+interrupted turn's completion cannot be established. Recovered sessions return
+to `idle`. The same pass also reconciles function calls left `unavailable`/
+`submitting` by a disconnect: a call whose turn is authoritatively `completed`
+is restored to `submitted`, because a turn cannot complete unless its calls
+were resolved, so the result delivered even though the acknowledgment was lost;
+any other turn status leaves the call unresolved for the caller, so a genuinely
+lost pending call still surfaces in `unresolvedActions` and is never claimed as
+delivered or re-driven from a saved request id. Determining the markers needed
+no new schema, so no migration was added. It is best-effort and never fails a
+reconnect. Tests: `reconcile_recovers_completed_turn_lost_to_disconnect`
+(tests/suite/reconcile_recovery.rs) completes a turn on a real worker, then
+simulates a lost completion notification plus disconnect by marking the public
+turn provisionally failed through the approved codex-state sqlite shim, and
+after reconnecting a replacement worker on the same home confirms the turn is
+restored to `completed` and the session to `idle`;
+`reconcile_recovers_submitted_tool_result_lost_to_disconnect`
+(tests/suite/reconcile_functions.rs) submits a function result that completes
+its turn, reverts the call to `unavailable` via the shim, and after reconnect
+confirms the call leaves `unresolvedActions` and an identical resubmit returns
+the stored receipt instead of a conflict.
+
+Slice evidence (2026-09-24, API-crash orphan reclaim): an API-process crash
+(for example SIGKILL) skips graceful shutdown and `kill_on_drop`, so the managed
+worker keeps running against its home while the API-held home lock is released —
+a second start would otherwise put two app-servers on one home. `runtime.rs`
+now writes an authenticated ownership record (`agents-api-worker.json`: PID plus
+process start time) on spawn, and managed startup calls `reclaim_orphan` before
+spawning: it re-reads the record, and if a live process still matches both PID
+and start time (the start time defeats PID reuse, since a PID file alone is
+insufficient) it SIGKILLs that orphan and waits until it no longer runs, then
+clears the record; a missing, stale, or reused record signals no process and is
+cleared without touching anything. Start time is read per-OS (Linux
+`/proc/<pid>/stat`, macOS `proc_pidinfo`); other platforms fall back to the home
+lock alone. Externally owned workers are never recorded or reclaimed. This is
+separate from worker-crash handling (the supervisor, which reaps its own child).
+Test: `orphaned_worker_is_reclaimed_after_api_crash` (tests/suite/runtime_cli.rs)
+SIGKILLs the real API binary, confirms its worker is orphaned and alive, then
+starts a second API on the same data directory and confirms the orphan is gone,
+a fresh worker replaced it, and the API serves. Remaining API-crash gaps:
+Windows containment (Job Object / `LockFileEx` / `GetProcessTimes`) and the
+sub-second window between child spawn and record write are not yet covered.
+
 ## G02 — Durable storage evolution and ownership
 
 **Outcome:** new APIs and recovery logic can evolve persisted data without losing
@@ -153,7 +273,7 @@ existing sessions or introducing duplicate writers.
 
 Starting points: `src/store.rs`, `src/records.rs`, and `src/resources.rs`.
 
-- [ ] Replace unversioned schema expansion with ordered, transactional migrations.
+- [x] Replace unversioned schema expansion with ordered, transactional migrations.
   Cover upgrades from the current SQLite schema and defaults for old JSON records.
 - [ ] Define durable resource identity, timestamps, lifecycle/tombstone state,
   backend-generation bindings, and any principal scope required by the contract.
@@ -168,6 +288,23 @@ Starting points: `src/store.rs`, `src/records.rs`, and `src/resources.rs`.
 Acceptance: old databases upgrade without changing completed history or session
 snapshots; interrupted migrations are recoverable; duplicate owners are rejected;
 concurrent updates cannot leave contradictory session/turn/action records.
+
+Slice evidence (2026-09-23, migration runner): the scattered
+`CREATE TABLE IF NOT EXISTS` startup path is replaced by an sqlx `Migrator`
+(`sqlx_macros::migrate!("./migrations")`) run in `Store::open` before any
+access; `migrations/0001_initial.sql` holds the baseline schema and uses
+`IF NOT EXISTS` so a pre-migration database is adopted in place rather than
+failing on existing tables. Each migration runs in its own transaction, so a
+partial upgrade resumes from the last committed one. Startup recovery (marking
+lost function waiters `unavailable` and interrupted public turns failed) now
+runs after migration instead of inside table setup. Bazel embeds
+`migrations/**` via crate `compile_data`. Test:
+`migrations_record_a_ledger_and_adopt_a_legacy_database` (src/store_tests.rs)
+asserts the `_sqlx_migrations` ledger is recorded, then drops it to simulate a
+legacy unversioned database and confirms reopening adopts the baseline without
+dropping tables or the existing row. Remaining in G02: durable identity /
+tombstones / generation bindings, transactional record+event grouping, data
+directory / worker ownership, and list/filter indexes.
 
 ## G03 — Saved agents and complete configuration
 
@@ -438,15 +575,24 @@ SDK success is not full parity.
 
 1. **G00 recovery subset:** pin failure/status and pending-function semantics
    needed for supervision; continue the broader inventory alongside later work.
-2. **G01 connection ownership:** keep HTTP/store state alive when the backend
-   disconnects; fence generations; add focused disconnect tests.
-3. **G01 worker replacement:** restart owned workers with bounded backoff and
-   initialization, while leaving externally owned workers untouched.
-4. **G01 + G02 reconciliation:** migrate the required recovery fields, reconcile
-   saved outcomes and unresolved actions, and test crash boundaries.
-5. **G03/G04 resource completion:** complete saved-agent and session CRUD in
+2. **G01 connection ownership (complete 2026-09-23):** HTTP/store state stays
+   alive when the backend disconnects; generations are fenced; disconnect and
+   reconnect tests cover replacement and worker SIGKILL.
+3. **G01 worker replacement (complete 2026-09-23):** the CLI supervisor restarts
+   owned workers with bounded backoff and initialization and reattaches via
+   `AgentsApi::reconnect`; externally owned workers are left untouched.
+4. **G02 migrations (complete 2026-09-23):** ordered, transactional sqlx
+   migrations with in-place adoption of the pre-migration database.
+5. **G01 turn + function reconciliation (complete 2026-09-24):** after
+   reconnect, turns and tool-result deliveries failed only by a connection loss
+   are recovered from authoritative rollout history; interrupted work is not
+   falsely recovered and lost waiters are not re-driven. No schema was needed.
+6. **G01 API-crash orphan reclaim (complete 2026-09-24, Unix):** an orphaned
+   worker is authenticated by PID plus start time and reclaimed before a
+   replacement spawns. Windows containment remains a follow-up.
+7. **G03/G04 resource completion:** complete saved-agent and session CRUD in
    independently reviewable changes, then input/idempotency semantics.
-6. **G05/G06 richer execution contract:** finish deltas/items/usage and function
+8. **G05/G06 richer execution contract:** finish deltas/items/usage and function
    content/limits before layering on additional capabilities and environments.
 
 ## How to maintain this plan

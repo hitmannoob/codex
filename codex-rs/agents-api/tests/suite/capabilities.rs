@@ -16,7 +16,7 @@ pub(super) fn call(name: &str, id: &str) -> String {
     ].iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap_or_default())).collect()
 }
 
-async fn pending(client: &reqwest::Client, url: &str) -> anyhow::Result<Value> {
+pub(super) async fn pending(client: &reqwest::Client, url: &str) -> anyhow::Result<Value> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(/*secs*/ 10);
     loop {
         let session = request(client, reqwest::Method::GET, url, Value::Null).await?;

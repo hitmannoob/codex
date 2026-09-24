@@ -1,0 +1,100 @@
+{
+  "agent_create_request": {
+    "model": "mock-model",
+    "instructions": "Use the lookup tool.",
+    "tools": [
+      {
+        "type": "function",
+        "name": "lookup",
+        "description": "Look up a code",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    ]
+  },
+  "session_create_request": {
+    "environment": {
+      "type": "none"
+    },
+    "input": "Remember orange-731"
+  },
+  "message_event": {
+    "type": "agent.session.input.message",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "fixture text"
+          }
+        ]
+      }
+    ]
+  },
+  "agent_response": {
+    "id": "agent_fixture",
+    "created_at": 1758499200,
+    "instructions": "Use the lookup tool.",
+    "metadata": {},
+    "model": "mock-model",
+    "multi_agent": {
+      "enabled": false,
+      "max_concurrent_subagents": null
+    },
+    "name": null,
+    "object": "agent",
+    "reasoning": {
+      "effort": null,
+      "summary": null
+    },
+    "service_tier": "auto",
+    "text": {
+      "format": {
+        "type": "text"
+      },
+      "verbosity": "medium"
+    },
+    "tools": [],
+    "updated_at": 1758499200
+  },
+  "session_response": {
+    "id": "sess_fixture",
+    "agent": {
+      "id": "agent_fixture",
+      "instructions": "Use the lookup tool.",
+      "model": "mock-model",
+      "multi_agent": {
+        "enabled": false,
+        "max_concurrent_subagents": null
+      },
+      "name": null,
+      "reasoning": {
+        "effort": null,
+        "summary": null
+      },
+      "service_tier": "auto",
+      "text": {
+        "format": {
+          "type": "text"
+        },
+        "verbosity": "medium"
+      },
+      "tools": []
+    },
+    "created_at": 1758499200,
+    "environment": {
+      "type": "none"
+    },
+    "error": null,
+    "last_active_at": 1758499200,
+    "metadata": {},
+    "object": "agent.session",
+    "required_actions": [],
+    "status": "idle",
+    "usage": null,
+    "vault_ids": []
+  }
+}
