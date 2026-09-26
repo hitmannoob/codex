@@ -260,7 +260,7 @@ async fn create(
     let public = json!({"id":session.id,"object":"agent.session","agent":agent(&session.agent),
         "created_at":now(),"last_active_at":now(),"environment":{"type":"none"},"metadata":metadata,
         "vault_ids":[],"required_actions":[],"status":"in_progress","error":null,"usage":null});
-    crate::records::save_session(&state, &session.id, &public).await?;
+    crate::records::save_session(&state.store.0, &session.id, &public).await?;
     let receiver = state.public_events.subscribe();
     crate::records::emit(
         &state,

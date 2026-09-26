@@ -22,10 +22,27 @@ pub(crate) async fn disconnected(pool: &sqlx::SqlitePool) -> anyhow::Result<()> 
     Ok(())
 }
 
-pub(crate) async fn save_session(state: &State, id: &str, data: &Value) -> anyhow::Result<()> {
+/// Persist a public session document. Executor-generic so a single write can go
+/// straight to the pool, while a multi-write handler can pass its transaction so
+/// related records commit together before any event is broadcast.
+pub(crate) async fn save_session<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+    executor: E,
+    id: &str,
+    data: &Value,
+) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO public_sessions (id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data = excluded.data")
-        .bind(id).bind(data.to_string()).execute(&state.store.0).await?;
+        .bind(id).bind(data.to_string()).execute(executor).await?;
     Ok(())
+}
+
+/// Apply a session status change in memory, returning the updated document to
+/// persist and the lifecycle event to broadcast only after the commit.
+fn transition(mut session: Value, status: &str) -> (Value, Value) {
+    session["status"] = json!(status);
+    session["error"] = Value::Null;
+    session["last_active_at"] = json!(crate::contract::now());
+    let event = json!({"type": format!("agent.session.{status}"), "session": session});
+    (session, event)
 }
 
 pub(crate) async fn session(state: &State, id: &str) -> Result<Value, ApiError> {
@@ -62,7 +79,7 @@ pub(crate) async fn session_status(
     data["status"] = json!(status);
     data["error"] = json!(error);
     data["last_active_at"] = json!(crate::contract::now());
-    save_session(state, id, &data).await?;
+    save_session(&state.store.0, id, &data).await?;
     emit(
         state,
         json!({"type":format!("agent.session.{status}"),"session":data}),
@@ -70,15 +87,15 @@ pub(crate) async fn session_status(
     Ok(())
 }
 
-async fn save(
-    state: &State,
+async fn save<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+    executor: E,
     session_id: &str,
     kind: &str,
     data: &Value,
     turn_id: &str,
 ) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO public_records(session_id,kind,id,turn_id,data) VALUES(?,?,?,?,?) ON CONFLICT(session_id,kind,id) DO UPDATE SET data = excluded.data")
-        .bind(session_id).bind(kind).bind(data["id"].as_str()).bind(turn_id).bind(data.to_string()).execute(&state.store.0).await?;
+        .bind(session_id).bind(kind).bind(data["id"].as_str()).bind(turn_id).bind(data.to_string()).execute(executor).await?;
     Ok(())
 }
 
@@ -118,26 +135,36 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":current["agent"]["id"],"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
                 "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":null,"subagent_id":null,
                 "error":if status == "failed" {json!({"code":"internal_error","message":source["error"]["message"].as_str().unwrap_or("turn failed")})} else {Value::Null}});
-            save(state, &id, "turn", &turn, turn_id).await?;
+            // Persist the turn record and any session-status change atomically,
+            // then broadcast the events only after the commit succeeds.
+            let mut events = Vec::new();
+            let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
+            save(&mut *tx, &id, "turn", &turn, turn_id).await?;
             if raw["method"] == "turn/started" {
-                session_status(state, &id, "in_progress", /*error*/ None).await?;
-                emit(
-                    state,
-                    json!({"type":"agent.session.turn.created","session_id":id,"turn_id":turn_id,"turn":turn}),
-                );
+                let (data, event) = transition(current.clone(), "in_progress");
+                save_session(&mut *tx, &id, &data).await?;
+                events.push(event);
+                events.push(json!({"type":"agent.session.turn.created","session_id":id,"turn_id":turn_id,"turn":turn}));
             }
-            emit(
-                state,
-                json!({"type":format!("agent.session.turn.{status}"),"session_id":id,"turn_id":turn_id,"turn":turn}),
-            );
+            events.push(json!({"type":format!("agent.session.turn.{status}"),"session_id":id,"turn_id":turn_id,"turn":turn}));
             if status != "in_progress" {
-                session_status(state, &id, "idle", /*error*/ None).await?;
+                let (data, event) = transition(current.clone(), "idle");
+                save_session(&mut *tx, &id, &data).await?;
+                events.push(event);
+            }
+            tx.commit().await.map_err(anyhow::Error::from)?;
+            for event in events {
+                emit(state, event);
             }
         }
         "session.requires_action" => {
             let turn_id = params["action"]["turnId"].as_str();
-            sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'waiting') WHERE session_id = ? AND kind = 'turn' AND id = ?").bind(&id).bind(turn_id).execute(&state.store.0).await.map_err(anyhow::Error::from)?;
-            session_status(state, &id, "requires_action", /*error*/ None).await?;
+            let (data, event) = transition(session(state, &id).await?, "requires_action");
+            let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
+            sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'waiting') WHERE session_id = ? AND kind = 'turn' AND id = ?").bind(&id).bind(turn_id).execute(&mut *tx).await.map_err(anyhow::Error::from)?;
+            save_session(&mut *tx, &id, &data).await?;
+            tx.commit().await.map_err(anyhow::Error::from)?;
+            emit(state, event);
         }
         "item/started" | "item/completed" => {
             let item = &params["item"];
@@ -184,7 +211,11 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             if done && item["type"] == "dynamicToolCall" && item["status"] == "failed" {
                 public["status"] = json!("failed");
             }
-            publish_item(state, &id, turn_id, &public, done).await?;
+            // The item and, for a resolved tool call, its output record share one
+            // transaction so `output_index` counts them consistently; events are
+            // broadcast only after the commit.
+            let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
+            let mut events = publish_item(&mut tx, &id, turn_id, &public, done).await?;
             if done && item["type"] == "dynamicToolCall" {
                 let output = item["contentItems"]
                     .as_array()
@@ -195,7 +226,11 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                     .join("\n");
                 let failed = item["success"] == false || item["status"] == "failed";
                 let output = json!({"id":format!("output_{item_id}"),"type":"function_call_output","turn_id":turn_id,"call_id":item["id"],"status":if failed {"failed"} else {"completed"},"output":if failed {Value::Null} else {json!(output)},"error":if failed {json!(output)} else {Value::Null}});
-                publish_item(state, &id, turn_id, &output, /*done*/ true).await?;
+                events.extend(publish_item(&mut tx, &id, turn_id, &output, /*done*/ true).await?);
+            }
+            tx.commit().await.map_err(anyhow::Error::from)?;
+            for event in events {
+                emit(state, event);
             }
         }
         _ => {}
@@ -203,41 +238,40 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
     Ok(())
 }
 
+/// Persist one public item within the caller's transaction and return the events
+/// to broadcast after commit (in order), rather than broadcasting mid-write.
 async fn publish_item(
-    state: &State,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
     turn_id: &str,
     item: &Value,
     done: bool,
-) -> Result<(), ApiError> {
+) -> anyhow::Result<Vec<Value>> {
     let previous: Option<i64> = sqlx::query_scalar(
         "SELECT seq FROM public_records WHERE session_id = ? AND kind = 'item' AND id = ?",
     )
     .bind(id)
     .bind(item["id"].as_str())
-    .fetch_optional(&state.store.0)
-    .await
-    .map_err(anyhow::Error::from)?;
-    save(state, id, "item", item, turn_id).await?;
+    .fetch_optional(&mut **tx)
+    .await?;
+    save(&mut **tx, id, "item", item, turn_id).await?;
     let output_index: i64 = sqlx::query_scalar("SELECT count(*) - 1 FROM public_records WHERE session_id = ? AND kind = 'item' AND turn_id = ? AND coalesce(json_extract(data, '$.role'), '') != 'user' AND json_extract(data, '$.type') != 'function_call_output' AND seq <= (SELECT seq FROM public_records WHERE session_id = ? AND kind = 'item' AND id = ?)")
-        .bind(id).bind(turn_id).bind(id).bind(item["id"].as_str()).fetch_one(&state.store.0).await.map_err(anyhow::Error::from)?;
+        .bind(id).bind(turn_id).bind(id).bind(item["id"].as_str()).fetch_one(&mut **tx).await?;
     let input = item["role"] == "user" || item["type"] == "function_call_output";
+    let mut events = Vec::new();
     let mut event = json!({"session_id":id,"turn_id":turn_id,"item":item,"output_index":if input {Value::Null} else {json!(output_index)}});
     if previous.is_none() {
         event["type"] = json!("agent.session.turn.item.added");
-        emit(state, event.clone());
+        events.push(event.clone());
     }
     if done && item["role"] == "assistant" {
-        emit(
-            state,
-            json!({"type":"agent.session.turn.output_text.done","session_id":id,"turn_id":turn_id,"item_id":item["id"],"output_index":output_index,"content_index":0,"text":item["content"][0]["text"]}),
-        );
+        events.push(json!({"type":"agent.session.turn.output_text.done","session_id":id,"turn_id":turn_id,"item_id":item["id"],"output_index":output_index,"content_index":0,"text":item["content"][0]["text"]}));
     }
     if done && !input {
         event["type"] = json!("agent.session.turn.item.done");
-        emit(state, event);
+        events.push(event);
     }
-    Ok(())
+    Ok(events)
 }
 
 #[derive(Default, Deserialize)]

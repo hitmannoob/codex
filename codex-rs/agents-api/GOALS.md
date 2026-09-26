@@ -52,12 +52,19 @@ These capabilities already exist; extend them rather than rebuilding them:
 - API-process crash recovery on Unix: a worker orphaned by an API SIGKILL is
   authenticated (PID plus process start time) and reclaimed on the next managed
   startup before a replacement spawns, so two app-servers never share a home.
+- Data-directory ownership: `Store::open` holds an advisory lock on the API data
+  directory for its lifetime, rejecting a second API process in any worker mode.
+- Atomic public records with post-commit events: each notification handler writes
+  its related records in one transaction and broadcasts events only after commit,
+  so a mid-handler failure cannot leave contradictory records or premature events.
 
-Latest verification (2026-09-24): 19 tests passed via
+Latest verification (2026-09-24): 20 tests passed via
 `just test -p codex-agents-api`, including backend-replacement fencing,
 worker-SIGKILL/reconnect at the library, the managed-worker crash-and-restart
 CLI test, the migration ledger/legacy-adoption test, the turn- and
-function-reconciliation recovery tests, and the API-crash orphan-reclaim test;
+function-reconciliation recovery tests, the API-crash orphan-reclaim test, and
+the data-directory ownership test, with the exact-sequence event tests
+confirming the transactional-records refactor preserved emit order;
 the two pinned-SDK tests were skipped (no `CODEX_AGENTS_API_SDK_PYTHON`
 configured) and were last run for G00. `just fmt` and
 `just fix -p codex-agents-api` passed. Execution was on macOS with a mock
@@ -277,9 +284,9 @@ Starting points: `src/store.rs`, `src/records.rs`, and `src/resources.rs`.
   Cover upgrades from the current SQLite schema and defaults for old JSON records.
 - [ ] Define durable resource identity, timestamps, lifecycle/tombstone state,
   backend-generation bindings, and any principal scope required by the contract.
-- [ ] Use transactions for related public records and action state transitions.
+- [x] Use transactions for related public records and action state transitions.
   Persist changes before broadcasting their corresponding events.
-- [ ] Define ownership for one API data directory, one worker home, and external
+- [x] Define ownership for one API data directory, one worker home, and external
   workers. Coordinate this with G01 so orphan handling cannot bypass ownership.
 - [ ] Add indexes and stable ordering for the actual list/filter operations.
   Avoid a database migration or distributed worker pool unless its behavior is
@@ -302,9 +309,45 @@ runs after migration instead of inside table setup. Bazel embeds
 `migrations_record_a_ledger_and_adopt_a_legacy_database` (src/store_tests.rs)
 asserts the `_sqlx_migrations` ledger is recorded, then drops it to simulate a
 legacy unversioned database and confirms reopening adopts the baseline without
-dropping tables or the existing row. Remaining in G02: durable identity /
-tombstones / generation bindings, transactional record+event grouping, data
-directory / worker ownership, and list/filter indexes.
+dropping tables or the existing row.
+
+Slice evidence (2026-09-24, data-directory ownership): `Store::open` now claims
+an advisory lock (`agents-api.lock`) on the API data directory before touching
+the database and holds it for the store's lifetime, so a second API process on
+the same directory is rejected with "data directory is already in use by another
+agents-api process". This closes the external-worker-mode double-writer gap the
+worker-home lock (G01) does not cover, and complements it: managed startup is
+guarded by both, and the data lock releases when the owning store drops. Test:
+`data_directory_lock_rejects_a_second_owner` (src/store_tests.rs) opens a store,
+confirms a second open on the same directory fails, and confirms a new open
+succeeds once the first is dropped.
+
+Slice evidence (2026-09-24, transactional records + events): the public-record
+notification handler in `src/records.rs` previously wrote each related record
+under its own autocommit and emitted events interleaved with those writes, so a
+mid-handler failure could leave a turn record without its session-status change
+and events could precede a later write. Each handler branch (turn transition,
+requires-action, item + tool-output) now performs all of its related writes in
+one transaction and broadcasts the buffered events only after the commit. The
+write helpers `save`/`save_session` became executor-generic (pool or
+transaction) and `publish_item` takes the transaction and returns its events in
+order; the pure `transition` helper computes a session-status change and its
+event without I/O. Callers that do a single write (`contract` session creation,
+`session_status` for `deliver`/`reconcile`) still pass the pool, so recovery and
+delivery paths are unchanged. Emit order is preserved and verified by the
+existing exact-sequence event tests (`api.rs`, `capabilities.rs`), which pass
+unchanged. No schema change.
+
+Remaining in G02, deferred to their consumers to avoid dead schema (the plan's
+own guidance against a migration whose behavior is not yet needed):
+
+- Durable identity / timestamps / tombstones / generation columns — timestamps
+  already live in the record JSON; tombstones gain a consumer with G04 session/
+  agent delete, and creation-ordered columns with the G03/G04 list endpoints.
+  These land as migration `0002` alongside those endpoints.
+- List/filter indexes and stable ordering — the list operations that exist
+  today (turns, items) are already covered by `public_records_page`; agent and
+  session list indexes land with the G03/G04 list endpoints that query them.
 
 ## G03 — Saved agents and complete configuration
 
@@ -590,9 +633,15 @@ SDK success is not full parity.
 6. **G01 API-crash orphan reclaim (complete 2026-09-24, Unix):** an orphaned
    worker is authenticated by PID plus start time and reclaimed before a
    replacement spawns. Windows containment remains a follow-up.
-7. **G03/G04 resource completion:** complete saved-agent and session CRUD in
+7. **G02 data-directory ownership + transactional records (complete 2026-09-24):**
+   `Store::open` holds a data-directory lock for its lifetime, and each public-
+   record notification handler now writes atomically and emits after commit.
+   Durable-identity columns and list indexes stay deferred until their G03/G04
+   consumers exist (they land as migration `0002` with those endpoints), to
+   avoid dead schema.
+8. **G03/G04 resource completion:** complete saved-agent and session CRUD in
    independently reviewable changes, then input/idempotency semantics.
-8. **G05/G06 richer execution contract:** finish deltas/items/usage and function
+9. **G05/G06 richer execution contract:** finish deltas/items/usage and function
    content/limits before layering on additional capabilities and environments.
 
 ## How to maintain this plan

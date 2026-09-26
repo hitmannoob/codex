@@ -4,7 +4,9 @@ A local HTTP facade over a dedicated Codex app-server from this checkout.
 Agent definitions and session bindings live in `agents-api.sqlite`; Codex owns
 the execution history. Normalized API turns and items also live in SQLite. Run
 one API process per data directory and retain the app-server's `CODEX_HOME`
-alongside it. The text/function session path implements a subset of the OpenAI
+alongside it. Startup takes an advisory lock (`agents-api.lock`) on the data
+directory for the life of the process, so a second API pointed at the same
+directory is rejected in every worker mode rather than becoming a rival writer. The text/function session path implements a subset of the OpenAI
 wire contract, pinned to the official Python SDK 3.17.0. Full compatibility
 remains incomplete. The target is documented function-for-function parity; see
 the [contract inventory](CONTRACT_INVENTORY.md), [parity plan](PARITY.md), and

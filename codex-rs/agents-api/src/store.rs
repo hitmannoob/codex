@@ -2,6 +2,7 @@ use crate::resources::Agent;
 use crate::resources::AgentConfig;
 use crate::resources::Session;
 use crate::resources::SessionCreateParams;
+use anyhow::Context;
 use codex_state::SqliteConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sqlx::SqlitePool;
@@ -14,11 +15,25 @@ use uuid::Uuid;
 /// from the last committed migration.
 static MIGRATOR: Migrator = sqlx_macros::migrate!("./migrations");
 
-pub(crate) struct Store(pub SqlitePool);
+/// The store owns one API data directory. The second tuple field is an advisory
+/// lock held for the store's lifetime so a second API process cannot open the
+/// same directory and become a rival writer of the shared SQLite database —
+/// including in external-worker mode, where no worker-home lock applies. It is
+/// never read; the fd is retained only to hold the lock until the store drops.
+pub(crate) struct Store(pub SqlitePool, #[allow(dead_code)] std::fs::File);
 
 impl Store {
     pub async fn open(directory: AbsolutePathBuf) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&directory).await?;
+        // Claim exclusive ownership of the data directory before touching the
+        // database, rejecting a second concurrent owner in any worker mode.
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(directory.join("agents-api.lock").as_path())?;
+        lock.try_lock()
+            .context("data directory is already in use by another agents-api process")?;
         let path = directory.join("agents-api.sqlite");
         let pool = SqliteConfig::from_sqlite_home(directory)
             .open_read_write_pool(path.as_path())
@@ -31,7 +46,7 @@ impl Store {
         sqlx::query("UPDATE tool_calls SET status = 'unavailable' WHERE status IN ('pending', 'submitting')")
             .execute(&pool).await?;
         crate::records::disconnected(&pool).await?;
-        Ok(Self(pool))
+        Ok(Self(pool, lock))
     }
 
     pub async fn create_agent(&self, config: AgentConfig) -> anyhow::Result<Agent> {

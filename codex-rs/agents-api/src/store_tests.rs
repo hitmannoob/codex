@@ -41,6 +41,7 @@ async fn empty_sessions_survive_restart_with_independent_configuration() -> anyh
         .execute(&store.0)
         .await?;
     store.0.close().await;
+    drop(store); // Release the data-directory lock before reopening.
     let reopened = Store::open(path).await?;
     assert_eq!(reopened.agent(&agent.id).await?, Some(updated));
     assert_eq!(reopened.session(&first.id).await?, Some(first));
@@ -73,6 +74,7 @@ async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Res
         .execute(&store.0)
         .await?;
     store.0.close().await;
+    drop(store); // Release the data-directory lock before reopening.
     let adopted = Store::open(path).await?;
     let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
         .fetch_one(&adopted.0)
@@ -80,5 +82,21 @@ async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Res
     assert!(applied >= 1, "adoption must re-record the baseline");
     assert_eq!(adopted.agent(&agent.id).await?, Some(agent));
     adopted.0.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn data_directory_lock_rejects_a_second_owner() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = AbsolutePathBuf::from_absolute_path(directory.path())?;
+    let first = Store::open(path.clone()).await?;
+    let error = Store::open(path.clone())
+        .await
+        .err()
+        .context("a second owner must be rejected")?;
+    assert!(error.to_string().contains("already in use"), "{error}");
+    // Releasing the owner frees the directory for a new process.
+    drop(first);
+    Store::open(path).await?;
     Ok(())
 }
