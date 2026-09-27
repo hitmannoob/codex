@@ -49,11 +49,20 @@ impl Store {
         Ok(Self(pool, lock))
     }
 
-    pub async fn create_agent(&self, config: AgentConfig) -> anyhow::Result<Agent> {
+    pub async fn create_agent(
+        &self,
+        config: AgentConfig,
+        name: Option<String>,
+        metadata: std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Agent> {
+        let now = crate::contract::now();
         let agent = Agent {
             id: Uuid::new_v4().to_string(),
             config,
-            created_at: crate::contract::now(),
+            created_at: now,
+            updated_at: now,
+            name,
+            metadata,
         };
         sqlx::query("INSERT INTO agents (id, data) VALUES (?, ?)")
             .bind(&agent.id)
@@ -71,6 +80,82 @@ impl Store {
         data.map(|data| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn list_agents(
+        &self,
+        after: Option<&str>,
+        order: &str,
+        limit: i64,
+    ) -> anyhow::Result<Option<(Vec<Agent>, bool)>> {
+        let cursor: Option<i64> = if let Some(id) = after {
+            match sqlx::query_scalar("SELECT created_seq FROM agents WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.0)
+                .await?
+            {
+                Some(seq) => Some(seq),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        let rows: Vec<(String,)> = if order == "asc" {
+            sqlx::query_as(
+                "SELECT data FROM agents WHERE created_seq > ? ORDER BY created_seq ASC LIMIT ?",
+            )
+            .bind(cursor.unwrap_or(0))
+            .bind(limit + 1)
+            .fetch_all(&self.0)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT data FROM agents WHERE created_seq < ? ORDER BY created_seq DESC LIMIT ?",
+            )
+            .bind(cursor.unwrap_or(i64::MAX))
+            .bind(limit + 1)
+            .fetch_all(&self.0)
+            .await?
+        };
+        let has_more = rows.len() as i64 > limit;
+        let agents = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|(data,)| serde_json::from_str(&data))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((agents, has_more)))
+    }
+
+    pub async fn update_agent(&self, previous: &Agent, updated: &Agent) -> anyhow::Result<bool> {
+        let Some(data): Option<String> = sqlx::query_scalar("SELECT data FROM agents WHERE id = ?")
+            .bind(&previous.id)
+            .fetch_optional(&self.0)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if serde_json::from_str::<Agent>(&data)? != *previous {
+            return Ok(false);
+        }
+        Ok(
+            sqlx::query("UPDATE agents SET data = ? WHERE id = ? AND data = ?")
+                .bind(serde_json::to_string(updated)?)
+                .bind(&previous.id)
+                .bind(data)
+                .execute(&self.0)
+                .await?
+                .rows_affected()
+                == 1,
+        )
+    }
+
+    pub async fn delete_agent(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query("DELETE FROM agents WHERE id = ?")
+            .bind(id)
+            .execute(&self.0)
+            .await?
+            .rows_affected()
+            == 1)
     }
 
     pub async fn create_session(

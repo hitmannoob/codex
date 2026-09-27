@@ -74,11 +74,13 @@ The API listens on `127.0.0.1:4501`. Every request requires
 ## Official-style session path
 
 The SDK sends `OpenAI-Beta: agents=v1`. This selects flattened, tagged-function
-payloads for saved-agent creation/retrieval at `/v1/agents`. The original payloads
+payloads for saved-agent operations at `/v1/agents`. The original payloads
 remain available without that header. New session routes are:
 
 | Method | Path | Behavior |
 | --- | --- | --- |
+| POST / GET | `/v1/agents` | Create saved agents / list in creation order |
+| GET / POST / DELETE | `/v1/agents/{id}` | Retrieve, update, or delete a saved agent |
 | POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, required initial input, optional SSE |
 | GET | `/v1/agents/sessions/{id}` | Configuration snapshot, status, metadata and current `required_actions` |
 | POST | `/v1/agents/sessions/{id}/events` | Message/steering, cancel, or function result/error; empty HTTP 202 |
@@ -95,16 +97,30 @@ Backend notification loss fails the connection rather than serving incomplete
 history as healthy. Backend loss marks active public turns failed, without replay.
 
 This stage accepts only `environment: {"type":"none"}`, one text user message
-per request, and one input event per request. Agent fields are `model`,
-`instructions`, `reasoning.effort`, and tagged function `tools`; omitted fields
-inherit from a saved agent, while null instructions/tools clear those fields.
-Function results currently accept a text `output` or separate text `error`.
-Unsupported configuration, content, event batches, vaults and idempotency keys are
-rejected explicitly. Existing prototype size limits below still apply. Reasoning
-and provider defaults remain subject to Codex configuration; model-default reset,
-usage accounting, incremental text deltas and inherited helper-tool item types
-are not yet complete parity. Lists/updates/deletion of agents and sessions are
-not implemented.
+per request, and one input event per request. Saved agents support names,
+metadata, model/instructions, reasoning effort/summary, text format/verbosity,
+service tier, multi-agent configuration, and the pinned SDK tool variants.
+Omitted fields preserve saved values; supplied objects replace them; null resets
+optional settings. Metadata accepts at most 16 string pairs, with keys up to 64
+characters and values up to 512. Lists default to 20 entries, descending creation
+order, and reject unknown/deleted cursors. Updates use an atomic comparison to
+prevent lost writes (a concurrent modification returns 409).
+
+Session snapshots are independent of later saved-agent updates/deletion and
+retain their settings across cold resume. Reasoning resets use the model's
+default effort, summaries reset to disabled, verbosity to medium, and text format
+to ordinary text. These values override inherited worker defaults. Provider
+support still governs available model settings. `fast` maps to `priority` and
+requires advertised model support. An explicit `default` tier is forwarded to
+Responses, including after cold resume; omitted/`auto` leaves the tier unset.
+
+Deferred functions, tool search, enabled programmatic calling, public MCP/web
+search, and enabled multi-agent configurations can be saved/retrieved but their
+execution is rejected until G06–G08. Disabled programmatic calling/web search are
+accepted. Function results currently accept text `output` or separate text
+`error`. Event batches, vaults and idempotency keys are rejected. Prototype size
+limits below still apply. Session list/update/delete, usage accounting, and
+incremental text deltas remain open.
 
 The runtime tests require the real `codex-app-server` binary: build it with the
 command above before `just test -p codex-agents-api`. They exercise the actual

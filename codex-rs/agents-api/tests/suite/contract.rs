@@ -41,14 +41,18 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             done,
         ])
         .await;
-        Mock::given(body_string_contains("sdk-cancel-input"))
-            .respond_with(
-                ResponseTemplate::new(/*s*/ 200).set_delay(Duration::from_secs(/*secs*/ 60)),
-            )
-            .with_priority(/*p*/ 1)
-            .up_to_n_times(/*n*/ 1)
-            .mount(&model)
-            .await;
+        Mock::given(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            body["input"]
+                .as_array()
+                .and_then(|items| items.iter().rev().find(|item| item["role"] == "user"))
+                .is_some_and(|item| item.to_string().contains("sdk-cancel-input"))
+        })
+        .respond_with(ResponseTemplate::new(/*s*/ 200).set_delay(Duration::from_secs(/*secs*/ 60)))
+        .with_priority(/*p*/ 1)
+        .up_to_n_times(/*n*/ 1)
+        .mount(&model)
+        .await;
         MockResponsesConfig::new(&model.uri())
             .with_root_config("features.plugins = false")
             .write(home.path())?;

@@ -34,14 +34,14 @@ in [GOALS.md](GOALS.md).
 
 | Area | Documented target | Current implementation / gap |
 | --- | --- | --- |
-| Saved agents | Create, retrieve, list, update, delete; full configuration | Create/read support SDK-shaped function configuration under the beta header; list/update/delete and remaining configuration still missing |
-| Configuration | Inline agents or saved IDs; session overrides; omitted/null/object replacement semantics; allowed session setting updates | Inline or saved IDs with snapshot overrides for the supported fields; broader configuration and updates missing |
+| Saved agents | Create, retrieve, list, update, delete; full configuration | CRUD and creation-order pagination implemented; SDK configuration round trips covered; project scope and prototype limits remain |
+| Configuration | Inline agents or saved IDs; session overrides; omitted/null/object replacement semantics; allowed session setting updates | Saved/inline overrides, replacement/null resets, deletion-independent snapshots, cold resume, and explicit default tier execution covered; session updates remain |
 | Sessions | Create with optional streaming/initial input as permitted; retrieve/list/update/delete; runtime status and required actions | Official create/retrieve routes, initial input/streaming and normalized lifecycle; list/update/delete missing |
 | Input | Message, cancel, and tool-result events through the session events endpoint | Unified events endpoint implemented for one text message, cancel, or text function result/error; batching and idempotency missing |
 | Turns and items | List/retrieve turn outcomes; saved item history with pagination and turn filtering | Durable normalized item and turn records with after/order/limit and turn filtering; remaining item variants missing |
 | Streaming | Agent/session/turn/item events with stable IDs and text updates | Normalized lifecycle/item/completed-text events; text deltas and remaining event variants missing |
 | Functions | Tagged function tools, supported output content, separate error field, deferred loading and tool search | Tagged functions and SDK result/error flow; structured content, deferred tools and official size limits missing |
-| MCP and built-ins | API-selected tools/transports/controls; capability-specific behavior | Server-side MCP references and filters; built-ins partly inherited |
+| MCP and built-ins | API-selected tools/transports/controls; capability-specific behavior | Public MCP/web/search configurations round trip; execution gated; prototype server-side MCP references and filters remain |
 | Harness features | Configurable multi-agent execution, context compaction, programmatic tool calling, skills/plugins | Codex has underlying machinery; API integration and parity tests missing |
 | Environments | None, service-hosted, self-hosted executor; connection actions and lifecycle | None or read-only local workspace |
 | Files/artifacts | Documented upload, publication, retrieval and cleanup behavior | No public implementation |

@@ -3,16 +3,72 @@ use crate::resources::Environment;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn agent_pages_keep_creation_order_and_sessions_keep_snapshots() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = Store::open(AbsolutePathBuf::from_absolute_path(directory.path())?).await?;
+    let config = AgentConfig {
+        model: "model-a".into(),
+        ..Default::default()
+    };
+    let first = store
+        .create_agent(config.clone(), None, Default::default())
+        .await?;
+    let second = store
+        .create_agent(config.clone(), None, Default::default())
+        .await?;
+    let session = store
+        .create_session(
+            first.clone(),
+            SessionCreateParams {
+                agent_id: first.id.clone(),
+                environment: Environment::None,
+            },
+        )
+        .await?;
+    let mut changed = first.clone();
+    changed.config.instructions = Some("changed".into());
+    assert!(store.update_agent(&first, &changed).await?);
+    let (page, more) = store.list_agents(None, "asc", 1).await?.unwrap();
+    assert_eq!(page, vec![changed.clone()]);
+    assert!(more);
+    let (page, more) = store.list_agents(Some(&first.id), "asc", 1).await?.unwrap();
+    assert_eq!(page, vec![second.clone()]);
+    assert!(!more);
+    assert!(store.delete_agent(&second.id).await?);
+    let third = store.create_agent(config, None, Default::default()).await?;
+    let (page, more) = store
+        .list_agents(Some(&first.id), "asc", 10)
+        .await?
+        .unwrap();
+    assert_eq!(page, vec![third]);
+    assert!(!more);
+    assert_eq!(store.session(&session.id).await?, Some(session.clone()));
+    assert!(store.delete_agent(&first.id).await?);
+    assert!(store.session(&session.id).await?.is_some());
+    assert!(
+        store
+            .list_agents(Some(&second.id), "asc", 1)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn empty_sessions_survive_restart_with_independent_configuration() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = AbsolutePathBuf::from_absolute_path(directory.path())?;
     let store = Store::open(path.clone()).await?;
     let agent = store
-        .create_agent(AgentConfig {
-            model: "model-a".into(),
-            instructions: "original".into(),
-            ..Default::default()
-        })
+        .create_agent(
+            AgentConfig {
+                model: "model-a".into(),
+                instructions: Some("original".into()),
+                ..Default::default()
+            },
+            None,
+            Default::default(),
+        )
         .await?;
     let first = store
         .create_session(
@@ -34,7 +90,7 @@ async fn empty_sessions_survive_restart_with_independent_configuration() -> anyh
         .await?;
     assert_ne!(first.id, second.id);
     let mut updated = agent.clone();
-    updated.config.instructions = "changed".into();
+    updated.config.instructions = Some("changed".into());
     sqlx::query("UPDATE agents SET data = ? WHERE id = ?")
         .bind(serde_json::to_string(&updated)?)
         .bind(&agent.id)
@@ -61,15 +117,31 @@ async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Res
         .await?;
     assert!(applied >= 1, "baseline migration must be recorded");
     let agent = store
-        .create_agent(AgentConfig {
-            model: "legacy-model".into(),
-            instructions: "keep me".into(),
-            ..Default::default()
-        })
+        .create_agent(
+            AgentConfig {
+                model: "legacy-model".into(),
+                instructions: Some("keep me".into()),
+                ..Default::default()
+            },
+            None,
+            Default::default(),
+        )
         .await?;
     // Simulate a pre-migration database: the tables and rows exist, but there
     // is no migration ledger. Reopening must adopt the baseline in place
     // without recreating tables or dropping the existing row.
+    sqlx::query("DROP TABLE agents").execute(&store.0).await?;
+    sqlx::query("DROP TABLE agent_sequence")
+        .execute(&store.0)
+        .await?;
+    sqlx::query("CREATE TABLE agents (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        .execute(&store.0)
+        .await?;
+    sqlx::query("INSERT INTO agents (id, data) VALUES (?, ?)")
+        .bind(&agent.id)
+        .bind(serde_json::to_string(&agent)?)
+        .execute(&store.0)
+        .await?;
     sqlx::query("DROP TABLE _sqlx_migrations")
         .execute(&store.0)
         .await?;

@@ -7,12 +7,18 @@ use serde_json::Value;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentConfig {
     pub model: String,
-    pub instructions: String,
+    pub instructions: Option<String>,
     #[serde(default)]
-    pub tools: Vec<FunctionTool>,
+    pub tools: Vec<crate::agent_tools::Tool>,
     #[serde(default)]
     pub mcp_servers: Vec<McpSelection>,
     pub reasoning: Option<Reasoning>,
+    #[serde(default)]
+    pub text: Option<crate::configuration::Text>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub multi_agent: Option<crate::configuration::MultiAgent>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -21,6 +27,8 @@ pub(crate) struct FunctionTool {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    #[serde(default, rename = "defer_loading", alias = "deferLoading")]
+    pub defer_loading: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -33,7 +41,9 @@ pub(crate) struct McpSelection {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Reasoning {
-    pub effort: String,
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -60,6 +70,12 @@ pub(crate) struct Agent {
     pub config: AgentConfig,
     #[serde(default)]
     pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

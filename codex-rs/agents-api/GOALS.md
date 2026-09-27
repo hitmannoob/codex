@@ -58,18 +58,18 @@ These capabilities already exist; extend them rather than rebuilding them:
   its related records in one transaction and broadcasts events only after commit,
   so a mid-handler failure cannot leave contradictory records or premature events.
 
-Latest verification (2026-09-24): 20 tests passed via
-`just test -p codex-agents-api`, including backend-replacement fencing,
-worker-SIGKILL/reconnect at the library, the managed-worker crash-and-restart
-CLI test, the migration ledger/legacy-adoption test, the turn- and
-function-reconciliation recovery tests, the API-crash orphan-reclaim test, and
-the data-directory ownership test, with the exact-sequence event tests
-confirming the transactional-records refactor preserved emit order;
-the two pinned-SDK tests were skipped (no `CODEX_AGENTS_API_SDK_PYTHON`
-configured) and were last run for G00. `just fmt` and
-`just fix -p codex-agents-api` passed. Execution was on macOS with a mock
-provider. Windows execution, real-provider acceptance, and full API parity
-remain unverified.
+Latest verification (2026-09-27): 24/24 tests passed, none skipped, using
+`CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CODEX_AGENTS_API_SDK_PYTHON=/private/tmp/codex-g03-sdk/bin/python just test -p codex-agents-api --run-ignored all`.
+This includes strict `openai==3.17.0` inventory/lifecycle checks, saved-agent
+configuration coverage, provider request captures before/after cold resume,
+and existing recovery/ownership tests. `just test -p codex-features` passed
+42/42, and the focused core integration test
+`default_service_tier_override_is_omitted_from_http_turn` passed. The complete
+core crate run had failures in connector, MCP, and executor tests; those failures
+were not resolved in this G03 change. Execution was on macOS with mock providers;
+Windows and real-provider acceptance remain unverified. Scoped
+`just fix -p codex-features -p codex-core -p codex-agents-api`, `just fmt`, and
+`git diff --check` passed.
 
 Current boundaries:
 
@@ -100,7 +100,7 @@ fixture design may start earlier.
 | G00 | Complete and pin the contract inventory (complete) | None | Inventory, fixtures, coverage mapping |
 | G01 | Keep the service available through worker failure | G00 recovery/error contract | Replaceable connection, supervisor, reconciliation, process-crash handling |
 | G02 | Version persistence and define ownership | Existing store; coordinate with G01 | Migrations, durable identity, transactional updates |
-| G03 | Complete saved agents and configuration | G00, G02 | List, update/delete, field families |
+| G03 | Complete saved agents and configuration (complete locally) | G00, G02 | List, update/delete, field families |
 | G04 | Complete sessions and input semantics | G00, G01, G02 | List, update/delete, input variants, idempotency |
 | G05 | Complete events, items, turns, and usage | G00, G02 | Text deltas, item families, transitions, usage |
 | G06 | Complete function-tool behavior | G00, G04, G05 | Content/limits, deferred tools, failure cases |
@@ -349,30 +349,52 @@ own guidance against a migration whose behavior is not yet needed):
   today (turns, items) are already covered by `public_records_page`; agent and
   session list indexes land with the G03/G04 list endpoints that query them.
 
-## G03 — Saved agents and complete configuration
+## G03 — Saved agents and complete configuration (complete locally 2026-09-27)
 
 **Outcome:** all inventoried saved-agent operations and configuration semantics
 work through the official SDK.
 
-Starting points: `src/contract.rs`, `src/resources.rs`, `src/store.rs`, and
-`src/capabilities.rs`. Add focused private modules as the contract module grows.
+Implemented (2026-09-27): saved-agent CRUD and stable creation-order pagination,
+name/metadata constraints, atomic replacement with conflict detection, complete
+pinned-SDK configuration field families, and independent session snapshots.
 
-- [ ] Implement agent listing with the specified cursor, ordering, limits, and
-  filters. Validate cursor ownership and invalid/expired cursor behavior.
-- [ ] Implement update and delete according to the documented replacement/merge
-  and deletion rules. Preserve already-created session snapshots where required.
-- [ ] Represent omitted, explicit null, empty collections, and populated values
-  distinctly where the contract distinguishes them.
-- [ ] Add remaining configuration field families incrementally: model/reasoning
-  settings, output settings, tools, and other inventoried agent capabilities.
-- [ ] Resolve model-default reset and inheritance behavior explicitly. Do not
-  silently substitute inherited Codex defaults for a requested API setting.
-- [ ] Persist normalized configuration and apply the same translation at initial
-  session creation and cold resume.
+- [x] Implement local agent listing, exclusive cursors, ordering, and 1..100 limits.
+  Unknown/deleted cursors are rejected; project-scoped ownership remains G11.
+- [x] Implement update/delete and preserve already-created session snapshots.
+- [x] Distinguish omitted, null, empty collections, and populated values; supplied
+  configuration objects replace previous objects.
+- [x] Store/retrieve reasoning, text, tier, multi-agent and all SDK tool variants.
+  G06–G08 execution capabilities remain explicitly gated.
+- [x] Reset effort to the model default, summary to disabled, verbosity to medium,
+  and structured output to ordinary text; override inherited worker settings.
+- [x] Apply saved snapshots at initial creation and cold resume, including after
+  deletion of the saved agent during active work.
+- [x] Forward explicit `service_tier: default` through a session-scoped Codex
+  feature; ordinary Codex sessions still omit that tier. Provider/model setting
+  compatibility and prototype limits remain tracked separately.
 
-Acceptance: SDK create/read/list/update/delete tests; pagination boundaries; invalid
-fields; omitted/null/empty variants; saved-agent override combinations; and a test
-showing that an existing session's snapshot behaves correctly after agent changes.
+Acceptance coverage: `tests/sdk_agents.py` (called by the strict pinned SDK
+lifecycle test), `store_tests.rs`, and
+`tests/suite/configuration.rs`. The runtime test inspects actual mock-provider
+requests for effort, summary, JSON schema, verbosity and
+flex/priority/default/auto tier settings before and after worker restart, with
+hostile inherited defaults.
+The migration/store tests cover old database adoption and stable list ordering.
+Concurrent session coverage exposed a deferred SQLite read-to-write upgrade
+race in item publication; reserving the writer with `BEGIN IMMEDIATE` before
+reading fixes it. The SDK cancellation mock now matches the latest user message
+so cancelled text in history cannot stall the post-restart request.
+The session feature `features.explicit_default_service_tier` defaults off in
+Codex and is enabled only by this facade's configuration overrides. The core
+integration test for ordinary Codex requests still verifies omitted default.
+Real-provider and cross-platform acceptance remain G12; project ownership
+remains G11 and extended capability execution remains G06–G08.
+
+Review staging (the combined working diff exceeds 800 lines): land saved-agent
+CRUD/storage/ordering and its migration first; then configuration normalization
+in `configuration.rs` / `agent_tools.rs` and its resource/call-site changes;
+then execution translation and the SDK/provider acceptance coverage. These stages
+have dependencies in that order; avoid landing schema types without their callers.
 
 ## G04 — Session management and input semantics
 

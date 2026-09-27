@@ -26,6 +26,7 @@ use axum::response::sse::KeepAlive;
 use axum::routing::get;
 use axum::routing::post;
 use futures::StreamExt;
+use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 use std::convert::Infallible;
@@ -34,8 +35,11 @@ use tokio_stream::wrappers::BroadcastStream;
 
 pub(crate) fn router(state: Arc<State>) -> Router {
     Router::new()
-        .route("/v1/agents", post(create_agent))
-        .route("/v1/agents/{id}", get(read_agent))
+        .route("/v1/agents", post(create_agent).get(list_agents))
+        .route(
+            "/v1/agents/{id}",
+            get(read_agent).post(update_agent).delete(delete_agent),
+        )
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}", get(read_session))
         .route("/v1/sessions/{id}/input", post(input))
@@ -106,6 +110,12 @@ async fn create_agent(
     Json(value): Json<Value>,
 ) -> Result<Response, ApiError> {
     let compatible = headers.get("openai-beta").and_then(|h| h.to_str().ok()) == Some("agents=v1");
+    let mut value = value;
+    let (name, metadata) = if compatible {
+        take_agent_details(&mut value, None, Default::default())?
+    } else {
+        (None, Default::default())
+    };
     let config: AgentConfig = if compatible {
         crate::contract::configure(AgentConfig::default(), value)?
     } else {
@@ -113,7 +123,7 @@ async fn create_agent(
     };
     if config.model.trim().is_empty()
         || config.model.len() > 256
-        || config.instructions.len() > 1024
+        || config.instructions.as_deref().unwrap_or_default().len() > 1024
     {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -121,7 +131,7 @@ async fn create_agent(
         ));
     }
     crate::capabilities::validate(&config)?;
-    let agent = state.store.create_agent(config).await?;
+    let agent = state.store.create_agent(config, name, metadata).await?;
     Ok(if compatible {
         Json(public_agent(&agent)).into_response()
     } else {
@@ -152,9 +162,121 @@ fn public_agent(agent: &Agent) -> Value {
     let mut value = crate::contract::agent(agent);
     value["object"] = json!("agent");
     value["created_at"] = json!(agent.created_at);
-    value["updated_at"] = json!(agent.created_at);
-    value["metadata"] = json!({});
+    value["updated_at"] = json!(if agent.updated_at == 0 {
+        agent.created_at
+    } else {
+        agent.updated_at
+    });
+    value["metadata"] = json!(agent.metadata);
+    value["name"] = json!(agent.name);
     value
+}
+
+fn take_agent_details(
+    value: &mut Value,
+    previous_name: Option<String>,
+    previous_metadata: std::collections::BTreeMap<String, String>,
+) -> Result<(Option<String>, std::collections::BTreeMap<String, String>), ApiError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| crate::contract::invalid("agent must be an object"))?;
+    let name = match object.remove("name") {
+        None => previous_name,
+        Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name),
+        Some(_) => return Err(crate::contract::invalid("name must be a string or null")),
+    };
+    let metadata = match object.remove("metadata") {
+        None => previous_metadata,
+        Some(Value::Null) => Default::default(),
+        Some(value) => {
+            let metadata: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(value)
+                    .map_err(|_| crate::contract::invalid("metadata must contain string pairs"))?;
+            if metadata.len() > 16
+                || metadata
+                    .iter()
+                    .any(|(key, value)| key.chars().count() > 64 || value.chars().count() > 512)
+            {
+                return Err(crate::contract::invalid("metadata exceeds its size limit"));
+            }
+            metadata
+        }
+    };
+    Ok((name, metadata))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentListParams {
+    after: Option<String>,
+    limit: Option<u32>,
+    order: Option<String>,
+}
+
+async fn list_agents(
+    Extract(state): Extract<Arc<State>>,
+    Query(params): Query<AgentListParams>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = params.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err(crate::contract::invalid("limit must be between 1 and 100"));
+    }
+    let order = params.order.as_deref().unwrap_or("desc");
+    if !matches!(order, "asc" | "desc") {
+        return Err(crate::contract::invalid("order must be asc or desc"));
+    }
+    let (agents, has_more) = state
+        .store
+        .list_agents(params.after.as_deref(), order, i64::from(limit))
+        .await?
+        .ok_or_else(|| crate::contract::invalid("invalid agent cursor"))?;
+    Ok(Json(json!({
+        "object":"list",
+        "first_id":agents.first().map(|agent| &agent.id),
+        "last_id":agents.last().map(|agent| &agent.id),
+        "data":agents.iter().map(public_agent).collect::<Vec<_>>(),
+        "has_more":has_more,
+    })))
+}
+
+async fn update_agent(
+    Extract(state): Extract<Arc<State>>,
+    Path(id): Path<String>,
+    Json(mut patch): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let previous = state
+        .store
+        .agent(&id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "agent not found".into()))?;
+    let (name, metadata) =
+        take_agent_details(&mut patch, previous.name.clone(), previous.metadata.clone())?;
+    let config = crate::contract::configure(previous.config.clone(), patch)?;
+    let mut updated = previous.clone();
+    updated.config = config;
+    updated.name = name;
+    updated.metadata = metadata;
+    updated.updated_at = crate::contract::now();
+    if !state.store.update_agent(&previous, &updated).await? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "agent changed during update".into(),
+        ));
+    }
+    Ok(Json(public_agent(&updated)))
+}
+
+async fn delete_agent(
+    Extract(state): Extract<Arc<State>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !state.store.delete_agent(&id).await? {
+        return Err(ApiError(StatusCode::NOT_FOUND, "agent not found".into()));
+    }
+    Ok(Json(
+        json!({"id":id,"object":"agent.deleted","deleted":true}),
+    ))
 }
 
 async fn create_session(
@@ -202,6 +324,7 @@ pub(crate) async fn input(
         .await
         .map_err(anyhow::Error::from)?;
     let Json(session) = read_session(Extract(Arc::clone(&state)), Path(id.clone())).await?;
+    crate::configuration::validate_execution(&session.agent.config)?;
     let config =
         crate::capabilities::overrides(&state, &session.agent.config, &session.environment).await?;
     let thread_id = if let Some(thread_id) = session.thread_id {
@@ -209,7 +332,8 @@ pub(crate) async fn input(
             .rpc(
                 "thread/resume",
                 json!({"threadId": thread_id, "excludeTurns": true, "config": config,
-                    "model": session.agent.config.model, "developerInstructions": session.agent.config.instructions}),
+                    "serviceTier": null,
+                    "model": session.agent.config.model, "developerInstructions": session.agent.config.instructions.as_deref().unwrap_or_default()}),
             )
             .await?;
         thread_id
@@ -223,10 +347,11 @@ pub(crate) async fn input(
                 "thread/start",
                 json!({
                     "model": session.agent.config.model,
-                    "developerInstructions": session.agent.config.instructions,
+                    "developerInstructions": session.agent.config.instructions.as_deref().unwrap_or_default(),
+                    "serviceTier": null,
                     "environments": environments,
                     "config": config,
-                    "dynamicTools": session.agent.config.tools.iter().map(|tool| json!({
+                    "dynamicTools": session.agent.config.tools.iter().filter_map(crate::agent_tools::Tool::function).map(|tool| json!({
                         "type": "function", "name": tool.name, "description": tool.description, "inputSchema": tool.parameters
                     })).collect::<Vec<_>>(),
                     "approvalPolicy": "never", "sandbox": "read-only", "ephemeral": false,
@@ -257,7 +382,25 @@ pub(crate) async fn input(
         state
             .rpc(
                 "turn/start",
-                json!({"threadId": thread_id, "input": [{"type": "text", "text": params.input}]}),
+                json!({"threadId": thread_id, "input": [{"type": "text", "text": params.input}],
+                    // A complete settings value clears inherited effort; effort:null alone is a no-op.
+                    "collaborationMode":{"mode":"default","settings":{
+                        "model":session.agent.config.model,
+                        "reasoning_effort":session.agent.config.reasoning.as_ref().and_then(|r| r.effort.as_ref()),
+                        "developer_instructions":""}},
+                    "summary": session.agent.config.reasoning.as_ref().and_then(|r| r.summary.as_deref()).unwrap_or("none"),
+                    "serviceTier": match session.agent.config.service_tier.as_deref() {
+                        // `null` means Codex's explicit default; `auto` clears the
+                        // inherited tier without selecting standard routing.
+                        None | Some("auto") => Some("auto"),
+                        Some("fast") => Some("priority"),
+                        Some(tier) => Some(tier),
+                    },
+                    "outputSchema": match session.agent.config.text.as_ref().and_then(|t| t.format.as_ref()) {
+                        Some(crate::configuration::TextFormat::JsonSchema { schema }) => Some(schema),
+                        None | Some(crate::configuration::TextFormat::Text) => None,
+                    },
+                }),
             )
             .await?,
     ))

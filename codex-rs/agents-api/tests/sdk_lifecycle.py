@@ -6,6 +6,7 @@ import time
 
 import openai
 
+from sdk_agents import check_saved_agents
 from sdk_helpers import client as sdk_client
 from sdk_helpers import fixture
 from sdk_helpers import message
@@ -38,8 +39,29 @@ if len(sys.argv) == 3:
     print(json.dumps({"session_id": session_id, "restarted": True}))
     sys.exit(0)
 
+check_saved_agents(client)
 agent = client.beta.agents.create(**fixture("agent_create_request"))
 assert client.beta.agents.retrieve(agent.id) == agent
+temporary = client.beta.agents.create(
+    model="mock-model", name="temporary", metadata={"team": "test"}
+)
+assert temporary.name == "temporary" and temporary.metadata == {"team": "test"}
+page = client.beta.agents.list(limit=1, order="asc")
+assert len(page.data) == 1 and page.has_next_page()
+next_page = page.get_next_page()
+assert len(next_page.data) == 1 and next_page.data[0].id != page.data[0].id
+assert {page.data[0].id, next_page.data[0].id} == {agent.id, temporary.id}
+updated = client.beta.agents.update(
+    temporary.id, instructions="updated", metadata=None, name=None
+)
+assert (
+    updated.instructions == "updated"
+    and updated.metadata == {}
+    and updated.name is None
+)
+assert updated.created_at == temporary.created_at
+assert client.beta.agents.delete(temporary.id).deleted
+assert [item.id for item in client.beta.agents.list()] == [agent.id]
 session_request = fixture("session_create_request")
 session_request["agent_id"] = agent.id
 with sessions.create(**session_request, stream=True) as stream:
@@ -125,7 +147,7 @@ inline = sessions.create(
     environment={"type": "none"},
     input="Independent conversation",
 )
-assert inline.agent.instructions == "" and inline.agent.tools == []
+assert inline.agent.instructions is None and inline.agent.tools == []
 assert client.beta.agents.retrieve(agent.id) == agent
 deadline = time.monotonic() + 10
 while sessions.retrieve(inline.id).status != "idle":
@@ -179,11 +201,6 @@ for bad in [
         "agent": {"model": "mock-model"},
         "input": "x",
         "vault_ids": ["secret"],
-    },
-    {
-        "environment": {"type": "none"},
-        "agent": {"model": "mock-model", "text": {"verbosity": "low"}},
-        "input": "x",
     },
 ]:
     try:

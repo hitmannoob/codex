@@ -266,6 +266,7 @@ pub struct ModelClient {
     event_sender: Option<Sender<ProtocolEvent>>,
     http_client_factory: HttpClientFactory,
     restored_history: bool,
+    explicit_default_service_tier: bool,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -542,6 +543,7 @@ impl ModelClient {
             event_sender: None,
             http_client_factory,
             restored_history: false,
+            explicit_default_service_tier: false,
         }
     }
 
@@ -561,10 +563,12 @@ impl ModelClient {
         prompt_cache_key_override: Option<String>,
         event_sender: Sender<ProtocolEvent>,
         codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
+        explicit_default_service_tier: bool,
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
         self.event_sender = Some(event_sender);
         self.codex_responses_headers = codex_responses_headers;
+        self.explicit_default_service_tier = explicit_default_service_tier;
         self
     }
 
@@ -973,6 +977,11 @@ impl ModelClient {
         let service_tier = if self.state.provider.info().is_amazon_bedrock() {
             // Bedrock only supports the implicit default tier, including with custom catalogs.
             None
+        } else if self.explicit_default_service_tier
+            && service_tier.as_deref()
+                == Some(codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE)
+        {
+            service_tier
         } else {
             model_info.service_tier_for_request(service_tier)
         };

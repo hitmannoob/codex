@@ -359,6 +359,8 @@ pub enum Feature {
     Artifact,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
+    /// Forward an explicit default service tier to the Responses API.
+    ExplicitDefaultServiceTier,
     /// Enable explicitly requested model changes for later step captures.
     StepModelSwitching,
     /// Enable voice conversations in the TUI.
@@ -1743,6 +1745,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "fast_mode",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ExplicitDefaultServiceTier,
+        key: "explicit_default_service_tier",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::StepModelSwitching,

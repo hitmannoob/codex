@@ -1,5 +1,7 @@
 mod actions;
+mod agent_tools;
 mod capabilities;
+mod configuration;
 mod contract;
 mod reconcile;
 mod records;

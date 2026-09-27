@@ -825,6 +825,9 @@
             "experimental_windows_sandbox": {
               "type": "boolean"
             },
+            "explicit_default_service_tier": {
+              "type": "boolean"
+            },
             "external_agent_memory_import": {
               "type": "boolean"
             },
@@ -6713,6 +6716,9 @@
           "type": "boolean"
         },
         "experimental_windows_sandbox": {
+          "type": "boolean"
+        },
+        "explicit_default_service_tier": {
           "type": "boolean"
         },
         "external_agent_memory_import": {

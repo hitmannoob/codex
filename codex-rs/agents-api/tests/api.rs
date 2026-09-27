@@ -336,3 +336,6 @@ mod reconnect;
 
 #[path = "suite/reconcile_functions.rs"]
 mod reconcile_functions;
+
+#[path = "suite/configuration.rs"]
+mod configuration;

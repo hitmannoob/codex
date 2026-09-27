@@ -214,7 +214,14 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             // The item and, for a resolved tool call, its output record share one
             // transaction so `output_index` counts them consistently; events are
             // broadcast only after the commit.
-            let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
+            // Reserve the writer before publish_item reads: upgrading a deferred
+            // read transaction can fail immediately if another session writes.
+            let mut tx = state
+                .store
+                .0
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(anyhow::Error::from)?;
             let mut events = publish_item(&mut tx, &id, turn_id, &public, done).await?;
             if done && item["type"] == "dynamicToolCall" {
                 let output = item["contentItems"]

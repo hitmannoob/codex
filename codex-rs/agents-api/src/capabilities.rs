@@ -18,7 +18,11 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
         return Err(invalid());
     }
     let mut names = HashSet::new();
-    for tool in &config.tools {
+    for tool in config
+        .tools
+        .iter()
+        .filter_map(crate::agent_tools::Tool::function)
+    {
         if !identifier(&tool.name)
             || tool.name == "mcp"
             || tool.name.starts_with("mcp__")
@@ -42,9 +46,9 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
             return Err(invalid());
         }
     }
-    if let Some(reasoning) = &config.reasoning
+    if let Some(effort) = config.reasoning.as_ref().and_then(|r| r.effort.as_deref())
         && !matches!(
-            reasoning.effort.as_str(),
+            effort,
             "none"
                 | "minimal"
                 | "low"
@@ -74,6 +78,38 @@ pub(crate) async fn overrides(
     config: &AgentConfig,
     environment: &Environment,
 ) -> Result<Value, ApiError> {
+    if matches!(config.service_tier.as_deref(), Some("priority" | "fast")) {
+        let mut cursor = Value::Null;
+        let mut supported = false;
+        // Bound catalog traversal even if an external worker returns a broken cursor.
+        for _ in 0..100 {
+            let page = state
+                .rpc(
+                    "model/list",
+                    json!({"cursor":cursor,"limit":100,"includeHidden":true}),
+                )
+                .await?;
+            if let Some(model) = page["data"]
+                .as_array()
+                .and_then(|models| models.iter().find(|model| model["model"] == config.model))
+            {
+                supported = model["serviceTiers"]
+                    .as_array()
+                    .is_some_and(|tiers| tiers.iter().any(|tier| tier["id"] == "priority"));
+                break;
+            }
+            let next = page["nextCursor"].clone();
+            if next.is_null() || next == cursor {
+                break;
+            }
+            cursor = next;
+        }
+        if !supported {
+            return Err(crate::contract::invalid(
+                "selected model does not advertise priority service tier support",
+            ));
+        }
+    }
     let cwd = match environment {
         Environment::None => None,
         Environment::Local { cwd } => Some(cwd),
@@ -127,9 +163,13 @@ pub(crate) async fn overrides(
         "features.enable_mcp_apps": false, "web_search": "disabled",
         "agents.enabled": false, "features.multi_agent_v2": false,
         "tools.experimental_request_user_input.enabled": false,
+        "model_reasoning_summary": config.reasoning.as_ref().and_then(|r| r.summary.as_deref()).unwrap_or("none"),
+        "model_verbosity": config.text.as_ref().and_then(|t| t.verbosity.as_ref()).map_or(json!("medium"), |v| json!(v)),
+        "features.fast_mode": true,
+        "features.explicit_default_service_tier": true,
     });
-    if let Some(reasoning) = &config.reasoning {
-        overrides["model_reasoning_effort"] = json!(reasoning.effort);
+    if let Some(effort) = config.reasoning.as_ref().and_then(|r| r.effort.as_ref()) {
+        overrides["model_reasoning_effort"] = json!(effort);
     }
     Ok(overrides)
 }

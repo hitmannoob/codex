@@ -79,6 +79,7 @@ pub(crate) async fn register(
                 .config
                 .tools
                 .iter()
+                .filter_map(crate::agent_tools::Tool::function)
                 .any(|tool| tool.name == params.tool),
         "unregistered function"
     );

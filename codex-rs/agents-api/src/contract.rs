@@ -53,108 +53,8 @@ pub(crate) fn now() -> u64 {
         .as_secs()
 }
 
-pub(crate) fn agent(agent: &Agent) -> Value {
-    json!({"id":agent.id,"model":agent.config.model,"instructions":agent.config.instructions,
-        "name":null,"multi_agent":{"enabled":false,"max_concurrent_subagents":0},
-        "reasoning":{"effort":agent.config.reasoning.as_ref().map(|r| &r.effort),"summary":null},
-        "service_tier":"auto","text":{"format":{"type":"text"},"verbosity":"medium"},
-        "tools":agent.config.tools.iter().map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters,"defer_loading":false})).collect::<Vec<_>>()})
-}
-
-pub(crate) fn configure(mut config: AgentConfig, patch: Value) -> Result<AgentConfig, ApiError> {
-    let fields = patch
-        .as_object()
-        .ok_or_else(|| invalid("agent must be an object"))?;
-    for (key, value) in fields {
-        match key.as_str() {
-            "model" => {
-                config.model = value
-                    .as_str()
-                    .ok_or_else(|| invalid("model must be a string"))?
-                    .into()
-            }
-            "instructions" => {
-                config.instructions = if value.is_null() {
-                    String::new()
-                } else {
-                    value
-                        .as_str()
-                        .ok_or_else(|| invalid("instructions must be a string or null"))?
-                        .into()
-                }
-            }
-            "tools" => {
-                config.tools.clear();
-                if !value.is_null() {
-                    for tool in value
-                        .as_array()
-                        .ok_or_else(|| invalid("tools must be an array or null"))?
-                    {
-                        let mut tool = tool.clone();
-                        if tool["type"] != "function" {
-                            return Err(invalid(
-                                "only function tools are implemented on this API path",
-                            ));
-                        }
-                        tool.as_object_mut()
-                            .ok_or_else(|| invalid("invalid function"))?
-                            .remove("type");
-                        if tool.get("defer_loading") == Some(&json!(false)) {
-                            tool.as_object_mut()
-                                .ok_or_else(|| invalid("invalid function"))?
-                                .remove("defer_loading");
-                        }
-                        config.tools.push(
-                            serde_json::from_value(tool).map_err(|e| invalid(e.to_string()))?,
-                        );
-                    }
-                }
-            }
-            "reasoning" => {
-                config.reasoning = if value.is_null() {
-                    None
-                } else {
-                    let reasoning: crate::resources::Reasoning =
-                        serde_json::from_value(value.clone())
-                            .map_err(|e| invalid(e.to_string()))?;
-                    if !matches!(
-                        reasoning.effort.as_str(),
-                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                    ) {
-                        return Err(invalid("unsupported reasoning effort"));
-                    }
-                    Some(reasoning)
-                }
-            }
-            _ => return Err(invalid(format!("agent field {key} is not implemented"))),
-        }
-    }
-    if config.model.trim().is_empty()
-        || config.model.len() > 256
-        || config.instructions.len() > 1024
-    {
-        return Err(invalid(
-            "model must be 1-256 bytes; instructions must be at most 1024 bytes",
-        ));
-    }
-    if !config.mcp_servers.is_empty() {
-        return Err(invalid(
-            "saved MCP configurations are not supported on this API path",
-        ));
-    }
-    if config.reasoning.as_ref().is_some_and(|r| {
-        !matches!(
-            r.effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        )
-    }) {
-        return Err(invalid(
-            "saved reasoning effort is not supported on this API path",
-        ));
-    }
-    crate::capabilities::validate(&config)?;
-    Ok(config)
-}
+pub(crate) use crate::configuration::agent;
+pub(crate) use crate::configuration::configure;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -244,9 +144,19 @@ async fn create(
             id: Uuid::new_v4().to_string(),
             config: AgentConfig::default(),
             created_at: now(),
+            updated_at: now(),
+            name: None,
+            metadata: Default::default(),
         },
     };
-    saved.config = configure(saved.config, params.agent.unwrap_or_else(|| json!({})))?;
+    let mut patch = params.agent.unwrap_or_else(|| json!({}));
+    if let Some(object) = patch.as_object_mut()
+        && let Some(name) = object.remove("name")
+    {
+        saved.name = serde_json::from_value(name).map_err(|e| invalid(e.to_string()))?;
+    }
+    saved.config = configure(saved.config, patch)?;
+    crate::configuration::validate_execution(&saved.config)?;
     let session = state
         .store
         .create_session(

@@ -1727,6 +1727,7 @@ impl Session {
                     .or(fork_cache_key),
                     tx_event.clone(),
                     codex_responses_headers,
+                    config.features.enabled(Feature::ExplicitDefaultServiceTier),
                 ),
                 executed_tool_calls: executed_tool_calls.clone(),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(
