@@ -171,11 +171,37 @@ Input admission is serialized per session: simultaneous inputs to one session
 are applied one at a time, starting or steering its turn, while other sessions
 proceed concurrently. Each Codex thread is resumed once per backend connection.
 
-Deferred functions, tool search, enabled programmatic calling, public MCP/web
-search, and enabled multi-agent configurations can be saved/retrieved but their
-execution is rejected until G06–G08. Disabled programmatic calling/web search are
+Deferred functions, tool search, enabled web search, enabled programmatic calling,
+and enabled multi-agent configurations can be saved/retrieved but their
+execution is rejected. Deferred functions and web search depend on model and
+provider support the worker does not report, so enabling them could leave the
+model silently without the tool. Disabled programmatic calling/web search are
 accepted. Vaults are rejected. Prototype size limits below still apply to the
 original routes.
+
+Public MCP servers run when they use HTTP with `connection_origin: service`
+(the default). Each becomes a session-scoped Codex server that sets only the
+URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
+`required`.
+- **Unsupported configurations:** stdio servers and environment-origin
+  connections need an execution environment. `credential_id`, an
+  `Authorization` header, and `request_metadata` are rejected, as is a label
+  that matches a server configured in the worker.
+- **Egress:** the worker host makes these connections, so a server URL must use
+  https and resolve only to public addresses. Loopback, private, link-local
+  (including cloud metadata), and shared addresses are refused. The check runs
+  before the session is created and again before every turn. An operator can
+  allow specific hosts, internal or plain http, with repeated
+  `--allow-mcp-host <host>` flags or `AgentsApi::allow_mcp_hosts`. DNS is
+  checked at admission and could still change before Codex connects.
+- **Approvals:** tool calls run without approval prompts; the caller's
+  `allowed_tools` is the approval.
+- **Items:** calls appear as `mcp_call` items with the server label, tool name,
+  arguments, output content, and error.
+- **Required servers:** a `required` server that cannot initialize fails the
+  turn with `connection_failed`, as the guide documents. The request itself
+  succeeds. The failed turn gets a service-assigned ID, because Codex never
+  starts it.
 
 A successful function result carries `output`: a string, or an array of
 `input_text` and `input_image` parts. Images must be `data:image/` URLs, and

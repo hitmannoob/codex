@@ -106,8 +106,8 @@ fixture design may start earlier.
 | G03 | Complete saved agents and configuration (complete locally) | G00, G02 | List, update/delete, field families |
 | G04 | Complete sessions and input semantics (complete locally) | G00, G01, G02 | List, update/delete, input variants, idempotency |
 | G05 | Complete events, items, turns, and usage (complete locally) | G00, G02 | Text deltas, item families, transitions, usage |
-| G06 | Complete function-tool behavior | G00, G04, G05 | Content/limits, deferred tools, failure cases |
-| G07 | Complete MCP and built-in controls | G00, G03, G05 | MCP, built-in capabilities, isolation |
+| G06 | Complete function-tool behavior (complete locally except deferred functions) | G00, G04, G05 | Content/limits, deferred tools, failure cases |
+| G07 | Complete MCP and built-in controls (HTTP MCP complete locally) | G00, G03, G05 | MCP, built-in capabilities, isolation |
 | G08 | Expose remaining harness capabilities | G00, G03, G05, G07 | Delegation, compaction, programmatic calls, skills/plugins |
 | G09 | Implement environment lifecycle | G00, G01, G02 | Self-hosted attachment, managed provisioning, lifecycle recovery |
 | G10 | Implement files and artifacts | G00, G02; G09 for environment transfer | Storage contract, transfer, publication, cleanup |
@@ -688,29 +688,91 @@ it needs an additive `supportsSearchTool` field on `model/list` (a shared-crate
 protocol change with schema regeneration) or equivalent worker-reported
 support.
 
-## G07 — MCP and built-in capability control
+## G07 — MCP and built-in capability control (complete locally for HTTP MCP)
 
 **Outcome:** advertised tool capabilities are selected and enforced by the API's
 configuration, with verified execution behavior.
 
-- [ ] Inventory each supported MCP transport, authentication mechanism, approval
+- [x] Inventory each supported MCP transport, authentication mechanism, approval
   mode, resource/tool surface, and built-in capability separately.
-- [ ] Translate public MCP configuration into session-scoped server connections.
+- [x] Translate public MCP configuration into session-scoped server connections.
   Use `codex-mcp/src/mcp_connection_manager.rs` for tool mutation/call behavior
   where applicable; avoid duplicating connection management in the HTTP layer.
 - [ ] Wire scoped credentials through G11. Keep secrets out of persisted public
   configuration, API responses, model-visible text, and routine logs.
-- [ ] Enforce selection across tools and resources, including changes on cold
+- [x] Enforce selection across tools and resources, including changes on cold
   resume. Define the requested behavior for approvals and interactive actions.
 - [ ] Add each built-in capability as its own implementation/test slice. Validate
   underlying provider support and represent unsupported features explicitly.
-- [ ] Ensure inherited Codex helpers cannot accidentally contradict the advertised
+- [x] Ensure inherited Codex helpers cannot accidentally contradict the advertised
   capability policy. Preserve Codex safety constraints; document and resolve any
   incompatibility rather than bypassing policy for apparent parity.
 
 Acceptance: isolated mock MCP servers, selected/unselected tools and resources,
 authentication failures, approval paths, disconnection, configuration changes,
 and cold resume. Include concurrent sessions with different capability policies.
+
+Evidence (2026-09-28, HTTP MCP):
+
+Inventory. The pinned SDK has an inline transport that can carry
+`authorization` and stdio `env`, and a saved transport whose `headers` are
+documented as non-secret. The guide lists three placements:
+- HTTP with `connection_origin: service`: runs in the service, no environment.
+- HTTP with `connection_origin: environment`: needs an environment.
+- stdio: needs an environment.
+
+Credentials come inline or from vaults; `required` makes initialization
+mandatory; `allowed_tools` filters tools. The public schema has no approval
+field and no resource selection.
+
+Implementation. `src/mcp.rs` executes service-origin HTTP servers. Everything
+else is rejected with an explicit reason:
+- stdio or environment origin: G09.
+- `credential_id`, an `Authorization` header, or inline `authorization`: G11.
+- `request_metadata`.
+
+Each server becomes a session-scoped Codex `mcp_servers` entry through thread
+configuration, so Codex's own MCP connection manager connects and calls it. The
+entry sets only `url`, `http_headers`, `enabled_tools`, `required`, `enabled`,
+and auto-approval, so no public field can reach worker-local options such as
+header helper commands. Worker-configured servers stay disabled (the existing
+policy), and a public label that shadows one is rejected. Plugins, apps, and
+agent spawning remain off.
+
+Egress policy (decision 2026-09-28). URLs must be https and resolve only to
+public addresses; loopback, RFC 1918, link-local/metadata, shared, multicast,
+IPv6 ULA/link-local, and IPv4-mapped forms are refused. An operator allowlist
+(`--allow-mcp-host`, `AgentsApi::allow_mcp_hosts`) can permit specific hosts.
+The check runs before a session is created and before each turn. DNS can still
+change between the check and Codex's connection.
+
+Behavior:
+- **Approvals:** the caller's `allowed_tools` is the approval, so calls run
+  without prompts. Interactive MCP requests stay rejected by the pump.
+- **Required servers:** a required server that cannot initialize makes Codex
+  refuse the thread, so `turns::fail_unstarted_turn` records the documented
+  failed turn (`connection_failed`, a service-assigned turn ID, then `error`,
+  `turn.failed`, and idle) instead of a 502 carrying Codex internals.
+- **Items:** calls map to `mcp_call` items.
+
+Test: `public_mcp_servers_are_scoped_filtered_and_egress_checked`
+(tests/suite/mcp.rs) with a mock HTTP MCP server. It checks that nine
+blocked or unsupported configurations fail before any session exists; that an
+allowed server exposes `lookup` but not `secret`, receives its tenant header,
+and yields the expected `mcp_call`; that a concurrent session without MCP never
+sees the server; that cold resume restores the server with the same filter;
+and the required-server failed turn. Unit test:
+`only_public_addresses_are_reachable_without_approval` (src/mcp_tests.rs).
+
+Remaining:
+- MCP credentials: `[ ]` wire scoped credentials through G11.
+- Built-in web search (decision 2026-09-28): stays rejected, like deferred
+  functions. The hosted tool is only sent when the provider reports
+  web-search capability, and some models use Codex's standalone `web.run`.
+  The worker reports neither, so enabling it could leave the model silently
+  without search. The `[ ]` built-in item stays open until the worker reports
+  that support.
+- Programmatic tool calling belongs to G08.
 
 ## G08 — Remaining harness features
 

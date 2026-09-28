@@ -46,6 +46,7 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
             return Err(invalid());
         }
     }
+    crate::mcp::validate(config)?;
     if let Some(effort) = config.reasoning.as_ref().and_then(|r| r.effort.as_deref())
         && !matches!(
             effort,
@@ -65,7 +66,7 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn identifier(value: &str) -> bool {
+pub(crate) fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -120,6 +121,7 @@ pub(crate) async fn overrides(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    crate::mcp::check(state, config, &servers).await?;
     for selection in &config.mcp_servers {
         let Some(server) = servers.get(&selection.server) else {
             return Err(ApiError(
@@ -157,6 +159,7 @@ pub(crate) async fn overrides(
             server["enabled_tools"] = json!(selection.allowed_tools);
         }
     }
+    servers.extend(crate::mcp::overrides(config));
     // Disable other sources of MCP capabilities; never mutate global config.
     let mut overrides = json!({
         "mcp_servers": servers, "features.plugins": false, "features.apps": false,

@@ -198,7 +198,7 @@ pub(crate) fn validate_execution(config: &AgentConfig) -> Result<(), ApiError> {
             Tool::Capability(CapabilityTool::ProgrammaticToolCalling { enabled: true }) => {
                 Some("programmatic tool calling")
             }
-            Tool::Capability(CapabilityTool::Mcp { .. }) => Some("public MCP connections"),
+            Tool::Capability(tool @ CapabilityTool::Mcp { .. }) => crate::mcp::unsupported(tool),
             Tool::Capability(CapabilityTool::WebSearch { .. }) => Some("web search"),
         };
         if let Some(feature) = unsupported {

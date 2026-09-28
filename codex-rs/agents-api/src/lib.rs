@@ -5,6 +5,7 @@ mod configuration;
 mod contract;
 mod gates;
 mod input;
+mod mcp;
 mod reconcile;
 mod records;
 mod resources;
@@ -12,6 +13,7 @@ mod routes;
 mod sessions;
 mod store;
 mod streaming;
+mod turns;
 mod usage;
 
 use axum::Json;
@@ -55,6 +57,8 @@ struct State {
     backend: Mutex<Option<Backend>>,
     input_gates: gates::Gates,
     streams: streaming::Streams,
+    /// Lower-case MCP hosts the operator allows to be internal or plain http.
+    mcp_hosts: Mutex<HashSet<String>>,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -174,6 +178,7 @@ impl AgentsApi {
             backend: Mutex::new(None),
             input_gates: gates::Gates::default(),
             streams: streaming::Streams::default(),
+            mcp_hosts: Mutex::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
             // behind is closed and recovers from saved records.
@@ -248,6 +253,12 @@ impl AgentsApi {
 
     pub fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    /// Allow public MCP servers on these hosts even when they resolve to
+    /// loopback, private, or link-local addresses, or use plain http.
+    pub fn allow_mcp_hosts(&self, hosts: impl IntoIterator<Item = String>) {
+        lock(&self.state.mcp_hosts).extend(hosts.into_iter().map(|host| host.to_ascii_lowercase()));
     }
 
     /// Close the backend connection, allowing Codex to flush session state.

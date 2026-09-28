@@ -200,7 +200,7 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> anyhow::Result<(
             .bind(params["threadId"].as_str())
             .fetch_optional(&state.store.0)
             .await?;
-            let error = crate::records::turn_error(&params["error"]);
+            let error = crate::turns::turn_error(&params["error"]);
             session
                 .map(|session| {
                     json!({"type":"error","session_id":session,"error":{

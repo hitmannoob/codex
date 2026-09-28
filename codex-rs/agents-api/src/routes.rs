@@ -328,7 +328,8 @@ pub(crate) async fn start_turn(
     let config =
         crate::capabilities::overrides(state, &session.agent.config, &session.environment).await?;
     let loaded = state.loaded_threads()?;
-    let thread_id = if let Some(thread_id) = session.thread_id {
+    let thread = async {
+        Ok::<_, ApiError>(if let Some(thread_id) = session.thread_id {
         // Resume once per connection. Per-turn settings travel with
         // `turn/start`, and resuming a just-started thread can race the first
         // write of its rollout.
@@ -385,6 +386,26 @@ pub(crate) async fn start_turn(
             .map_err(anyhow::Error::from)?;
         crate::lock(&loaded).insert(thread_id.clone());
         thread_id
+    })
+    }
+    .await;
+    let thread_id = match thread {
+        Ok(thread_id) => thread_id,
+        // Codex will not start or resume a thread whose required MCP server
+        // cannot initialize; the contract reports that as a failed turn.
+        Err(error)
+            if error.0 == StatusCode::BAD_GATEWAY
+                && error
+                    .1
+                    .contains("required MCP servers failed to initialize") =>
+        {
+            let failure = json!({"code": "connection_failed", "message": "a required MCP server failed to initialize"});
+            if crate::turns::fail_unstarted_turn(state, id, failure).await? {
+                return Ok(json!({}));
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
     };
     state
             .rpc(

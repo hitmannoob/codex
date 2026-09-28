@@ -410,3 +410,6 @@ mod streaming;
 
 #[path = "suite/functions.rs"]
 mod functions;
+
+#[path = "suite/mcp.rs"]
+mod mcp;

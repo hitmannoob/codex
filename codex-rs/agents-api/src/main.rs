@@ -29,6 +29,10 @@ struct Args {
     data_directory: PathBuf,
     #[arg(long, env = "CODEX_AGENTS_API_TOKEN", hide_env_values = true)]
     token: String,
+    /// MCP server host the API may reach even when it is internal or plain
+    /// http. Repeat for each host.
+    #[arg(long = "allow-mcp-host")]
+    allow_mcp_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -87,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             result = &mut stopping => return result,
         };
         let api = AgentsApi::new(AppServerClient::Remote(client), directory, args.token).await?;
+        api.allow_mcp_hosts(args.allow_mcp_hosts);
         eprintln!("agents-api listening on {}", listener.local_addr()?);
         let (stop_http, stopping_http) = tokio::sync::oneshot::channel();
         let mut http = tokio::spawn(

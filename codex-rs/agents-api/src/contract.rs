@@ -115,6 +115,9 @@ async fn create(
     }
     saved.config = configure(saved.config, patch)?;
     crate::configuration::validate_execution(&saved.config)?;
+    // Resolve worker configuration now so an unreachable MCP server or an
+    // unsupported tier is rejected before a session is created.
+    crate::capabilities::overrides(&state, &saved.config, &Environment::None).await?;
     let session = state
         .store
         .create_session(

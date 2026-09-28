@@ -36,7 +36,7 @@ pub(crate) async fn create_session(pool: &sqlx::SqlitePool, data: &Value) -> any
 /// Change only the fields status writers own, so a concurrent session update's
 /// metadata and settings survive. Returns the lifecycle event to broadcast after
 /// commit, or `None` when the session has been deleted.
-async fn transition(
+pub(crate) async fn transition(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
     status: &str,
@@ -109,7 +109,7 @@ pub(crate) async fn session_status(
     Ok(())
 }
 
-async fn save<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+pub(crate) async fn save<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
     executor: E,
     session_id: &str,
     kind: &str,
@@ -179,7 +179,7 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 .ok_or_else(|| anyhow::anyhow!("turn missing ID"))?;
             let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":agent_id,"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
                 "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":crate::usage::usage(&mut tx, &id, Some(turn_id)).await?,"subagent_id":null,
-                "error":if status == "failed" {turn_error(&source["error"])} else {Value::Null}});
+                "error":if status == "failed" {crate::turns::turn_error(&source["error"])} else {Value::Null}});
             if status != "in_progress" {
                 events.extend(close_items(&mut tx, &id, turn_id).await?);
                 state.streams.end_turn(&id, turn_id);
@@ -234,6 +234,10 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 Some("dynamicToolCall") => {
                     json!({"type":"function_call","call_id":item["id"],"name":item["tool"],"arguments":item["arguments"]})
                 }
+                Some("mcpToolCall") => {
+                    json!({"type":"mcp_call","server_label":item["server"],"name":item["tool"],"arguments":item["arguments"],
+                        "output":item["result"]["content"],"error":item["error"]["message"]})
+                }
                 _ => return Ok(()),
             };
             public
@@ -249,7 +253,13 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             if public["role"] == "user" {
                 public["status"] = json!("completed");
             }
-            if done && item["type"] == "dynamicToolCall" && item["status"] == "failed" {
+            if done
+                && matches!(
+                    item["type"].as_str(),
+                    Some("dynamicToolCall" | "mcpToolCall")
+                )
+                && item["status"] == "failed"
+            {
                 public["status"] = json!("failed");
             }
             // The item and, for a resolved tool call, its output record share one
@@ -378,42 +388,6 @@ async fn close_items(
         events.push(json!({"type":"agent.session.turn.item.done","session_id":id,"turn_id":turn_id,"item":item,"output_index":output_index}));
     }
     Ok(events)
-}
-
-/// Map a Codex turn error to the documented failure categories; kinds without
-/// a public counterpart are reported as `internal_error`.
-pub(crate) fn turn_error(error: &Value) -> Value {
-    let info = &error["codexErrorInfo"];
-    let kind = info.as_str().or_else(|| {
-        info.as_object()
-            .and_then(|info| info.keys().next())
-            .map(String::as_str)
-    });
-    let status = info
-        .as_object()
-        .and_then(|info| info.values().next())
-        .and_then(|details| details["httpStatusCode"].as_u64());
-    let code = match kind {
-        Some("contextWindowExceeded") => "context_length_exceeded",
-        Some("sessionBudgetExceeded") => "session_budget_exceeded",
-        Some("usageLimitExceeded") => "usage_limit_exceeded",
-        Some("rateLimitExceeded") => "rate_limit_exceeded",
-        Some("serverOverloaded") => "server_overloaded",
-        Some("cyberPolicy") => "cyber_policy",
-        Some(
-            "httpConnectionFailed"
-            | "responseStreamConnectionFailed"
-            | "responseStreamDisconnected",
-        ) => "connection_failed",
-        Some("responseTooManyFailedAttempts") if status == Some(429) => "rate_limit_exceeded",
-        Some("internalServerError" | "responseTooManyFailedAttempts") => "server_error",
-        Some("unauthorized") => "authentication_error",
-        Some("badRequest") => "invalid_request",
-        Some("sandboxError") => "sandbox_error",
-        Some("activeTurnNotSteerable") => "active_turn_not_steerable",
-        _ => "internal_error",
-    };
-    json!({"code":code,"message":error["message"].as_str().unwrap_or("turn failed")})
 }
 
 #[derive(Default, Deserialize)]

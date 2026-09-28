@@ -86,7 +86,7 @@ async fn reconcile_session(state: &State, session_id: &str) -> anyhow::Result<()
         let (status, error) = match turn["status"].as_str() {
             Some("completed") => ("completed", Value::Null),
             Some("interrupted") => ("cancelled", Value::Null),
-            Some("failed") => ("failed", crate::records::turn_error(&turn["error"])),
+            Some("failed") => ("failed", crate::turns::turn_error(&turn["error"])),
             // inProgress or unknown: completion cannot be established.
             _ => continue,
         };
