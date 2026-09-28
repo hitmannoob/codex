@@ -47,6 +47,20 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             capabilities::call("lookup", "sdk-handler"),
             done.clone(),
             done.clone(),
+            // Event stream: reasoning and text streamed as deltas.
+            sse(&[
+                json!({"type":"response.created","response":{"id":"streamed"}}),
+                json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_streamed","summary":[]}}),
+                json!({"type":"response.reasoning_summary_part.added","summary_index":0}),
+                json!({"type":"response.reasoning_summary_text.delta","delta":"Think","summary_index":0}),
+                json!({"type":"response.reasoning_summary_text.delta","delta":"ing","summary_index":0}),
+                json!({"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_streamed","summary":[{"type":"summary_text","text":"Thinking"}],"encrypted_content":"opaque"}}),
+                json!({"type":"response.output_item.added","item":{"type":"message","role":"assistant","id":"msg_streamed","content":[]}}),
+                json!({"type":"response.output_text.delta","delta":"Hel"}),
+                json!({"type":"response.output_text.delta","delta":"lo"}),
+                json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":"msg_streamed","content":[{"type":"output_text","text":"Hello"}]}}),
+                json!({"type":"response.completed","response":{"id":"streamed","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},"output_tokens":6,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":16}}}),
+            ]),
             done,
         ])
         .await;

@@ -215,6 +215,8 @@ pub(crate) async fn delete(
         "DELETE FROM public_records WHERE session_id = ?",
         "DELETE FROM tool_calls WHERE session_id = ?",
         "DELETE FROM input_requests WHERE session_id = ?",
+        "DELETE FROM turn_usage WHERE session_id = ?",
+        "DELETE FROM usage_totals WHERE session_id = ?",
         "DELETE FROM public_sessions WHERE id = ?",
         "DELETE FROM sessions WHERE id = ?",
     ] {

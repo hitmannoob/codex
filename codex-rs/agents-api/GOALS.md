@@ -105,7 +105,7 @@ fixture design may start earlier.
 | G02 | Version persistence and define ownership | Existing store; coordinate with G01 | Migrations, durable identity, transactional updates |
 | G03 | Complete saved agents and configuration (complete locally) | G00, G02 | List, update/delete, field families |
 | G04 | Complete sessions and input semantics (complete locally) | G00, G01, G02 | List, update/delete, input variants, idempotency |
-| G05 | Complete events, items, turns, and usage | G00, G02 | Text deltas, item families, transitions, usage |
+| G05 | Complete events, items, turns, and usage (complete locally) | G00, G02 | Text deltas, item families, transitions, usage |
 | G06 | Complete function-tool behavior | G00, G04, G05 | Content/limits, deferred tools, failure cases |
 | G07 | Complete MCP and built-in controls | G00, G03, G05 | MCP, built-in capabilities, isolation |
 | G08 | Expose remaining harness capabilities | G00, G03, G05, G07 | Delegation, compaction, programmatic calls, skills/plugins |
@@ -541,7 +541,7 @@ G04 acceptance, all on macOS with a mock provider:
 
 Real-provider and Windows acceptance remain G12.
 
-## G05 — Events, items, turns, and usage
+## G05 — Events, items, turns, and usage (complete locally 2026-09-28)
 
 **Outcome:** clients observe the documented event/content types and can reconstruct
 current state from durable records after disconnects.
@@ -549,24 +549,79 @@ current state from durable records after disconnects.
 Starting points: `src/records.rs`, the notification pump in `src/lib.rs`, and
 session event routes in `src/contract.rs`.
 
-- [ ] Map remaining app-server notifications to typed public events, including
+- [x] Map remaining app-server notifications to typed public events, including
   incremental text deltas and documented reasoning/tool/environment item families.
-- [ ] Keep event IDs, item IDs, turn IDs, output indexes, timestamps, and terminal
+  Tool, environment, and subagent families need their capabilities (G07–G09).
+- [x] Keep event IDs, item IDs, turn IDs, output indexes, timestamps, and terminal
   states consistent across streaming and retrieval responses.
-- [ ] Specify ordering and terminal-state invariants for create/start/update/end,
+- [x] Specify ordering and terminal-state invariants for create/start/update/end,
   cancellation, provider errors, and backend loss. Avoid duplicate terminal events.
-- [ ] Persist authoritative item/turn state before related state-change events.
+- [x] Persist authoritative item/turn state before related state-change events.
   Bound in-memory stream queues and transient deltas; follow the contract's
   retention requirements rather than persisting every fragment by default.
-- [ ] Preserve live-only stream semantics. Test subscribe/read/merge recovery and
+- [x] Preserve live-only stream semantics. Test subscribe/read/merge recovery and
   slow-consumer behavior without inventing a missed-event replay endpoint.
-- [ ] Translate usage from authoritative provider/harness accounting, including
+- [x] Translate usage from authoritative provider/harness accounting, including
   the documented aggregation and unavailable-value behavior. Do not fabricate
   token counts or double-count retries and resumed turns.
 
 Acceptance: validate entire event sequences and final objects through the SDK;
 compare streamed text with saved text; cover reconnect races, lagged consumers,
 failed/cancelled turns, multiple tool items, and usage across follow-up turns.
+
+Evidence (2026-09-28): `src/streaming.rs` translates `item/agentMessage/delta`,
+`item/reasoning/summaryTextDelta`, and `item/reasoning/summaryPartAdded` into
+the pinned SDK's delta and part events. It also emits `error` for non-retried
+provider errors. None of these events are persisted.
+- **Framing:** a small per-connection map holds each streaming item's session,
+  turn, output index, and announced parts. Entries are removed when the item
+  finishes, its turn ends, or the connection drops.
+- **Ordering:** `records.rs` publishes each item's `item.added` and `item.done`
+  around the streaming events, so every item follows the SDK's
+  added → part → delta → done → part done → item done order. Parts are announced
+  even when no delta arrived.
+- **Terminal invariants:** a terminal turn closes any item still `in_progress`
+  as `incomplete`, with one `item.done`, before `turn.{status}`. Failed turns
+  and `error` events use the SDK's documented codes, mapped from Codex's error
+  kinds. Reconciliation uses the same mapping.
+- **Buffer:** the public event buffer grew from 128 to 1,024 so token-rate
+  deltas don't close streams. A consumer lagging past that is still closed
+  rather than skipped.
+
+Usage (`src/usage.rs`, migration `0005`) comes from `thread/tokenUsage/updated`. The raw
+per-response notification is opt-in only at `thread/start`, so it would be lost
+after a cold resume.
+- Each session stores the last cumulative total seen, and each update adds only
+  its increase to the turn. Repeated totals, and the total Codex replays on
+  resume, add nothing.
+- An update for a turn that is no longer running only moves the stored total.
+- Without a usable stored total, only that response's `last` usage counts.
+- Turn and session usage are `null` until a response reports usage.
+
+Tests:
+- `tests/sdk_events.py` (strict SDK lifecycle) validates every streamed event
+  against `AgentSessionEvent` and checks each item's exact event order. It also
+  checks that deltas rebuild the saved message and summary, that `item.done`
+  payloads equal the saved items, and output indexes and exact turn/session
+  usage.
+- `usage_sums_each_response_once_across_turns_and_restart` covers per-turn and
+  session sums across a cold resume, and `null` for a response without usage.
+- `failed_turn_reports_its_error_and_closes_open_items` checks the exact
+  sequence item.added → part → delta → `error` → item.done(`incomplete`) →
+  turn.failed → idle, with `context_length_exceeded` on both the event and the
+  saved turn.
+- `reconnected_stream_merges_with_saved_items` follows the documented
+  subscribe/read/merge recovery across a function call and requires the merged
+  state to equal the final saved items.
+- Unit tests in `src/contract_tests.rs` show that a lagged subscriber is closed,
+  and that a stream carries only its own session and ends on deletion.
+
+Not covered:
+- Cancellation leaving a partially streamed item: the mock provider cannot
+  stall mid-stream. The failure path exercises the same sweep.
+- Several tool items in one turn, because Codex runs dynamic tools one at a
+  time.
+- Real-provider accounting (G12).
 
 ## G06 — Function tools and limits
 

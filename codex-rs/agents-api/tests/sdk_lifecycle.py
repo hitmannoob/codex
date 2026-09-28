@@ -9,6 +9,7 @@ import openai
 from sdk_agents import check_saved_agents
 from sdk_helpers import client as sdk_client
 from sdk_helpers import fixture
+from sdk_events import check_event_stream
 from sdk_helpers import message
 from sdk_input import check_input_semantics
 from sdk_sessions import check_session_management
@@ -165,6 +166,8 @@ print("SDK: session management", file=sys.stderr, flush=True)
 check_session_management(client, agent.id, [session_id, inline.id])
 print("SDK: input semantics", file=sys.stderr, flush=True)
 check_input_semantics(client, agent.id)
+print("SDK: event stream", file=sys.stderr, flush=True)
+check_event_stream(client)
 
 # Cancel a stalled model request, and preserve the outcome in history.
 print("SDK: cancel turn", file=sys.stderr, flush=True)

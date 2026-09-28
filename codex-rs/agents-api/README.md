@@ -87,7 +87,7 @@ remain available without that header. New session routes are:
 | POST | `/v1/agents/sessions/{id}` | Replace metadata; change model, reasoning effort, or service tier for later turns |
 | DELETE | `/v1/agents/sessions/{id}` | Delete a session with no running turn; its Codex thread is removed afterwards |
 | POST | `/v1/agents/sessions/{id}/events` | Batch of message/steering, cancel, and function result/error events; optional `Idempotency-Key`; empty HTTP 202 |
-| GET | `/v1/agents/sessions/{id}/events` | Live normalized session, turn, item and completed-text events |
+| GET | `/v1/agents/sessions/{id}/events` | Live session, turn, item, text/reasoning delta, content-part and `error` events |
 | GET | `/v1/agents/sessions/{id}/items` | Saved messages, reasoning and function records |
 | GET | `/v1/agents/sessions/{id}/turns` | Saved outcomes |
 | GET | `/v1/agents/sessions/{id}/turns/{turn_id}` | One saved outcome |
@@ -96,6 +96,22 @@ Lists accept `after`, `order=asc|desc`, and `limit=1..100`; item lists also acce
 `turn_id`. Records persist before their events are emitted. Disconnecting an HTTP
 stream does not cancel work. Streams do not replay; reconnect, read current state
 and history, and merge buffered updates by item ID. A lagged stream closes.
+
+Assistant messages stream as `item.added`, `content_part.added`, one or more
+`output_text.delta`, `output_text.done`, `content_part.done`, and `item.done`.
+Reasoning summaries follow the same shape with `reasoning_summary_part.*` and
+`reasoning_summary_text.*` events per summary index. Deltas and part events are
+live only; the saved item holds the complete text. When a turn ends, any item
+it left in progress is saved and closed as `incomplete`. A final provider error
+emits an `error` event before `turn.failed`. Failed turns carry the documented
+error codes (for example `context_length_exceeded` or `connection_failed`); a
+Codex error without a public counterpart is `internal_error`.
+
+Turn and session `usage` is best effort. It comes from Codex's running token
+totals: each update adds only its increase to the turn, so repeated updates and
+the totals Codex replays on resume are never counted twice. Usage stays `null`
+until a response reports some; missing usage is unknown, not zero. Cached tokens
+are included in input, and reasoning tokens in output.
 Backend notification loss fails the connection rather than serving incomplete
 history as healthy. Backend loss marks active public turns failed, without replay.
 
@@ -159,8 +175,7 @@ Deferred functions, tool search, enabled programmatic calling, public MCP/web
 search, and enabled multi-agent configurations can be saved/retrieved but their
 execution is rejected until G06–G08. Disabled programmatic calling/web search are
 accepted. Function results currently accept text `output` or separate text
-`error`. Vaults are rejected. Prototype size limits below still apply. Usage accounting and incremental text deltas remain
-open.
+`error`. Vaults are rejected. Prototype size limits below still apply.
 
 The runtime tests require the real `codex-app-server` binary: build it with the
 command above before `just test -p codex-agents-api`. They exercise the actual

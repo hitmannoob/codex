@@ -81,6 +81,38 @@ async fn request(
     Ok(body)
 }
 
+/// Encode Responses stream events as an SSE body for the mock provider.
+fn sse(events: &[Value]) -> String {
+    events
+        .iter()
+        .map(|event| {
+            let kind = event["type"].as_str().unwrap_or_default();
+            format!("event: {kind}\ndata: {event}\n\n")
+        })
+        .collect()
+}
+
+/// Read public SSE events until the session goes idle.
+async fn until_idle(stream: &mut reqwest::Response) -> anyhow::Result<Vec<Value>> {
+    let mut buffer = String::new();
+    let mut events = Vec::new();
+    loop {
+        while let Some(end) = buffer.find("\n\n") {
+            let block: String = buffer.drain(..end + 2).collect();
+            if let Some(data) = block.lines().find_map(|line| line.strip_prefix("data: ")) {
+                let event: Value = serde_json::from_str(data)?;
+                let idle = event["type"] == "agent.session.idle";
+                events.push(event);
+                if idle {
+                    return Ok(events);
+                }
+            }
+        }
+        let chunk = stream.chunk().await?.context("event stream ended")?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
 /// Poll a public session until it is idle with at least `expected_turns` turns.
 async fn idle(client: &reqwest::Client, url: &str, expected_turns: usize) -> anyhow::Result<Value> {
     loop {
@@ -372,3 +404,6 @@ mod sessions;
 
 #[path = "suite/input.rs"]
 mod input;
+
+#[path = "suite/streaming.rs"]
+mod streaming;

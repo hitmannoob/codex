@@ -115,7 +115,13 @@ async fn keyed_batches_run_once_and_interrupted_keys_report_unknown() -> anyhow:
         Mock::given(body_string_contains("call-lookup"))
             .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_raw(capabilities::call("lookup", "batch-call"), "text/event-stream"))
             .with_priority(/*p*/ 1).up_to_n_times(/*n*/ 1).mount(&provider).await;
-        Mock::given(body_string_contains("batched-result"))
+        // Stall only the request that continues after the tool result, so the
+        // cancel always finds the turn running. Later turns carry the same
+        // output in history, so match on the final input item.
+        Mock::given(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            body["input"].as_array().and_then(|items| items.last()).is_some_and(|item| item["type"] == "function_call_output")
+        })
             .respond_with(ResponseTemplate::new(/*s*/ 200).set_delay(Duration::from_secs(/*secs*/ 60)))
             .with_priority(/*p*/ 1).up_to_n_times(/*n*/ 1).mount(&provider).await;
         MockResponsesConfig::new(&provider.uri()).with_root_config("features.plugins = false").write(home.path())?;

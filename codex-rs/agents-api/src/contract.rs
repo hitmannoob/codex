@@ -164,6 +164,10 @@ async fn stream(
     Ok(sse(receiver, id))
 }
 
+#[cfg(test)]
+#[path = "contract_tests.rs"]
+mod tests;
+
 fn sse(receiver: tokio::sync::broadcast::Receiver<Value>, id: String) -> Response {
     // Streams are live only. End on lag, backend loss, or deletion of this
     // session so clients recover via saved state.

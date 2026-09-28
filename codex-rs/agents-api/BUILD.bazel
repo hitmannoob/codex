@@ -10,6 +10,7 @@ codex_rust_crate(
         "src/runtime.rs",
         "tests/fixtures/sdk_contract.json",
         "tests/fixtures/model_catalog.json",
+        "tests/sdk_events.py",
         "tests/sdk_helpers.py",
         "tests/sdk_input.py",
         "tests/sdk_agents.py",

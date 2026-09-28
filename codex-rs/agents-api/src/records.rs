@@ -138,6 +138,7 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             | "session.requires_action"
             | "item/started"
             | "item/completed"
+            | "thread/tokenUsage/updated"
     ) {
         return Ok(());
     }
@@ -176,8 +177,12 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("turn missing ID"))?;
             let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":agent_id,"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
-                "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":null,"subagent_id":null,
-                "error":if status == "failed" {json!({"code":"internal_error","message":source["error"]["message"].as_str().unwrap_or("turn failed")})} else {Value::Null}});
+                "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":crate::usage::usage(&mut tx, &id, Some(turn_id)).await?,"subagent_id":null,
+                "error":if status == "failed" {turn_error(&source["error"])} else {Value::Null}});
+            if status != "in_progress" {
+                events.extend(close_items(&mut tx, &id, turn_id).await?);
+                state.streams.end_turn(&id, turn_id);
+            }
             save(&mut *tx, &id, "turn", &turn, turn_id).await?;
             if method == "turn/started" {
                 events.extend(transition(&mut tx, &id, "in_progress", /*error*/ None).await?);
@@ -187,6 +192,12 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             if status != "in_progress" {
                 events.extend(transition(&mut tx, &id, "idle", /*error*/ None).await?);
             }
+        }
+        "thread/tokenUsage/updated" => {
+            let Some(turn_id) = params["turnId"].as_str() else {
+                return Ok(());
+            };
+            crate::usage::record(&mut tx, &id, turn_id, &params["tokenUsage"]).await?;
         }
         "session.requires_action" => {
             let turn_id = params["action"]["turnId"].as_str();
@@ -198,14 +209,12 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             let turn_id = params["turnId"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("item missing turn ID"))?;
-            let done = raw["method"] == "item/completed";
+            let done = method == "item/completed";
+            let codex_id = item["id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("item missing ID"))?;
             let status = if done { "completed" } else { "in_progress" };
-            let item_id = format!(
-                "item_{turn_id}_{}",
-                item["id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("item missing ID"))?
-            );
+            let item_id = format!("item_{turn_id}_{codex_id}");
             let common = json!({"id":item_id,"turn_id":turn_id,"status":status});
             let mut public = match item["type"].as_str() {
                 Some("userMessage") => {
@@ -244,7 +253,20 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             }
             // The item and, for a resolved tool call, its output record share one
             // transaction so `output_index` counts them consistently.
-            events.extend(publish_item(&mut tx, &id, turn_id, &public, done).await?);
+            let published = publish_item(&mut tx, &id, turn_id, &public, done).await?;
+            events.extend(published.added);
+            if let Some(output_index) = published.output_index {
+                events.extend(if done {
+                    state
+                        .streams
+                        .finished(thread_id, codex_id, &id, &public, output_index)
+                } else {
+                    state
+                        .streams
+                        .started(thread_id, codex_id, &id, &public, output_index)
+                });
+            }
+            events.extend(published.done);
             if done && item["type"] == "dynamicToolCall" {
                 let output = item["contentItems"]
                     .as_array()
@@ -255,7 +277,8 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                     .join("\n");
                 let failed = item["success"] == false || item["status"] == "failed";
                 let output = json!({"id":format!("output_{item_id}"),"type":"function_call_output","turn_id":turn_id,"call_id":item["id"],"status":if failed {"failed"} else {"completed"},"output":if failed {Value::Null} else {json!(output)},"error":if failed {json!(output)} else {Value::Null}});
-                events.extend(publish_item(&mut tx, &id, turn_id, &output, /*done*/ true).await?);
+                let published = publish_item(&mut tx, &id, turn_id, &output, /*done*/ true).await?;
+                events.extend(published.added);
             }
         }
         _ => return Ok(()),
@@ -267,40 +290,114 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
     Ok(())
 }
 
-/// Persist one public item within the caller's transaction and return the events
-/// to broadcast after commit (in order), rather than broadcasting mid-write.
+/// Lifecycle events for one persisted item, broadcast only after commit.
+struct Published {
+    added: Option<Value>,
+    done: Option<Value>,
+    /// The item's position in the turn output; `None` for input items.
+    output_index: Option<i64>,
+}
+
+/// Persist one public item within the caller's transaction and return its
+/// events, rather than broadcasting mid-write.
 async fn publish_item(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
     turn_id: &str,
     item: &Value,
     done: bool,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Published> {
+    let item_id = item["id"].as_str().unwrap_or_default();
     let previous: Option<i64> = sqlx::query_scalar(
         "SELECT seq FROM public_records WHERE session_id = ? AND kind = 'item' AND id = ?",
     )
     .bind(id)
-    .bind(item["id"].as_str())
+    .bind(item_id)
     .fetch_optional(&mut **tx)
     .await?;
     save(&mut **tx, id, "item", item, turn_id).await?;
-    let output_index: i64 = sqlx::query_scalar("SELECT count(*) - 1 FROM public_records WHERE session_id = ? AND kind = 'item' AND turn_id = ? AND coalesce(json_extract(data, '$.role'), '') != 'user' AND json_extract(data, '$.type') != 'function_call_output' AND seq <= (SELECT seq FROM public_records WHERE session_id = ? AND kind = 'item' AND id = ?)")
-        .bind(id).bind(turn_id).bind(id).bind(item["id"].as_str()).fetch_one(&mut **tx).await?;
     let input = item["role"] == "user" || item["type"] == "function_call_output";
+    let output_index = if input {
+        None
+    } else {
+        Some(output_index(tx, id, turn_id, item_id).await?)
+    };
+    let event = |kind: &str| json!({"type":kind,"session_id":id,"turn_id":turn_id,"item":item,"output_index":output_index});
+    Ok(Published {
+        added: previous
+            .is_none()
+            .then(|| event("agent.session.turn.item.added")),
+        done: (done && !input).then(|| event("agent.session.turn.item.done")),
+        output_index,
+    })
+}
+
+/// An output item's position among its turn's output items, in arrival order.
+async fn output_index(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    turn_id: &str,
+    item_id: &str,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) - 1 FROM public_records WHERE session_id = ? AND kind = 'item' AND turn_id = ? AND coalesce(json_extract(data, '$.role'), '') != 'user' AND json_extract(data, '$.type') != 'function_call_output' AND seq <= (SELECT seq FROM public_records WHERE session_id = ? AND kind = 'item' AND id = ?)")
+        .bind(id).bind(turn_id).bind(id).bind(item_id).fetch_one(&mut **tx).await?)
+}
+
+/// Mark items a terminal turn left unfinished `incomplete`, returning their
+/// `item.done` events so every added item is closed exactly once.
+async fn close_items(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    turn_id: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let open: Vec<String> = sqlx::query_scalar("SELECT data FROM public_records WHERE session_id = ? AND kind = 'item' AND turn_id = ? AND json_extract(data, '$.status') = 'in_progress' ORDER BY seq")
+        .bind(id).bind(turn_id).fetch_all(&mut **tx).await?;
     let mut events = Vec::new();
-    let mut event = json!({"session_id":id,"turn_id":turn_id,"item":item,"output_index":if input {Value::Null} else {json!(output_index)}});
-    if previous.is_none() {
-        event["type"] = json!("agent.session.turn.item.added");
-        events.push(event.clone());
-    }
-    if done && item["role"] == "assistant" {
-        events.push(json!({"type":"agent.session.turn.output_text.done","session_id":id,"turn_id":turn_id,"item_id":item["id"],"output_index":output_index,"content_index":0,"text":item["content"][0]["text"]}));
-    }
-    if done && !input {
-        event["type"] = json!("agent.session.turn.item.done");
-        events.push(event);
+    for item in open {
+        let mut item: Value = serde_json::from_str(&item)?;
+        item["status"] = json!("incomplete");
+        save(&mut **tx, id, "item", &item, turn_id).await?;
+        let output_index =
+            output_index(tx, id, turn_id, item["id"].as_str().unwrap_or_default()).await?;
+        events.push(json!({"type":"agent.session.turn.item.done","session_id":id,"turn_id":turn_id,"item":item,"output_index":output_index}));
     }
     Ok(events)
+}
+
+/// Map a Codex turn error to the documented failure categories; kinds without
+/// a public counterpart are reported as `internal_error`.
+pub(crate) fn turn_error(error: &Value) -> Value {
+    let info = &error["codexErrorInfo"];
+    let kind = info.as_str().or_else(|| {
+        info.as_object()
+            .and_then(|info| info.keys().next())
+            .map(String::as_str)
+    });
+    let status = info
+        .as_object()
+        .and_then(|info| info.values().next())
+        .and_then(|details| details["httpStatusCode"].as_u64());
+    let code = match kind {
+        Some("contextWindowExceeded") => "context_length_exceeded",
+        Some("sessionBudgetExceeded") => "session_budget_exceeded",
+        Some("usageLimitExceeded") => "usage_limit_exceeded",
+        Some("rateLimitExceeded") => "rate_limit_exceeded",
+        Some("serverOverloaded") => "server_overloaded",
+        Some("cyberPolicy") => "cyber_policy",
+        Some(
+            "httpConnectionFailed"
+            | "responseStreamConnectionFailed"
+            | "responseStreamDisconnected",
+        ) => "connection_failed",
+        Some("responseTooManyFailedAttempts") if status == Some(429) => "rate_limit_exceeded",
+        Some("internalServerError" | "responseTooManyFailedAttempts") => "server_error",
+        Some("unauthorized") => "authentication_error",
+        Some("badRequest") => "invalid_request",
+        Some("sandboxError") => "sandbox_error",
+        Some("activeTurnNotSteerable") => "active_turn_not_steerable",
+        _ => "internal_error",
+    };
+    json!({"code":code,"message":error["message"].as_str().unwrap_or("turn failed")})
 }
 
 #[derive(Default, Deserialize)]

@@ -11,6 +11,8 @@ mod resources;
 mod routes;
 mod sessions;
 mod store;
+mod streaming;
+mod usage;
 
 use axum::Json;
 use axum::Router;
@@ -52,6 +54,7 @@ struct State {
     store: store::Store,
     backend: Mutex<Option<Backend>>,
     input_gates: gates::Gates,
+    streams: streaming::Streams,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -170,8 +173,11 @@ impl AgentsApi {
             store: store::Store::open(directory).await?,
             backend: Mutex::new(None),
             input_gates: gates::Gates::default(),
+            streams: streaming::Streams::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
-            public_events: broadcast::channel(/*capacity*/ 128).0,
+            // Text deltas arrive at token rate; a consumer that falls this far
+            // behind is closed and recovers from saved records.
+            public_events: broadcast::channel(/*capacity*/ 1024).0,
             token,
         });
         let router = routes::router(Arc::clone(&state));
@@ -298,6 +304,9 @@ async fn pump(
                     if records::notification(&state, &value).await.is_err() {
                         break;
                     }
+                    if let Err(error) = streaming::notification(&state, &value).await {
+                        eprintln!("agents-api: stream event dropped: {error:#}");
+                    }
                     let _ = state.events.send(value);
                 }
             }
@@ -366,6 +375,7 @@ async fn disconnect_bookkeeping(state: &State) -> anyhow::Result<()> {
     .execute(&state.store.0)
     .await?;
     records::disconnected(&state.store.0).await?;
+    state.streams.clear();
     let _ = state.events.send(json!({"method": "stream/disconnected"}));
     let _ = state.public_events.send(json!({"type":"disconnect"}));
     Ok(())
