@@ -873,7 +873,7 @@ worker process ownership.
 
 Implement self-hosted attachment first:
 
-- [ ] Inventory connection actions, credentials, statuses, expiry, and reconnection
+- [x] Inventory connection actions, credentials, statuses, expiry, and reconnection
   behavior. Map them to existing app-server/exec-server protocol capabilities.
 - [ ] Persist session-to-environment bindings. Route execution to the attached
   executor; do not assume the HTTP host, app-server, and executor share an OS or
@@ -901,6 +901,47 @@ remote path handling, lose/reconnect the executor during a command, and delete a
 session without stopping caller-owned compute. For managed compute, additionally
 verify setup failure, API crash during allocation, expiry, and leaked-resource
 cleanup. Deployment/billing changes need separate concrete authorization.
+
+Inventory (2026-09-29). The pinned SDK's `self_hosted` environment takes
+`workspace_directory` and `capability_directories`. Environment states are
+`pending`, `ready`, `connected`, `disconnected`, and `failed`, with matching
+`agent.session.environment.*` events and the `environment_connection`
+required action. The guide's flow:
+- The application runs a stock `codex exec-server`.
+- It dials out with a separate, restricted environment key (`CODEX_API_KEY`)
+  and registers with its environment ID.
+- The session response exposes `environment.remote_url`.
+
+What the Codex code actually does:
+- `codex exec-server --remote <registry> --environment-id <id>` registers at
+  `/cloud/environment/{id}/register` with a Noise public key. The harness uses
+  `/connect`, and the executor checks harness keys with `/validate`.
+- Both sides then join a rendezvous websocket that routes protobuf relay frames
+  (handshake, data, ack, resume, reset, heartbeat) by stream ID. Noise IK runs
+  end to end between executor and harness.
+- The simpler `direct` transport is only allowed with `--aws-sigv4`, so it
+  cannot serve the documented `CODEX_API_KEY` flow.
+- The worker can join a registry environment only through process-wide
+  variables (`CODEX_EXEC_SERVER_NOISE_REGISTRY_URL` and related), which gives
+  one environment per worker. Per-session attachment would go through the
+  experimental `environment/add {environmentId, execServerUrl}`, which accepts
+  plain websocket exec-servers only.
+
+Full compatibility would mean implementing, in this service:
+- the registry;
+- the rendezvous relay;
+- a Noise harness bridged to a local websocket for `environment/add`, likely
+  needing exports from `codex-exec-server`;
+- environment keys, statuses, events, and the required action with its
+  reconnection wait.
+
+Tests would run the exec-server library in-process, because the `codex` CLI
+needs a V8 build unavailable here.
+
+Deferred by decision (2026-09-29): implementation is paused in favour of work
+in G10–G12 that does not need environments. Sessions accept only environment
+`none` meanwhile. Stdio and environment-origin MCP, skills and plugins from
+`capability_directories`, and environment files stay blocked on this goal.
 
 ## G10 — Files and artifacts
 
