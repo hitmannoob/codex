@@ -21,6 +21,92 @@ async fn submit(
 }
 
 #[tokio::test]
+async fn concurrent_first_inputs_share_one_thread() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 60), async {
+        let home = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let provider = create_mock_responses_server_repeating_assistant("finished").await;
+        MockResponsesConfig::new(&provider.uri())
+            .with_root_config("features.plugins = false")
+            .write(home.path())?;
+        let api = AgentsApi::new(
+            backend(home.path()).await?,
+            AbsolutePathBuf::from_absolute_path(data.path())?,
+            TOKEN.into(),
+        )
+        .await?;
+        let (base, server) = capabilities::serve(&api).await?;
+        let client = reqwest::Client::new();
+        let agent = request(
+            &client,
+            reqwest::Method::POST,
+            &format!("{base}/agents"),
+            json!({"model":"mock-model"}),
+        )
+        .await?;
+        let session = request(
+            &client,
+            reqwest::Method::POST,
+            &format!("{base}/sessions"),
+            json!({"agentId":agent["id"],"environment":{"type":"none"}}),
+        )
+        .await?;
+        let url = format!(
+            "{base}/sessions/{}",
+            session["id"].as_str().context("session id")?
+        );
+        // Inputs racing to bootstrap an empty session are admitted one at a
+        // time, so every turn they start or steer belongs to one Codex thread.
+        let responses = futures::future::try_join_all((0..4).map(|n| {
+            let (client, input_url) = (&client, format!("{url}/input"));
+            async move {
+                request(
+                    client,
+                    reqwest::Method::POST,
+                    &input_url,
+                    json!({"input":format!("concurrent-{n}")}),
+                )
+                .await
+            }
+        }))
+        .await?;
+        let mut expected = responses
+            .iter()
+            .map(|response| {
+                response["turn"]["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("turn id")
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        expected.sort();
+        expected.dedup();
+        loop {
+            let turns = request(
+                &client,
+                reqwest::Method::GET,
+                &format!("{url}/turns?limit=100"),
+                Value::Null,
+            )
+            .await?;
+            let data = turns["data"].as_array().context("turns")?;
+            let completed = expected.iter().all(|id| {
+                data.iter()
+                    .any(|turn| turn["id"] == *id && turn["status"] == "completed")
+            });
+            if completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await;
+        }
+        server.abort();
+        api.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn keyed_batches_run_once_and_interrupted_keys_report_unknown() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(/*secs*/ 90), async {
         let home = tempfile::tempdir()?;

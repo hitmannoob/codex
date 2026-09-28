@@ -151,6 +151,10 @@ retained for 24 hours:
 
 The key deduplicates HTTP requests; it does not make execution exactly-once.
 
+Input admission is serialized per session: simultaneous inputs to one session
+are applied one at a time, starting or steering its turn, while other sessions
+proceed concurrently. Each Codex thread is resumed once per backend connection.
+
 Deferred functions, tool search, enabled programmatic calling, public MCP/web
 search, and enabled multi-agent configurations can be saved/retrieved but their
 execution is rejected until G06–G08. Disabled programmatic calling/web search are

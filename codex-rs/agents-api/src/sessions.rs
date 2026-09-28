@@ -182,11 +182,7 @@ pub(crate) async fn delete(
         )
     };
     // Hold input admission so no turn can start between the check and removal.
-    let permit = state
-        .input_gate
-        .acquire()
-        .await
-        .map_err(anyhow::Error::from)?;
+    let admission = state.input_gates.lock(&id).await;
     let session = crate::records::session(&state, &id).await?;
     if matches!(
         session["status"].as_str(),
@@ -237,7 +233,7 @@ pub(crate) async fn delete(
             .map_err(anyhow::Error::from)?;
     }
     tx.commit().await.map_err(anyhow::Error::from)?;
-    drop(permit);
+    drop(admission);
     let _ = state
         .public_events
         .send(json!({"type": DELETED, "session_id": id}));

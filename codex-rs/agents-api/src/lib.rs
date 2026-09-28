@@ -3,6 +3,7 @@ mod agent_tools;
 mod capabilities;
 mod configuration;
 mod contract;
+mod gates;
 mod input;
 mod reconcile;
 mod records;
@@ -23,6 +24,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -41,12 +43,15 @@ struct Backend {
     handle: AppServerRequestHandle,
     submissions: mpsc::Sender<actions::Submission>,
     cancel: watch::Sender<bool>,
+    /// Threads started or resumed on this connection. A replacement connection
+    /// starts empty, so each thread is resumed once per connection.
+    loaded: Arc<Mutex<HashSet<String>>>,
 }
 
 struct State {
     store: store::Store,
     backend: Mutex<Option<Backend>>,
-    input_gate: Semaphore,
+    input_gates: gates::Gates,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -80,6 +85,13 @@ impl State {
 
     fn connected(&self) -> bool {
         lock(&self.backend).is_some()
+    }
+
+    fn loaded_threads(&self) -> Result<Arc<Mutex<HashSet<String>>>, ApiError> {
+        lock(&self.backend)
+            .as_ref()
+            .map(|backend| Arc::clone(&backend.loaded))
+            .ok_or_else(disconnected_error)
     }
 
     fn submissions(&self) -> Option<mpsc::Sender<actions::Submission>> {
@@ -157,7 +169,7 @@ impl AgentsApi {
         let state = Arc::new(State {
             store: store::Store::open(directory).await?,
             backend: Mutex::new(None),
-            input_gate: Semaphore::new(/*permits*/ 1),
+            input_gates: gates::Gates::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
             public_events: broadcast::channel(/*capacity*/ 128).0,
             token,
@@ -204,6 +216,7 @@ impl AgentsApi {
             handle,
             submissions,
             cancel,
+            loaded: Arc::default(),
         });
         let task = tokio::spawn(pump(
             Arc::clone(&self.state),

@@ -104,7 +104,7 @@ fixture design may start earlier.
 | G01 | Keep the service available through worker failure | G00 recovery/error contract | Replaceable connection, supervisor, reconciliation, process-crash handling |
 | G02 | Version persistence and define ownership | Existing store; coordinate with G01 | Migrations, durable identity, transactional updates |
 | G03 | Complete saved agents and configuration (complete locally) | G00, G02 | List, update/delete, field families |
-| G04 | Complete sessions and input semantics | G00, G01, G02 | List, update/delete, input variants, idempotency |
+| G04 | Complete sessions and input semantics (complete locally) | G00, G01, G02 | List, update/delete, input variants, idempotency |
 | G05 | Complete events, items, turns, and usage | G00, G02 | Text deltas, item families, transitions, usage |
 | G06 | Complete function-tool behavior | G00, G04, G05 | Content/limits, deferred tools, failure cases |
 | G07 | Complete MCP and built-in controls | G00, G03, G05 | MCP, built-in capabilities, isolation |
@@ -399,7 +399,7 @@ in `configuration.rs` / `agent_tools.rs` and its resource/call-site changes;
 then execution translation and the SDK/provider acceptance coverage. These stages
 have dependencies in that order; avoid landing schema types without their callers.
 
-## G04 — Session management and input semantics
+## G04 — Session management and input semantics (complete locally 2026-09-28)
 
 **Outcome:** session lifecycle operations and input processing match the contract
 under normal use, retries, concurrency, and restart.
@@ -425,7 +425,7 @@ Starting points: `src/contract.rs`, `src/routes.rs`, and `src/store.rs`.
 - [x] Separate request deduplication from execution recovery: a crash between
   dispatch and receipt persistence is ambiguous unless reconciliation proves the
   outcome. Do not claim exactly-once execution from an HTTP idempotency table.
-- [ ] Replace unnecessary global serialization with per-session coordination where
+- [x] Replace unnecessary global serialization with per-session coordination where
   safe, preserving the documented policy for simultaneous input to one session.
 
 Acceptance: SDK list/update/delete; empty-initial-input cases if supported; batch
@@ -507,6 +507,39 @@ test runtime. The CLI binary already runs multi-threaded.
 Codex runs dynamic tools one at a time, so a batch resolving two pending calls
 cannot occur against this worker and is not exercised. Run on macOS with a mock
 provider.
+
+Slice evidence (2026-09-28, per-session coordination): `src/gates.rs` replaces
+the global input semaphore with one async mutex per session. An entry lives only
+while a caller holds or awaits it. Turn start and session deletion take their
+own session's gate, so independent sessions are admitted concurrently while one
+session's bootstrap, submissions, and deletion check never interleave. This
+matches the pinned SDK's single-writer guidance: simultaneous inputs to one
+session are serialized and steer the active turn.
+
+A new concurrency test found a bug that predates this change. Every input called
+`thread/resume`, and resuming a thread whose first turn had just started could
+fail with 502 while its rollout file was still empty. Each backend connection
+now records the threads it has started or resumed and resumes each thread once.
+Per-turn model, effort, summary, and tier already travel with `turn/start`, and
+a replacement connection starts empty, so cold resume still happens.
+Tests:
+- `one_session_waits_while_independent_sessions_proceed` (src/gates_tests.rs)
+  checks admission and pruning.
+- `concurrent_first_inputs_share_one_thread` (tests/suite/input.rs) races four
+  first inputs on an empty session and requires every returned turn to complete
+  in the session's single thread. It passed five repeated runs.
+- The session-update test still sees the updated model/effort/tier on later
+  turns.
+
+G04 acceptance, all on macOS with a mock provider:
+- SDK list/update/delete: covered.
+- Empty initial input: not allowed for environment `none`.
+- Batch validation, and key retry/conflict cases: covered.
+- Concurrent same-session and independent-session admission: covered.
+- Deletion during active work: covered.
+- Restart around input acceptance: covered by a simulated crash state.
+
+Real-provider and Windows acceptance remain G12.
 
 ## G05 — Events, items, turns, and usage
 

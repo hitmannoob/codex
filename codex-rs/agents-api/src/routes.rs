@@ -320,25 +320,29 @@ pub(crate) async fn start_turn(
     id: &str,
     items: Vec<Value>,
 ) -> Result<Value, ApiError> {
-    // Serialize bootstrap and submission, not the model/tool execution that follows.
-    let _permit = state
-        .input_gate
-        .acquire()
-        .await
-        .map_err(anyhow::Error::from)?;
+    // Serialize this session's bootstrap and submission, not the model/tool
+    // execution that follows; other sessions are admitted concurrently.
+    let _admission = state.input_gates.lock(id).await;
     let Json(session) = read_session(Extract(Arc::clone(state)), Path(id.to_owned())).await?;
     crate::configuration::validate_execution(&session.agent.config)?;
     let config =
         crate::capabilities::overrides(state, &session.agent.config, &session.environment).await?;
+    let loaded = state.loaded_threads()?;
     let thread_id = if let Some(thread_id) = session.thread_id {
-        state
-            .rpc(
-                "thread/resume",
-                json!({"threadId": thread_id, "excludeTurns": true, "config": config,
-                    "serviceTier": null,
-                    "model": session.agent.config.model, "developerInstructions": session.agent.config.instructions.as_deref().unwrap_or_default()}),
-            )
-            .await?;
+        // Resume once per connection. Per-turn settings travel with
+        // `turn/start`, and resuming a just-started thread can race the first
+        // write of its rollout.
+        if !crate::lock(&loaded).contains(&thread_id) {
+            state
+                .rpc(
+                    "thread/resume",
+                    json!({"threadId": thread_id, "excludeTurns": true, "config": config,
+                        "serviceTier": null,
+                        "model": session.agent.config.model, "developerInstructions": session.agent.config.instructions.as_deref().unwrap_or_default()}),
+                )
+                .await?;
+            crate::lock(&loaded).insert(thread_id.clone());
+        }
         thread_id
     } else {
         let environments = match &session.environment {
@@ -379,6 +383,7 @@ pub(crate) async fn start_turn(
             .execute(&state.store.0)
             .await
             .map_err(anyhow::Error::from)?;
+        crate::lock(&loaded).insert(thread_id.clone());
         thread_id
     };
     state
