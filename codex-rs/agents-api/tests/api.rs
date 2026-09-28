@@ -407,3 +407,6 @@ mod input;
 
 #[path = "suite/streaming.rs"]
 mod streaming;
+
+#[path = "suite/functions.rs"]
+mod functions;

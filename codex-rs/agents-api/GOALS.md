@@ -623,30 +623,70 @@ Not covered:
   time.
 - Real-provider accounting (G12).
 
-## G06 — Function tools and limits
+## G06 — Function tools and limits (complete locally except deferred functions)
 
 **Outcome:** function definitions, discovery, invocation, and outputs support the
 full inventoried contract without unsafe execution retries or unbounded context.
 
 Starting points: `src/actions.rs`, `src/capabilities.rs`, and public input/item types.
 
-- [ ] Implement supported structured/content variants for function outputs and
+- [x] Implement supported structured/content variants for function outputs and
   errors. Preserve item identity and error semantics through continuation.
-- [ ] Replace prototype limits with verified per-field/operation limits. Validate
+- [x] Replace prototype limits with verified per-field/operation limits. Validate
   serialized byte size and encoding consistently at the HTTP and backend boundary.
-- [ ] Define how larger allowed outputs reach Codex safely. Do not simply remove
+- [x] Define how larger allowed outputs reach Codex safely. Do not simply remove
   the 1,024-byte cap: preserve repository context-size rules and use a supported
   bounded representation or artifact path where the public contract permits it.
   Record unresolved incompatibilities instead of silently truncating content.
 - [ ] Implement deferred definitions and tool search/discovery where required.
   Make loaded-tool changes session-scoped and persist the relevant configuration.
-- [ ] Extend action transitions for duplicate submissions, simultaneous resolution,
+- [x] Extend action transitions for duplicate submissions, simultaneous resolution,
   cancellation, and connection-generation changes, reusing G01/G04 guarantees.
 
 Acceptance: SDK success/error/content variants, boundary-size and Unicode cases,
 deferred discovery, conflicting retries, wrong-session IDs, concurrent callbacks,
 and backend loss before/after result submission. Additional review is required
 for new model-visible context items crossing repository size thresholds.
+
+Slice evidence (2026-09-28, function results): `actions::result_output`
+validates official results. Success takes a string or `input_text` /
+`input_image` parts, and a JSON object must be serialized first, as the guide
+says. Failure takes `error`, and mixing the two returns 400. Images must be
+`data:image/` URLs, since Codex rejects remote ones. Parts map one to one to
+Codex `inputText`/`inputImage` content items. The saved `function_call_output`
+uses the stored submission, so parts and strings round-trip exactly; it falls
+back to Codex's text only when nothing was stored.
+
+Limits: the public docs publish no result limit. Codex silently truncates tool
+output at 10,000 bytes, or 10,000 tokens for catalogued models. Result text is
+therefore capped at 10,000 UTF-8 bytes, which no truncation policy shortens, so
+the model sees exactly what is saved. Larger outputs are rejected, not
+truncated; no artifact path exists before G10. **Review flag:** this raises a
+model-visible item from about 256 tokens (1,024 bytes) to as many as roughly
+2,500–10,000 tokens. That crosses the repository's 1k-token review threshold
+while staying within its 10k hard cap. The prototype route keeps its 1,024-byte
+limit.
+
+Transitions: validation failures leave the call pending. Racing different
+results resolve once: the winner gets 202, the loser 409, and the winner's
+identical retry gets its receipt. A misrouted session gets the pending-call
+race error, and a result after cancellation gets 409. Backend loss before and
+after submission is covered by G01's reconcile tests.
+
+Test: `function_results_keep_their_content_limits_and_semantics`
+(tests/suite/functions.rs) checks that parts reach the provider as parts, the
+10,000-byte boundary with two-byte characters (accepted at the limit, rejected
+one character over), invalid shapes, a failed result with a Unicode error, a
+misrouted result, the race, and a late result after cancel.
+
+Deferred functions remain open by decision (2026-09-28). Codex supports
+deferred dynamic tools through tool search, but only when the model's
+`supports_search_tool` is set. The app-server's `model/list` does not report
+that flag, so a deferred function on an unsupported model would be silently
+unreachable. Execution therefore stays rejected with an explicit error. Lifting
+it needs an additive `supportsSearchTool` field on `model/list` (a shared-crate
+protocol change with schema regeneration) or equivalent worker-reported
+support.
 
 ## G07 — MCP and built-in capability control
 

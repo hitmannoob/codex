@@ -1,5 +1,6 @@
 use crate::ApiError;
 use crate::State;
+use crate::contract::invalid;
 use crate::resources::RequiredAction;
 use crate::resources::ToolResult;
 use axum::Json;
@@ -9,6 +10,7 @@ use axum::http::StatusCode;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_protocol::DynamicToolCallParams;
 use codex_app_server_protocol::RequestId;
+use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
@@ -19,6 +21,97 @@ pub(crate) struct Submission {
     turn_id: String,
     result: ToolResult,
     reply: oneshot::Sender<Result<Value, ApiError>>,
+}
+
+/// Most UTF-8 bytes of text in one public function result. Codex silently
+/// truncates longer tool output (10,000 bytes, or 10,000 tokens for catalogued
+/// models), so a larger result is rejected rather than shortened unseen.
+const MAX_RESULT_TEXT_BYTES: usize = 10_000;
+
+/// Validate a public function result and return its stored form: the output
+/// (a string or `input_text`/`input_image` parts) on success, or the error
+/// message on failure.
+pub(crate) fn result_output(
+    success: bool,
+    output: Option<Value>,
+    error: Option<String>,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", deny_unknown_fields)]
+    enum Part {
+        #[serde(rename = "input_text")]
+        Text { text: String },
+        #[serde(rename = "input_image")]
+        Image { image_url: String },
+    }
+    let (stored, text_bytes) = match (success, output, error) {
+        (true, _, Some(_)) => {
+            return Err(invalid("a successful tool result cannot contain an error"));
+        }
+        (false, Some(_), _) => {
+            return Err(invalid(
+                "a failed tool result reports its message in error, not output",
+            ));
+        }
+        (true, None, None) => (json!(""), 0),
+        (true, Some(Value::String(text)), None) => {
+            let bytes = text.len();
+            (Value::String(text), bytes)
+        }
+        (true, Some(parts), None) => {
+            let parsed: Vec<Part> = serde_json::from_value(parts.clone()).map_err(|_| {
+                invalid("output must be a string or an array of input_text and input_image parts")
+            })?;
+            let mut bytes = 0;
+            for part in parsed {
+                match part {
+                    Part::Text { text } => bytes += text.len(),
+                    // Codex prepares inline images itself and rejects remote URLs.
+                    Part::Image { image_url } if !image_url.starts_with("data:image/") => {
+                        return Err(invalid(
+                            "input_image requires a data:image URL; remote image URLs are not supported",
+                        ));
+                    }
+                    Part::Image { .. } => {}
+                }
+            }
+            (parts, bytes)
+        }
+        (false, None, error) => {
+            let error = error.unwrap_or_default();
+            let bytes = error.len();
+            (Value::String(error), bytes)
+        }
+    };
+    if text_bytes > MAX_RESULT_TEXT_BYTES {
+        return Err(invalid(format!(
+            "tool result text must be at most {MAX_RESULT_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(stored)
+}
+
+/// Codex content items for a stored result: a string is one text item and
+/// public content parts map one to one. Other JSON, which only the prototype
+/// route accepts, is sent as its serialized text.
+fn content_items(output: &Value) -> Value {
+    let parts = output.as_array().and_then(|parts| {
+        parts
+            .iter()
+            .map(|part| match part["type"].as_str() {
+                Some("input_text") => Some(json!({"type": "inputText", "text": part["text"]})),
+                Some("input_image") => {
+                    Some(json!({"type": "inputImage", "imageUrl": part["image_url"]}))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    match (parts, output) {
+        (Some(parts), _) => json!(parts),
+        (None, Value::String(text)) => json!([{"type": "inputText", "text": text}]),
+        (None, other) => json!([{"type": "inputText", "text": other.to_string()}]),
+    }
 }
 
 /// Apply the prototype limit on serialized tool output.
@@ -36,12 +129,26 @@ pub(crate) fn validate_output(output: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Prototype route: any JSON output, within the prototype size limit.
 pub(crate) async fn submit(
     Extract(state): Extract<Arc<State>>,
     Path((session_id, turn_id)): Path<(String, String)>,
     Json(result): Json<ToolResult>,
 ) -> Result<Json<Value>, ApiError> {
     validate_output(&result.output)?;
+    Ok(Json(
+        resolve_call(&state, session_id, turn_id, result).await?,
+    ))
+}
+
+/// Hand a validated result to the connection that owns the call and wait for
+/// its receipt.
+pub(crate) async fn resolve_call(
+    state: &State,
+    session_id: String,
+    turn_id: String,
+    result: ToolResult,
+) -> Result<Value, ApiError> {
     let (reply, received) = oneshot::channel();
     let submissions = state.submissions().ok_or_else(crate::disconnected_error)?;
     submissions
@@ -53,15 +160,12 @@ pub(crate) async fn submit(
         })
         .await
         .map_err(|_| crate::disconnected_error())?;
-    received
-        .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "tool result delivery unknown".into(),
-            )
-        })?
-        .map(Json)
+    received.await.map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tool result delivery unknown".into(),
+        )
+    })?
 }
 
 pub(crate) async fn register(
@@ -152,10 +256,12 @@ async fn deliver(
     sqlx::query("UPDATE tool_calls SET status = 'submitting', result = ? WHERE session_id = ? AND turn_id = ? AND call_id = ?")
         .bind(serialized).bind(session_id).bind(turn_id).bind(&result.call_id).execute(&state.store.0).await.map_err(anyhow::Error::from)?;
     let request_id = serde_json::from_str(&request_id).map_err(anyhow::Error::from)?;
-    let delivered = client.resolve_server_request(request_id, json!({
-        "success": result.success,
-        "contentItems": [{"type": "inputText", "text": result.output.as_str().map(str::to_owned).unwrap_or_else(|| result.output.to_string())}]
-    })).await;
+    let delivered = client
+        .resolve_server_request(
+            request_id,
+            json!({"success": result.success, "contentItems": content_items(&result.output)}),
+        )
+        .await;
     let status = if delivered.is_ok() {
         "submitted"
     } else {

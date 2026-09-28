@@ -48,7 +48,7 @@ enum Input {
         call_id: String,
         turn_id: String,
         success: bool,
-        output: Option<String>,
+        output: Option<Value>,
         error: Option<String>,
     },
 }
@@ -154,26 +154,20 @@ fn plan(events: Vec<Input>) -> Result<Vec<Event>, ApiError> {
                     output,
                     error,
                 } => {
-                    if success && error.is_some() {
-                        return Err(invalid("a successful tool result cannot contain an error"));
-                    }
-                    if output.is_some() && error.is_some() {
-                        return Err(invalid(
-                            "combined function output and error are not implemented",
-                        ));
-                    }
                     if !calls.insert((turn_id.clone(), call_id.clone())) {
                         return Err(invalid(format!(
                             "tool call {call_id} is resolved more than once"
                         )));
                     }
-                    let result = ToolResult {
-                        call_id,
-                        success,
-                        output: json!(error.or(output).unwrap_or_default()),
-                    };
-                    crate::actions::validate_output(&result.output)?;
-                    Event::ToolResult { turn_id, result }
+                    let output = crate::actions::result_output(success, output, error)?;
+                    Event::ToolResult {
+                        turn_id,
+                        result: ToolResult {
+                            call_id,
+                            success,
+                            output,
+                        },
+                    }
                 }
             })
         })
@@ -230,12 +224,7 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
                 }
             }
             Event::ToolResult { turn_id, result } => {
-                let _ = crate::actions::submit(
-                    Extract(Arc::clone(state)),
-                    Path((id.to_owned(), turn_id)),
-                    Json(result),
-                )
-                .await?;
+                crate::actions::resolve_call(state, id.to_owned(), turn_id, result).await?;
             }
         }
     }

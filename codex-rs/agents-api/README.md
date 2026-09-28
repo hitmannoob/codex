@@ -174,8 +174,20 @@ proceed concurrently. Each Codex thread is resumed once per backend connection.
 Deferred functions, tool search, enabled programmatic calling, public MCP/web
 search, and enabled multi-agent configurations can be saved/retrieved but their
 execution is rejected until G06–G08. Disabled programmatic calling/web search are
-accepted. Function results currently accept text `output` or separate text
-`error`. Vaults are rejected. Prototype size limits below still apply.
+accepted. Vaults are rejected. Prototype size limits below still apply to the
+original routes.
+
+A successful function result carries `output`: a string, or an array of
+`input_text` and `input_image` parts. Images must be `data:image/` URLs, and
+JSON objects must be serialized to strings first. A failed result carries its
+message in `error`. Mixing `output` with `success: false`, or `error` with
+`success: true`, returns 400. Result text is limited to 10,000 UTF-8 bytes,
+because Codex silently truncates longer tool output (10,000 bytes, or 10,000
+tokens for catalogued models); rejecting it keeps what the model sees equal to
+what is saved. The saved `function_call_output` item keeps the result exactly
+as submitted. A result rejected by validation leaves its call pending. A result
+for a call that was cancelled, or already resolved differently, returns 409;
+an identical resubmission returns its receipt.
 
 The runtime tests require the real `codex-app-server` binary: build it with the
 command above before `just test -p codex-agents-api`. They exercise the actual
@@ -262,7 +274,7 @@ Application function requests are persisted before `session.requires_action` is
 emitted. Retrieve `requiredActions` if the event was missed. Each action contains
 `turnId`, `callId`, `name`, and `arguments`. Submit a result to the tool-results
 route with the same IDs; `success: false` delivers a tool failure to the model.
-Output may be JSON or text, limited to 1024 serialized UTF-8 bytes. Resolving the
+On this prototype route, output may be JSON or text, limited to 1024 serialized UTF-8 bytes. Resolving the
 request continues the same turn. MCP tools execute through Codex without this
 application callback.
 

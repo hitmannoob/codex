@@ -2,6 +2,7 @@
 use crate::ApiError;
 use crate::State;
 use crate::resources::RequiredAction;
+use crate::resources::ToolResult;
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::Query;
@@ -268,7 +269,7 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             }
             events.extend(published.done);
             if done && item["type"] == "dynamicToolCall" {
-                let output = item["contentItems"]
+                let text = item["contentItems"]
                     .as_array()
                     .into_iter()
                     .flatten()
@@ -276,7 +277,22 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                     .collect::<Vec<_>>()
                     .join("\n");
                 let failed = item["success"] == false || item["status"] == "failed";
-                let output = json!({"id":format!("output_{item_id}"),"type":"function_call_output","turn_id":turn_id,"call_id":item["id"],"status":if failed {"failed"} else {"completed"},"output":if failed {Value::Null} else {json!(output)},"error":if failed {json!(output)} else {Value::Null}});
+                // Save the result as submitted (a string or content parts); fall
+                // back to Codex's text when no matching submission was stored.
+                let stored: Option<String> = sqlx::query_scalar("SELECT result FROM tool_calls WHERE session_id = ? AND turn_id = ? AND call_id = ?")
+                    .bind(&id).bind(turn_id).bind(codex_id).fetch_optional(&mut *tx).await.map_err(anyhow::Error::from)?.flatten();
+                let stored: Option<ToolResult> = stored
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(anyhow::Error::from)?;
+                let (result, error) = match (stored, failed) {
+                    (Some(stored), false) if stored.success => (stored.output, Value::Null),
+                    (Some(stored), true) if !stored.success => (Value::Null, stored.output),
+                    (_, false) => (json!(text), Value::Null),
+                    (_, true) => (Value::Null, json!(text)),
+                };
+                let output = json!({"id":format!("output_{item_id}"),"type":"function_call_output","turn_id":turn_id,"call_id":item["id"],"status":if failed {"failed"} else {"completed"},"output":result,"error":error});
                 let published = publish_item(&mut tx, &id, turn_id, &output, /*done*/ true).await?;
                 events.extend(published.added);
             }
