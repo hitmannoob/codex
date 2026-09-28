@@ -195,9 +195,11 @@ root agent can spawn subagents, each a Codex child thread, up to
   toward the session.
 - **Deletion:** a session whose subagent is still working cannot be deleted.
 
-Not supported with V2: `wait_for_subagents_call`, `close_subagent_call`,
-`resume_subagent_call`, and `closed` status. Cancelling a turn does not stop
-running subagents, and subagent threads are not resumed after a restart.
+Cancelling (`agent.session.input.cancel`) stops all of the session's running
+work: its own turn and any turn a subagent is running. After a restart, the
+root can hand an existing subagent more work, and its new turns are recorded
+under the same subagent. Not supported with V2: `wait_for_subagents_call`,
+`close_subagent_call`, `resume_subagent_call`, and `closed` status.
 Codex's goal tools are disabled for every session.
 
 Public MCP servers run when they use HTTP with `connection_origin: service`

@@ -845,9 +845,23 @@ Tests:
 - `tests/sdk_subagents.py` (strict SDK lifecycle) validates every streamed
   event and all six subagent operations through the pinned SDK.
 
+Cancellation and restart (2026-09-28):
+- **Cancel:** `agent.session.input.cancel` now interrupts every running turn in
+  the session: its own and any subagent's. Otherwise a cancelled session could
+  keep running, and could not be deleted. An interrupt that races a subagent
+  turn ending on its own is tolerated.
+- **Restart:** the stored registry routes a resumed child's notifications to
+  the same subagent. After an API and worker restart, the root's
+  `followup_task` resumed the existing `/root/researcher`, and its second turn
+  was recorded under the same subagent, with a `send_subagent_input_call` in
+  root history.
+- **Tests:** both are covered by
+  `subagents_are_registered_attributed_and_kept_apart`. That includes a cancel
+  on a session whose root turn had already ended, so only the propagation could
+  interrupt the child; after it, the session deletes cleanly. The test passed
+  15 isolated runs.
+
 Remaining:
-- Cancelling a root turn does not interrupt running subagents.
-- Subagent threads are not resumed after a restart.
 - Codex V2 never reports `wait_for_subagents_call`, `close_subagent_call`,
   `resume_subagent_call`, `agent_message`, or `closed` status.
 - Subagent task text and settings are unavailable.

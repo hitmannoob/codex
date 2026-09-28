@@ -1,4 +1,5 @@
 use super::*;
+use app_test_support::create_final_assistant_message_sse_response;
 use pretty_assertions::assert_eq;
 
 fn last_input(request: &wiremock::Request) -> String {
@@ -135,6 +136,45 @@ async fn subagents_are_registered_attributed_and_kept_apart() -> anyhow::Result<
         for path in ["subagents/missing", &format!("subagents/{sub_id}/turns/{}", root_turns["data"][0]["id"].as_str().unwrap_or_default())] {
             assert_eq!(client.get(format!("{url}/{path}")).bearer_auth(TOKEN).send().await?.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
         }
+
+        // After a restart, the root can hand the same subagent more work; its
+        // new turn is recorded under the same subagent.
+        Mock::given(|request: &wiremock::Request| last_input(request).contains("follow-up-work"))
+            .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_raw(sse(&[
+                json!({"type":"response.created","response":{"id":"followup"}}),
+                json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"followup-call","namespace":"collaboration","name":"followup_task",
+                    "arguments":json!({"target":"/root/researcher","message":"second-task"}).to_string()}}),
+                json!({"type":"response.completed","response":{"id":"followup","status":"completed","output":[]}}),
+            ]), "text/event-stream"))
+            .with_priority(/*p*/ 1).up_to_n_times(/*n*/ 1).mount(&provider).await;
+        Mock::given(|request: &wiremock::Request| last_input(request).contains("second-task"))
+            .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_raw(create_final_assistant_message_sse_response("second-report")?, "text/event-stream"))
+            .with_priority(/*p*/ 1).up_to_n_times(/*n*/ 1).mount(&provider).await;
+        server.abort();
+        api.shutdown().await?;
+        let api = AgentsApi::new(backend(home.path()).await?, AbsolutePathBuf::from_absolute_path(data.path())?, TOKEN.into()).await?;
+        let (base, server) = capabilities::serve(&api).await?;
+        let url = format!("{base}/agents/sessions/{}", session["id"].as_str().context("session id")?);
+        let response = client.post(format!("{url}/events")).bearer_auth(TOKEN)
+            .json(&json!({"events":[{"type":"agent.session.input.message","input":"follow-up-work"}]})).send().await?;
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let turns_url = format!("{url}/subagents/{sub_id}/turns?order=asc");
+        let resumed = tokio::time::timeout(Duration::from_secs(/*secs*/ 20), async {
+            loop {
+                let turns = request(&client, reqwest::Method::GET, &turns_url, Value::Null).await?;
+                if turns["data"].as_array().is_some_and(|turns| turns.len() == 2 && turns[1]["status"] == "completed") {
+                    return Ok::<_, anyhow::Error>(turns);
+                }
+                tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await;
+            }
+        }).await??;
+        assert_eq!(resumed["data"][1]["subagent_id"], json!(sub_id));
+        assert!(request(&client, reqwest::Method::GET, &format!("{url}/subagents/{sub_id}/items"), Value::Null).await?.to_string().contains("second-report"));
+        assert_eq!(request(&client, reqwest::Method::GET, &format!("{url}/subagents"), Value::Null).await?["data"].as_array().map(Vec::len), Some(1));
+        let root_items = request(&client, reqwest::Method::GET, &format!("{url}/items?order=asc"), Value::Null).await?;
+        let handoff = root_items["data"].as_array().context("items")?.iter().find(|item| item["type"] == "send_subagent_input_call").context("handoff item")?;
+        assert_eq!(json!({"sender":handoff["sender_agent_id"],"recipient":handoff["recipient_agent_id"]}), json!({"sender":session["agent"]["id"],"recipient":sub_id}));
+        idle(&client, &url, /*expected_turns*/ 2).await?;
         request(&client, reqwest::Method::DELETE, &url, Value::Null).await?;
         assert_eq!(client.get(format!("{url}/subagents")).bearer_auth(TOKEN).send().await?.status(), reqwest::StatusCode::NOT_FOUND);
 
@@ -158,6 +198,21 @@ async fn subagents_are_registered_attributed_and_kept_apart() -> anyhow::Result<
         idle(&client, &busy_url, /*expected_turns*/ 1).await?;
         stalled.wait_until_satisfied().await;
         assert_eq!(client.delete(&busy_url).bearer_auth(TOKEN).send().await?.status(), reqwest::StatusCode::CONFLICT);
+        // Cancelling the session stops its subagent's work, and it can then be deleted.
+        let response = client.post(format!("{busy_url}/events")).bearer_auth(TOKEN)
+            .json(&json!({"events":[{"type":"agent.session.input.cancel"}]})).send().await?;
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let slow_id = request(&client, reqwest::Method::GET, &format!("{busy_url}/subagents"), Value::Null).await?["data"][0]["id"].as_str().context("slow id")?.to_owned();
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+            loop {
+                let turns = request(&client, reqwest::Method::GET, &format!("{busy_url}/subagents/{slow_id}/turns"), Value::Null).await?;
+                if turns["data"][0]["status"] == "cancelled" {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await;
+            }
+        }).await??;
+        request(&client, reqwest::Method::DELETE, &busy_url, Value::Null).await?;
         server.abort();
         api.shutdown().await?;
         Ok::<_, anyhow::Error>(())

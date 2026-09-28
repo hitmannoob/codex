@@ -214,13 +214,24 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
             Event::Message(items) => {
                 crate::routes::start_turn(state, id, items).await?;
             }
+            // Cancelling stops all of the session's running work: its own turn
+            // and any turn a subagent is running.
             Event::Cancel => {
-                if let Some(turn) = crate::records::active_turn(state, id).await? {
-                    let _ = crate::routes::cancel(
-                        Extract(Arc::clone(state)),
-                        Path((id.to_owned(), turn)),
-                    )
-                    .await?;
+                for (thread_id, turn_id, subagent) in
+                    crate::records::running_turns(state, id).await?
+                {
+                    match state
+                        .rpc(
+                            "turn/interrupt",
+                            json!({"threadId": thread_id, "turnId": turn_id}),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        // A subagent's turn can end on its own before the interrupt.
+                        Err(error) if subagent && error.0 == StatusCode::BAD_GATEWAY => {}
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             Event::ToolResult { turn_id, result } => {

@@ -124,9 +124,14 @@ pub(crate) async fn save<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
     Ok(())
 }
 
-pub(crate) async fn active_turn(state: &State, id: &str) -> Result<Option<String>, ApiError> {
-    sqlx::query_scalar("SELECT id FROM public_records WHERE session_id = ? AND kind = 'turn' AND subagent_id IS NULL AND json_extract(data, '$.status') IN ('queued','in_progress','waiting') ORDER BY seq DESC LIMIT 1")
-        .bind(id).fetch_optional(&state.store.0).await.map_err(anyhow::Error::from).map_err(Into::into)
+/// Every running turn in a session, the session's own first, as (thread ID,
+/// turn ID, whether a subagent runs it).
+pub(crate) async fn running_turns(
+    state: &State,
+    id: &str,
+) -> Result<Vec<(String, String, bool)>, ApiError> {
+    sqlx::query_as("SELECT coalesce(a.thread_id, s.thread_id), r.id, r.subagent_id IS NOT NULL FROM public_records r JOIN sessions s ON s.id = r.session_id LEFT JOIN subagents a ON a.session_id = r.session_id AND a.id = r.subagent_id WHERE r.session_id = ? AND r.kind = 'turn' AND json_extract(r.data, '$.status') IN ('queued', 'in_progress', 'waiting') ORDER BY r.subagent_id IS NOT NULL, r.seq")
+        .bind(id).fetch_all(&state.store.0).await.map_err(anyhow::Error::from).map_err(Into::into)
 }
 
 pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiError> {
