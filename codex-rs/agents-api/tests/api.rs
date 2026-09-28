@@ -81,6 +81,33 @@ async fn request(
     Ok(body)
 }
 
+/// Poll a public session until it is idle with at least `expected_turns` turns.
+async fn idle(client: &reqwest::Client, url: &str, expected_turns: usize) -> anyhow::Result<Value> {
+    loop {
+        let session = request(client, reqwest::Method::GET, url, Value::Null).await?;
+        match session["status"].as_str() {
+            Some("idle") => {
+                let turns = request(
+                    client,
+                    reqwest::Method::GET,
+                    &format!("{url}/turns"),
+                    Value::Null,
+                )
+                .await?;
+                if turns["data"]
+                    .as_array()
+                    .is_some_and(|turns| turns.len() >= expected_turns)
+                {
+                    return Ok(session);
+                }
+                tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await;
+            }
+            Some("failed") => anyhow::bail!("session failed: {session}"),
+            _ => tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await,
+        }
+    }
+}
+
 async fn completed(events: &mut reqwest::Response) -> anyhow::Result<Value> {
     event(events, "turn/completed").await
 }
@@ -339,3 +366,9 @@ mod reconcile_functions;
 
 #[path = "suite/configuration.rs"]
 mod configuration;
+
+#[path = "suite/sessions.rs"]
+mod sessions;
+
+#[path = "suite/input.rs"]
+mod input;

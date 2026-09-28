@@ -142,6 +142,16 @@ async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Res
         .bind(serde_json::to_string(&agent)?)
         .execute(&store.0)
         .await?;
+    for statement in [
+        "DROP TABLE public_sessions",
+        "DROP TABLE public_session_sequence",
+        "DROP TABLE session_cleanup",
+        "DROP TABLE input_requests",
+        "CREATE TABLE public_sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL)",
+        "INSERT INTO public_sessions (id, data) VALUES ('legacy-session', '{}')",
+    ] {
+        sqlx::query(statement).execute(&store.0).await?;
+    }
     sqlx::query("DROP TABLE _sqlx_migrations")
         .execute(&store.0)
         .await?;
@@ -153,6 +163,11 @@ async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Res
         .await?;
     assert!(applied >= 1, "adoption must re-record the baseline");
     assert_eq!(adopted.agent(&agent.id).await?, Some(agent));
+    let sessions: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id, created_seq FROM public_sessions")
+            .fetch_all(&adopted.0)
+            .await?;
+    assert_eq!(sessions, vec![("legacy-session".to_string(), 1)]);
     adopted.0.close().await;
     Ok(())
 }

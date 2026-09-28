@@ -82,8 +82,11 @@ remain available without that header. New session routes are:
 | POST / GET | `/v1/agents` | Create saved agents / list in creation order |
 | GET / POST / DELETE | `/v1/agents/{id}` | Retrieve, update, or delete a saved agent |
 | POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, required initial input, optional SSE |
+| GET | `/v1/agents/sessions` | List in creation order, optionally filtered by `agent_id` |
 | GET | `/v1/agents/sessions/{id}` | Configuration snapshot, status, metadata and current `required_actions` |
-| POST | `/v1/agents/sessions/{id}/events` | Message/steering, cancel, or function result/error; empty HTTP 202 |
+| POST | `/v1/agents/sessions/{id}` | Replace metadata; change model, reasoning effort, or service tier for later turns |
+| DELETE | `/v1/agents/sessions/{id}` | Delete a session with no running turn; its Codex thread is removed afterwards |
+| POST | `/v1/agents/sessions/{id}/events` | Batch of message/steering, cancel, and function result/error events; optional `Idempotency-Key`; empty HTTP 202 |
 | GET | `/v1/agents/sessions/{id}/events` | Live normalized session, turn, item and completed-text events |
 | GET | `/v1/agents/sessions/{id}/items` | Saved messages, reasoning and function records |
 | GET | `/v1/agents/sessions/{id}/turns` | Saved outcomes |
@@ -96,8 +99,8 @@ and history, and merge buffered updates by item ID. A lagged stream closes.
 Backend notification loss fails the connection rather than serving incomplete
 history as healthy. Backend loss marks active public turns failed, without replay.
 
-This stage accepts only `environment: {"type":"none"}`, one text user message
-per request, and one input event per request. Saved agents support names,
+This stage accepts only `environment: {"type":"none"}` and one user message per
+message event. Saved agents support names,
 metadata, model/instructions, reasoning effort/summary, text format/verbosity,
 service tier, multi-agent configuration, and the pinned SDK tool variants.
 Omitted fields preserve saved values; supplied objects replace them; null resets
@@ -114,13 +117,46 @@ support still governs available model settings. `fast` maps to `priority` and
 requires advertised model support. An explicit `default` tier is forwarded to
 Responses, including after cold resume; omitted/`auto` leaves the tier unset.
 
+Session updates follow the same omitted/null rules for their four fields. A
+running turn keeps the settings it started with; the next turn uses the update.
+Deleting a session that is `in_progress` or `requires_action`, or whose worker
+thread is still active, returns 409: cancel first. Deletion removes the public
+records at once, ends that session's open streams, and queues the Codex thread
+for deletion in the worker. The queue survives API restarts and is retried on
+each backend connection, so a session with a thread needs a connected backend
+to be deleted (otherwise 503).
+
+An events request holds 1–32 events. Any number of tool results may be combined
+with at most one message or one cancel event, never both, and each call may be
+resolved only once. The whole batch is validated first: an unknown pending
+call, a call that is no longer pending, or a disconnected backend rejects it
+before anything runs. Events then run in array order and stop at the first
+failure; earlier events stay applied. An unknown call returns 400 with code
+`invalid_request_error` and message `Unknown pending tool call: <call_id>`,
+which the pinned SDK retries because a call's item event can arrive before the
+call is registered. A message holds `input_text` parts totalling at most 8,192
+bytes plus `input_image` parts. Images must be `data:image/` URLs: Codex rejects
+remote image URLs, and invalid image data is left to Codex's image preparation.
+
+`Idempotency-Key` (1–255 visible ASCII characters) is scoped to one session and
+retained for 24 hours:
+- Retrying the identical request replays its stored status.
+- Reusing the key for a different request returns 400.
+- Retrying while the first attempt still runs returns 409.
+- A request rejected before anything ran (validation, missing session, or
+  disconnected backend) leaves the key unused.
+- If an attempt was interrupted after dispatch (backend loss, an internal error,
+  or an API crash), the key reports an unknown outcome with 409 and never runs
+  the request again. Read the session and resubmit with a new key.
+
+The key deduplicates HTTP requests; it does not make execution exactly-once.
+
 Deferred functions, tool search, enabled programmatic calling, public MCP/web
 search, and enabled multi-agent configurations can be saved/retrieved but their
 execution is rejected until G06–G08. Disabled programmatic calling/web search are
 accepted. Function results currently accept text `output` or separate text
-`error`. Event batches, vaults and idempotency keys are rejected. Prototype size
-limits below still apply. Session list/update/delete, usage accounting, and
-incremental text deltas remain open.
+`error`. Vaults are rejected. Prototype size limits below still apply. Usage accounting and incremental text deltas remain
+open.
 
 The runtime tests require the real `codex-app-server` binary: build it with the
 command above before `just test -p codex-agents-api`. They exercise the actual
@@ -240,6 +276,5 @@ acceptance remain separate checks.
 
 Review stages: capability configuration (`capabilities.rs` and Agent fields),
 then the durable function bridge (`actions.rs`, store, routes, and worker), with
-the integration fixture validating their combined behavior. Agent updates,
-approval endpoints, environment provisioning, and distributed recovery remain
-subsequent stages.
+the integration fixture validating their combined behavior. Approval endpoints,
+environment provisioning, and distributed recovery remain subsequent stages.

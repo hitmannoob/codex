@@ -21,12 +21,9 @@ pub(crate) struct Submission {
     reply: oneshot::Sender<Result<Value, ApiError>>,
 }
 
-pub(crate) async fn submit(
-    Extract(state): Extract<Arc<State>>,
-    Path((session_id, turn_id)): Path<(String, String)>,
-    Json(result): Json<ToolResult>,
-) -> Result<Json<Value>, ApiError> {
-    if serde_json::to_vec(&result.output)
+/// Apply the prototype limit on serialized tool output.
+pub(crate) fn validate_output(output: &Value) -> Result<(), ApiError> {
+    if serde_json::to_vec(output)
         .map_err(anyhow::Error::from)?
         .len()
         > 1024
@@ -36,6 +33,15 @@ pub(crate) async fn submit(
             "tool output must be at most 1024 bytes".into(),
         ));
     }
+    Ok(())
+}
+
+pub(crate) async fn submit(
+    Extract(state): Extract<Arc<State>>,
+    Path((session_id, turn_id)): Path<(String, String)>,
+    Json(result): Json<ToolResult>,
+) -> Result<Json<Value>, ApiError> {
+    validate_output(&result.output)?;
     let (reply, received) = oneshot::channel();
     let submissions = state.submissions().ok_or_else(crate::disconnected_error)?;
     submissions

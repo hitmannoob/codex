@@ -188,20 +188,7 @@ fn take_agent_details(
     };
     let metadata = match object.remove("metadata") {
         None => previous_metadata,
-        Some(Value::Null) => Default::default(),
-        Some(value) => {
-            let metadata: std::collections::BTreeMap<String, String> =
-                serde_json::from_value(value)
-                    .map_err(|_| crate::contract::invalid("metadata must contain string pairs"))?;
-            if metadata.len() > 16
-                || metadata
-                    .iter()
-                    .any(|(key, value)| key.chars().count() > 64 || value.chars().count() > 512)
-            {
-                return Err(crate::contract::invalid("metadata exceeds its size limit"));
-            }
-            metadata
-        }
+        Some(value) => crate::configuration::metadata(value)?,
     };
     Ok((name, metadata))
 }
@@ -306,7 +293,7 @@ async fn read_session(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "session not found".into()))
 }
 
-pub(crate) async fn input(
+async fn input(
     Extract(state): Extract<Arc<State>>,
     Path(id): Path<String>,
     Json(params): Json<InputParams>,
@@ -317,16 +304,32 @@ pub(crate) async fn input(
             "input must be 1-8192 bytes".into(),
         ));
     }
+    Ok(Json(
+        start_turn(
+            &state,
+            &id,
+            vec![json!({"type": "text", "text": params.input})],
+        )
+        .await?,
+    ))
+}
+
+/// Start a turn with Codex user input items, or steer the active turn.
+pub(crate) async fn start_turn(
+    state: &Arc<State>,
+    id: &str,
+    items: Vec<Value>,
+) -> Result<Value, ApiError> {
     // Serialize bootstrap and submission, not the model/tool execution that follows.
     let _permit = state
         .input_gate
         .acquire()
         .await
         .map_err(anyhow::Error::from)?;
-    let Json(session) = read_session(Extract(Arc::clone(&state)), Path(id.clone())).await?;
+    let Json(session) = read_session(Extract(Arc::clone(state)), Path(id.to_owned())).await?;
     crate::configuration::validate_execution(&session.agent.config)?;
     let config =
-        crate::capabilities::overrides(&state, &session.agent.config, &session.environment).await?;
+        crate::capabilities::overrides(state, &session.agent.config, &session.environment).await?;
     let thread_id = if let Some(thread_id) = session.thread_id {
         state
             .rpc(
@@ -372,17 +375,16 @@ pub(crate) async fn input(
             .await?;
         sqlx::query("UPDATE sessions SET thread_id = ? WHERE id = ?")
             .bind(&thread_id)
-            .bind(&id)
+            .bind(id)
             .execute(&state.store.0)
             .await
             .map_err(anyhow::Error::from)?;
         thread_id
     };
-    Ok(Json(
-        state
+    state
             .rpc(
                 "turn/start",
-                json!({"threadId": thread_id, "input": [{"type": "text", "text": params.input}],
+                json!({"threadId": thread_id, "input": items,
                     // A complete settings value clears inherited effort; effort:null alone is a no-op.
                     "collaborationMode":{"mode":"default","settings":{
                         "model":session.agent.config.model,
@@ -402,8 +404,7 @@ pub(crate) async fn input(
                     },
                 }),
             )
-            .await?,
-    ))
+            .await
 }
 
 async fn turns(

@@ -23,7 +23,9 @@ fn pinned_sdk_matches_operation_inventory() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+// Image preparation in the in-process worker blocks in place, which requires the
+// multi-threaded runtime the API binary uses.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires CODEX_AGENTS_API_SDK_PYTHON pointing to a Python with openai==3.17.0"]
 async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(/*secs*/ 45), async {
@@ -36,6 +38,13 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             capabilities::call("lookup", "sdk-call"),
             done.clone(),
             capabilities::call("lookup", "sdk-error"),
+            done.clone(),
+            done.clone(),
+            done.clone(),
+            // Input semantics: session creation, the SDK stream helper's
+            // function call and follow-up, then the keyed image message.
+            done.clone(),
+            capabilities::call("lookup", "sdk-handler"),
             done.clone(),
             done.clone(),
             done,
@@ -107,6 +116,11 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             );
         }
         let requests = model.received_requests().await.context("requests")?;
+        assert!(
+            requests
+                .iter()
+                .any(|request| String::from_utf8_lossy(&request.body).contains("\"input_image\""))
+        );
         let last: Value = serde_json::from_slice(&requests.last().context("last request")?.body)?;
         assert!(last["input"].to_string().contains("orange-731"));
         assert!(last["input"].to_string().contains("sdk-result-731"));

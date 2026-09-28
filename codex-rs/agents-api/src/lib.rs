@@ -3,10 +3,12 @@ mod agent_tools;
 mod capabilities;
 mod configuration;
 mod contract;
+mod input;
 mod reconcile;
 mod records;
 mod resources;
 mod routes;
+mod sessions;
 mod store;
 
 use axum::Json;
@@ -119,9 +121,14 @@ impl ApiError {
         } else {
             "invalid_request_error"
         };
+        // The pinned SDK recognizes the pending-call registration race by code.
+        let code = self
+            .1
+            .starts_with(input::UNKNOWN_PENDING_CALL)
+            .then_some("invalid_request_error");
         (
             self.0,
-            Json(json!({"error": {"message":self.1,"type":kind,"param":null,"code":null}})),
+            Json(json!({"error": {"message":self.1,"type":kind,"param":null,"code":code}})),
         )
             .into_response()
     }
@@ -212,6 +219,10 @@ impl AgentsApi {
         // fail the reconnect, since the service is otherwise ready.
         if let Err(error) = reconcile::run(&self.state).await {
             eprintln!("agents-api: reconciliation failed: {error:#}");
+        }
+        // Retry thread deletions a previous connection or process left queued.
+        if let Err(error) = sessions::cleanup(&self.state).await {
+            eprintln!("agents-api: session cleanup failed: {error:#}");
         }
         Ok(())
     }

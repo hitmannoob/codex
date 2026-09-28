@@ -25,8 +25,11 @@ These capabilities already exist; extend them rather than rebuilding them:
 
 - Saved-agent creation/retrieval, inline configuration, and session snapshots for
   the supported model, instructions, reasoning, and function-tool fields.
-- Session creation/retrieval, text input, steering, cancellation, and function
-  success/error submission on the supported official-style session routes.
+- Session creation/retrieval/list/update/delete, text and data-URL image input,
+  steering, cancellation, and function success/error submission on the
+  supported official-style session routes. Input events accept validated ordered
+  batches and a session-scoped `Idempotency-Key`. Deletion refuses running work and removes the
+  owned Codex thread through a durable cleanup queue.
 - Durable normalized session, turn, and item records with pagination/filtering.
 - Live session events; HTTP stream disconnection does not cancel execution.
 - API-owned app-server startup, initialization timeout, persistent worker home,
@@ -403,18 +406,23 @@ under normal use, retries, concurrency, and restart.
 
 Starting points: `src/contract.rs`, `src/routes.rs`, and `src/store.rs`.
 
-- [ ] Implement session listing/filtering and the supported update fields. Define
+- [x] Implement session listing/filtering and the supported update fields. Define
   what may change while a turn is active and apply changes at the correct boundary.
-- [ ] Implement deletion as an owned-resource lifecycle operation: stop/admit work
+- [x] Implement deletion as an owned-resource lifecycle operation: stop/admit work
   as specified, terminate streams appropriately, and schedule owned cleanup.
   Never delete a caller's workspace or terminate caller-owned compute.
-- [ ] Implement the remaining creation semantics, including optional initial input
+  Self-hosted environment ownership is covered when G09 adds attachment.
+- [x] Implement the remaining creation semantics, including optional initial input
   only where allowed by the pinned contract, and remaining input content variants.
-- [ ] Add event batches with the documented validation, ordering, and atomicity
+  The pinned SDK requires initial input for environment `none`; optional input
+  arrives with the environments that allow it (G09). Codex rejects remote image
+  URLs, so only `data:image/` images are accepted.
+- [x] Add event batches with the documented validation, ordering, and atomicity
   rules. Define behavior for mixed message/cancel/function-result batches.
-- [ ] Implement idempotency only for operations that support it. Persist scope,
+  The public docs define no batch rules, so the rules below are local decisions.
+- [x] Implement idempotency only for operations that support it. Persist scope,
   key, request fingerprint, outcome, and retention rules; reject conflicting reuse.
-- [ ] Separate request deduplication from execution recovery: a crash between
+- [x] Separate request deduplication from execution recovery: a crash between
   dispatch and receipt persistence is ambiguous unless reconciliation proves the
   outcome. Do not claim exactly-once execution from an HTTP idempotency table.
 - [ ] Replace unnecessary global serialization with per-session coordination where
@@ -423,6 +431,82 @@ Starting points: `src/contract.rs`, `src/routes.rs`, and `src/store.rs`.
 Acceptance: SDK list/update/delete; empty-initial-input cases if supported; batch
 validation; retry/conflict cases; concurrent same-session versus independent-session
 requests; deletion during active work; and restart around input acceptance.
+
+Slice evidence (2026-09-28, session management): `src/sessions.rs` adds list,
+update, and delete on `/v1/agents/sessions`. Migration `0003` gives public
+sessions a creation sequence that is never reused (the agents pattern) and adds
+a `session_cleanup` queue. Listing uses exclusive cursors and rejects unknown,
+deleted, or filter-mismatched ones. Updates replace metadata and change only
+model, reasoning effort (keeping the snapshot's summary), and service tier.
+Each turn reads the snapshot at `turn/start`, so a running turn keeps its
+settings and the next turn uses the update. Delete holds input admission and
+returns 409 while the public status is `in_progress`/`requires_action` or the
+worker reports the thread `active`. It then removes the public records in one
+transaction, queues the thread, ends that session's streams, and calls
+`thread/delete` in the background. Queue rows are removed only after the worker
+confirms, and every reconnect retries them. The G02 tombstone item is covered
+by this queue: deleted public data is removed outright and only the worker
+thread outlives the request. To keep concurrent status changes from overwriting
+update fields, session transitions now write only status/error/last_active_at
+inside write transactions. Notification handlers resolve their session inside
+one `BEGIN IMMEDIATE` transaction, so a concurrent deletion is skipped cleanly
+instead of failing the backend pump. Agents and sessions share one metadata
+validator. Tests: `tests/sdk_sessions.py` (from the strict SDK lifecycle)
+covers ordering, pagination, `agent_id` filtering, cursor errors, update/reset
+and rejection cases, 409 during pending-function and running turns, and 404s
+after deletion. `session_updates_apply_next_turn_and_deletion_waits_then_cleans_up`
+(tests/suite/sessions.rs) checks provider requests for the updated
+model/effort/tier on the next turn, 409 then cancel then delete, stream
+termination, removal of only the deleted session's rollout, and a queued cleanup
+finishing after an API restart. `migrations_record_a_ledger_and_adopt_a_legacy_database`
+now also adopts a legacy `public_sessions` table and assigns its creation order.
+Run on macOS with a mock provider.
+
+Slice evidence (2026-09-28, input semantics): `src/input.rs` replaces the
+single-event handler. The pinned SDK is the only contract evidence:
+`events.create` takes an `Idempotency-Key`; `sessions.stream` sends one per
+input and per tool result and retries a result only on 400 with code
+`invalid_request_error` and message `Unknown pending tool call: <call_id>`. The
+app-server emits a function call's `item/started` before its request, so that
+registration race is real and now gets exactly that error. The public guides
+define neither batch nor idempotency semantics, so these are local decisions:
+- **Batches:** 1–32 events; tool results plus at most one message or one
+  cancel; each call resolved once.
+- **Validation:** parsing, limits, call state, and backend connectivity are
+  checked for the whole batch before anything runs. Events then run in order
+  and stop at the first failure.
+- **Messages:** one user message of `input_text` (≤8,192 bytes total) and
+  `data:image/` `input_image` parts. They map to Codex `text`/`image` input and
+  are saved as public `input_image` items. Codex rejects remote image URLs, so
+  they are rejected up front.
+- **Keys:** migration `0004` stores the request, state, and outcome per
+  (session, key) for 24 hours. A key is claimed in a `BEGIN IMMEDIATE`
+  transaction. It is released if nothing was dispatched, and stored as
+  `completed` for replay otherwise. A 503/500 during dispatch leaves it
+  `unknown`, and startup turns every `pending` key `unknown`. Unknown keys
+  return 409 and never re-run: deduplication is kept separate from execution
+  recovery.
+
+Tests: `tests/sdk_input.py` (strict SDK lifecycle) runs `sessions.stream` with a
+tool handler, checks the unknown-call error with the SDK's own
+`is_pending_call_race`, replays a keyed text-and-image message without a second
+turn, checks the saved image content, and rejects each invalid batch and key
+shape without running anything. The lifecycle also asserts that a provider
+request carried `input_image`. It now runs on a multi-threaded runtime: Codex
+image preparation calls `block_in_place`, which panics on the current-thread
+test runtime. The CLI binary already runs multi-threaded.
+`keyed_batches_run_once_and_interrupted_keys_report_unknown`
+(tests/suite/input.rs) covers:
+- a `[tool_result, cancel]` batch that delivers the result and then cancels the
+  resumed turn;
+- a keyed message replayed with exactly one provider request;
+- reuse of a key with different input returning 400;
+- a key left `pending` by a simulated API crash reporting 409 unknown after
+  restart, while a new key runs.
+
+Codex runs dynamic tools one at a time, so a batch resolving two pending calls
+cannot occur against this worker and is not exercised. Run on macOS with a mock
+provider.
 
 ## G05 — Events, items, turns, and usage
 

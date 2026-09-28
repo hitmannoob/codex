@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +48,23 @@ pub(crate) fn agent(agent: &Agent) -> Value {
             Tool::Function(t) => json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters,"defer_loading":t.defer_loading}),
             Tool::Capability(t) => json!(t),
         }).collect::<Vec<_>>()})
+}
+
+/// Parse replacement metadata: null clears it, and a supplied map replaces it.
+pub(crate) fn metadata(value: Value) -> Result<BTreeMap<String, String>, ApiError> {
+    if value.is_null() {
+        return Ok(BTreeMap::new());
+    }
+    let metadata: BTreeMap<String, String> =
+        serde_json::from_value(value).map_err(|_| invalid("metadata must contain string pairs"))?;
+    if metadata.len() > 16
+        || metadata
+            .iter()
+            .any(|(key, value)| key.chars().count() > 64 || value.chars().count() > 512)
+    {
+        return Err(invalid("metadata exceeds its size limit"));
+    }
+    Ok(metadata)
 }
 
 pub(crate) fn configure(mut config: AgentConfig, patch: Value) -> Result<AgentConfig, ApiError> {

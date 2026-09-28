@@ -3,32 +3,6 @@ use app_test_support::create_final_assistant_message_sse_response;
 use codex_utils_cargo_bin::find_resource;
 use pretty_assertions::assert_eq;
 
-async fn idle(client: &reqwest::Client, url: &str, expected_turns: usize) -> anyhow::Result<Value> {
-    loop {
-        let session = request(client, reqwest::Method::GET, url, Value::Null).await?;
-        match session["status"].as_str() {
-            Some("idle") => {
-                let turns = request(
-                    client,
-                    reqwest::Method::GET,
-                    &format!("{url}/turns"),
-                    Value::Null,
-                )
-                .await?;
-                if turns["data"]
-                    .as_array()
-                    .is_some_and(|turns| turns.len() >= expected_turns)
-                {
-                    return Ok(session);
-                }
-                tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await;
-            }
-            Some("failed") => anyhow::bail!("session failed: {session}"),
-            _ => tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await,
-        }
-    }
-}
-
 #[tokio::test]
 async fn saved_settings_reset_and_survive_agent_deletion_and_cold_resume() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(/*secs*/ 90), async {

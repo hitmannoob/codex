@@ -11,8 +11,10 @@ codex_rust_crate(
         "tests/fixtures/sdk_contract.json",
         "tests/fixtures/model_catalog.json",
         "tests/sdk_helpers.py",
+        "tests/sdk_input.py",
         "tests/sdk_agents.py",
         "tests/sdk_inventory.py",
         "tests/sdk_lifecycle.py",
+        "tests/sdk_sessions.py",
     ],
 )

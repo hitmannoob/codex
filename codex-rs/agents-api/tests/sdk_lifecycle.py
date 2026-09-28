@@ -10,6 +10,8 @@ from sdk_agents import check_saved_agents
 from sdk_helpers import client as sdk_client
 from sdk_helpers import fixture
 from sdk_helpers import message
+from sdk_input import check_input_semantics
+from sdk_sessions import check_session_management
 
 
 client = sdk_client(sys.argv[1])
@@ -79,6 +81,11 @@ pending = sessions.retrieve(session_id)
 assert pending.status == "requires_action"
 action = pending.required_actions[0]
 assert action.type == "function_call" and action.name == "lookup"
+try:
+    sessions.delete(session_id)
+    raise AssertionError("session with a pending function was deleted")
+except openai.ConflictError:
+    pass
 result = {
     "type": "agent.session.input.tool_result",
     "turn_id": action.turn_id,
@@ -154,6 +161,10 @@ while sessions.retrieve(inline.id).status != "idle":
     assert time.monotonic() < deadline
     time.sleep(0.02)
 assert len(list(sessions.turns.list(inline.id))) == 1
+print("SDK: session management", file=sys.stderr, flush=True)
+check_session_management(client, agent.id, [session_id, inline.id])
+print("SDK: input semantics", file=sys.stderr, flush=True)
+check_input_semantics(client, agent.id)
 
 # Cancel a stalled model request, and preserve the outcome in history.
 print("SDK: cancel turn", file=sys.stderr, flush=True)
@@ -161,6 +172,11 @@ with sessions.events.stream(session_id) as stream:
     sessions.events.create(session_id, events=[message("sdk-cancel-input")])
     for event in stream:
         if event.type == "agent.session.turn.in_progress":
+            try:
+                sessions.delete(session_id)
+                raise AssertionError("session with a running turn was deleted")
+            except openai.ConflictError:
+                pass
             sessions.events.create(
                 session_id, events=[message("Keep this turn concise.")]
             )
@@ -175,16 +191,6 @@ assert (
     sessions.turns.retrieve(cancelled.id, session_id=session_id).status == "cancelled"
 )
 assert len(list(sessions.turns.list(session_id))) == 3
-
-try:
-    sessions.events.create(
-        session_id,
-        events=[message("must not execute")],
-        idempotency_key="unsupported-key",
-    )
-    raise AssertionError("idempotency key silently ignored")
-except openai.BadRequestError:
-    pass
 
 try:
     sessions.events.create(

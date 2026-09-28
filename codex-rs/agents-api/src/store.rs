@@ -45,6 +45,11 @@ impl Store {
         // appear healthy.
         sqlx::query("UPDATE tool_calls SET status = 'unavailable' WHERE status IN ('pending', 'submitting')")
             .execute(&pool).await?;
+        // A keyed input request that was executing may or may not have reached
+        // the worker, so its key reports an unknown outcome instead of re-running.
+        sqlx::query("UPDATE input_requests SET state = 'unknown' WHERE state = 'pending'")
+            .execute(&pool)
+            .await?;
         crate::records::disconnected(&pool).await?;
         Ok(Self(pool, lock))
     }

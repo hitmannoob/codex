@@ -1,6 +1,7 @@
 //! Durable public records are committed before their live notifications are sent.
 use crate::ApiError;
 use crate::State;
+use crate::resources::RequiredAction;
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::Query;
@@ -22,27 +23,51 @@ pub(crate) async fn disconnected(pool: &sqlx::SqlitePool) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Persist a public session document. Executor-generic so a single write can go
-/// straight to the pool, while a multi-write handler can pass its transaction so
-/// related records commit together before any event is broadcast.
-pub(crate) async fn save_session<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
-    executor: E,
-    id: &str,
-    data: &Value,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO public_sessions (id,data) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data = excluded.data")
-        .bind(id).bind(data.to_string()).execute(executor).await?;
+pub(crate) async fn create_session(pool: &sqlx::SqlitePool, data: &Value) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO public_sessions (id,data) VALUES (?,?)")
+        .bind(data["id"].as_str())
+        .bind(data.to_string())
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
-/// Apply a session status change in memory, returning the updated document to
-/// persist and the lifecycle event to broadcast only after the commit.
-fn transition(mut session: Value, status: &str) -> (Value, Value) {
-    session["status"] = json!(status);
-    session["error"] = Value::Null;
-    session["last_active_at"] = json!(crate::contract::now());
-    let event = json!({"type": format!("agent.session.{status}"), "session": session});
-    (session, event)
+/// Change only the fields status writers own, so a concurrent session update's
+/// metadata and settings survive. Returns the lifecycle event to broadcast after
+/// commit, or `None` when the session has been deleted.
+async fn transition(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> anyhow::Result<Option<Value>> {
+    let data: Option<String> = sqlx::query_scalar("UPDATE public_sessions SET data = json_set(data, '$.status', ?, '$.error', ?, '$.last_active_at', ?) WHERE id = ? RETURNING data")
+        .bind(status).bind(error).bind(crate::contract::now() as i64).bind(id).fetch_optional(&mut **tx).await?;
+    let Some(data) = data else {
+        return Ok(None);
+    };
+    let session = decorate(&mut **tx, id, serde_json::from_str(&data)?).await?;
+    Ok(Some(
+        json!({"type": format!("agent.session.{status}"), "session": session}),
+    ))
+}
+
+/// Fill a stored public session document with its current required actions.
+pub(crate) async fn decorate<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+    executor: E,
+    id: &str,
+    mut data: Value,
+) -> anyhow::Result<Value> {
+    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM tool_calls WHERE session_id = ? AND status = 'pending' ORDER BY turn_id, call_id")
+        .bind(id).fetch_all(executor).await?;
+    data["required_actions"] = actions
+        .iter()
+        .map(|action| {
+            let action: RequiredAction = serde_json::from_str(action)?;
+            Ok(json!({"type":"function_call","turn_id":action.turn_id,"call_id":action.call_id,"name":action.name,"arguments":action.arguments}))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(data)
 }
 
 pub(crate) async fn session(state: &State, id: &str) -> Result<Value, ApiError> {
@@ -51,17 +76,11 @@ pub(crate) async fn session(state: &State, id: &str) -> Result<Value, ApiError> 
         .fetch_optional(&state.store.0)
         .await
         .map_err(anyhow::Error::from)?;
-    let mut data: Value = serde_json::from_str(
+    let data = serde_json::from_str(
         &data.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "session not found".into()))?,
     )
     .map_err(anyhow::Error::from)?;
-    let saved = state
-        .store
-        .session(id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("missing session"))?;
-    data["required_actions"] = json!(saved.required_actions.into_iter().map(|a| json!({"type":"function_call","turn_id":a.turn_id,"call_id":a.call_id,"name":a.name,"arguments":a.arguments})).collect::<Vec<_>>());
-    Ok(data)
+    Ok(decorate(&state.store.0, id, data).await?)
 }
 
 pub(crate) fn emit(state: &State, mut event: Value) {
@@ -75,15 +94,17 @@ pub(crate) async fn session_status(
     status: &str,
     error: Option<&str>,
 ) -> Result<(), ApiError> {
-    let mut data = session(state, id).await?;
-    data["status"] = json!(status);
-    data["error"] = json!(error);
-    data["last_active_at"] = json!(crate::contract::now());
-    save_session(&state.store.0, id, &data).await?;
-    emit(
-        state,
-        json!({"type":format!("agent.session.{status}"),"session":data}),
-    );
+    let mut tx = state
+        .store
+        .0
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(anyhow::Error::from)?;
+    let event = transition(&mut tx, id, status, error).await?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
+    if let Some(event) = event {
+        emit(state, event);
+    }
     Ok(())
 }
 
@@ -109,17 +130,40 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
     let Some(thread_id) = params["threadId"].as_str() else {
         return Ok(());
     };
-    let id: Option<String> = sqlx::query_scalar(
-        "SELECT s.id FROM sessions s JOIN public_sessions p ON p.id = s.id WHERE s.thread_id = ?",
+    let method = raw["method"].as_str().unwrap_or_default();
+    if !matches!(
+        method,
+        "turn/started"
+            | "turn/completed"
+            | "session.requires_action"
+            | "item/started"
+            | "item/completed"
+    ) {
+        return Ok(());
+    }
+    // Resolve the session inside the write transaction: a concurrent deletion
+    // either commits first (nothing is written) or waits for this commit.
+    // Reserve the writer up front; upgrading a deferred read transaction can
+    // fail immediately if another session writes.
+    let mut tx = state
+        .store
+        .0
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(anyhow::Error::from)?;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT p.id, json_extract(p.data, '$.agent.id') FROM sessions s JOIN public_sessions p ON p.id = s.id WHERE s.thread_id = ?",
     )
     .bind(thread_id)
-    .fetch_optional(&state.store.0)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(anyhow::Error::from)?;
-    let Some(id) = id else {
+    let Some((id, agent_id)) = row else {
         return Ok(());
     };
-    match raw["method"].as_str().unwrap_or_default() {
+    // Related records commit together; events are broadcast only afterwards.
+    let mut events = Vec::new();
+    match method {
         "turn/started" | "turn/completed" => {
             let source = &params["turn"];
             let status = match source["status"].as_str() {
@@ -128,43 +172,26 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 Some("failed") => "failed",
                 _ => "in_progress",
             };
-            let current = session(state, &id).await?;
             let turn_id = source["id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("turn missing ID"))?;
-            let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":current["agent"]["id"],"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
+            let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":agent_id,"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
                 "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":null,"subagent_id":null,
                 "error":if status == "failed" {json!({"code":"internal_error","message":source["error"]["message"].as_str().unwrap_or("turn failed")})} else {Value::Null}});
-            // Persist the turn record and any session-status change atomically,
-            // then broadcast the events only after the commit succeeds.
-            let mut events = Vec::new();
-            let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
             save(&mut *tx, &id, "turn", &turn, turn_id).await?;
-            if raw["method"] == "turn/started" {
-                let (data, event) = transition(current.clone(), "in_progress");
-                save_session(&mut *tx, &id, &data).await?;
-                events.push(event);
+            if method == "turn/started" {
+                events.extend(transition(&mut tx, &id, "in_progress", /*error*/ None).await?);
                 events.push(json!({"type":"agent.session.turn.created","session_id":id,"turn_id":turn_id,"turn":turn}));
             }
             events.push(json!({"type":format!("agent.session.turn.{status}"),"session_id":id,"turn_id":turn_id,"turn":turn}));
             if status != "in_progress" {
-                let (data, event) = transition(current.clone(), "idle");
-                save_session(&mut *tx, &id, &data).await?;
-                events.push(event);
-            }
-            tx.commit().await.map_err(anyhow::Error::from)?;
-            for event in events {
-                emit(state, event);
+                events.extend(transition(&mut tx, &id, "idle", /*error*/ None).await?);
             }
         }
         "session.requires_action" => {
             let turn_id = params["action"]["turnId"].as_str();
-            let (data, event) = transition(session(state, &id).await?, "requires_action");
-            let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
             sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'waiting') WHERE session_id = ? AND kind = 'turn' AND id = ?").bind(&id).bind(turn_id).execute(&mut *tx).await.map_err(anyhow::Error::from)?;
-            save_session(&mut *tx, &id, &data).await?;
-            tx.commit().await.map_err(anyhow::Error::from)?;
-            emit(state, event);
+            events.extend(transition(&mut tx, &id, "requires_action", /*error*/ None).await?);
         }
         "item/started" | "item/completed" => {
             let item = &params["item"];
@@ -182,7 +209,11 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             let common = json!({"id":item_id,"turn_id":turn_id,"status":status});
             let mut public = match item["type"].as_str() {
                 Some("userMessage") => {
-                    json!({"type":"message","role":"user","phase":null,"content":item["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str().map(|text| json!({"type":"input_text","text":text}))).collect::<Vec<_>>()})
+                    json!({"type":"message","role":"user","phase":null,"content":item["content"].as_array().into_iter().flatten().filter_map(|c| match c["type"].as_str() {
+                        Some("text") => Some(json!({"type":"input_text","text":c["text"]})),
+                        Some("image") => Some(json!({"type":"input_image","image_url":c["url"]})),
+                        _ => None,
+                    }).collect::<Vec<_>>()})
                 }
                 Some("agentMessage") => {
                     json!({"type":"message","role":"assistant","phase":item["phase"],"content":[{"type":"output_text","text":item["text"]}]})
@@ -212,17 +243,8 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 public["status"] = json!("failed");
             }
             // The item and, for a resolved tool call, its output record share one
-            // transaction so `output_index` counts them consistently; events are
-            // broadcast only after the commit.
-            // Reserve the writer before publish_item reads: upgrading a deferred
-            // read transaction can fail immediately if another session writes.
-            let mut tx = state
-                .store
-                .0
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(anyhow::Error::from)?;
-            let mut events = publish_item(&mut tx, &id, turn_id, &public, done).await?;
+            // transaction so `output_index` counts them consistently.
+            events.extend(publish_item(&mut tx, &id, turn_id, &public, done).await?);
             if done && item["type"] == "dynamicToolCall" {
                 let output = item["contentItems"]
                     .as_array()
@@ -235,12 +257,12 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 let output = json!({"id":format!("output_{item_id}"),"type":"function_call_output","turn_id":turn_id,"call_id":item["id"],"status":if failed {"failed"} else {"completed"},"output":if failed {Value::Null} else {json!(output)},"error":if failed {json!(output)} else {Value::Null}});
                 events.extend(publish_item(&mut tx, &id, turn_id, &output, /*done*/ true).await?);
             }
-            tx.commit().await.map_err(anyhow::Error::from)?;
-            for event in events {
-                emit(state, event);
-            }
         }
-        _ => {}
+        _ => return Ok(()),
+    }
+    tx.commit().await.map_err(anyhow::Error::from)?;
+    for event in events {
+        emit(state, event);
     }
     Ok(())
 }

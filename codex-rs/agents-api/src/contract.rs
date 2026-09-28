@@ -4,14 +4,11 @@ use crate::State;
 use crate::resources::Agent;
 use crate::resources::AgentConfig;
 use crate::resources::Environment;
-use crate::resources::InputParams;
 use crate::resources::SessionCreateParams;
-use crate::resources::ToolResult;
 use axum::Json;
 use axum::Router;
 use axum::extract::Path;
 use axum::extract::State as Extract;
-use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -31,9 +28,20 @@ use uuid::Uuid;
 
 pub(crate) fn router() -> Router<Arc<State>> {
     Router::new()
-        .route("/v1/agents/sessions", post(create))
-        .route("/v1/agents/sessions/{id}", get(read))
-        .route("/v1/agents/sessions/{id}/events", get(stream).post(input))
+        .route(
+            "/v1/agents/sessions",
+            post(create).get(crate::sessions::list),
+        )
+        .route(
+            "/v1/agents/sessions/{id}",
+            get(read)
+                .post(crate::sessions::update)
+                .delete(crate::sessions::delete),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/events",
+            get(stream).post(crate::input::create),
+        )
         .route("/v1/agents/sessions/{id}/items", get(crate::records::items))
         .route("/v1/agents/sessions/{id}/turns", get(crate::records::turns))
         .route(
@@ -65,52 +73,9 @@ struct Create {
     input: Value,
     #[serde(default)]
     stream: bool,
-    metadata: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    metadata: Value,
     vault_ids: Option<Vec<String>>,
-}
-
-// Preserve a single user-message boundary; reject unsupported batches explicitly.
-fn text(input: Value) -> Result<String, ApiError> {
-    let input = if let Some(text) = input.as_str() {
-        text.to_owned()
-    } else {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Message {
-            role: String,
-            content: Vec<Content>,
-            #[serde(rename = "type")]
-            kind: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(tag = "type", deny_unknown_fields)]
-        enum Content {
-            #[serde(rename = "input_text")]
-            Text { text: String },
-        }
-        let messages: Vec<Message> =
-            serde_json::from_value(input).map_err(|e| invalid(e.to_string()))?;
-        if messages.len() != 1 {
-            return Err(invalid("exactly one user message is currently supported"));
-        }
-        let message = messages
-            .into_iter()
-            .next()
-            .ok_or_else(|| invalid("input required"))?;
-        if message.role != "user" || message.kind.is_some_and(|kind| kind != "message") {
-            return Err(invalid("input must be a user message"));
-        }
-        message
-            .content
-            .into_iter()
-            .map(|Content::Text { text }| text)
-            .collect::<Vec<_>>()
-            .join("")
-    };
-    if input.trim().is_empty() || input.len() > 8192 {
-        return Err(invalid("input must be 1-8192 bytes"));
-    }
-    Ok(input)
 }
 
 async fn create(
@@ -125,15 +90,8 @@ async fn create(
     if params.vault_ids.is_some_and(|ids| !ids.is_empty()) {
         return Err(invalid("vaults are not implemented"));
     }
-    let input = text(params.input)?;
-    let metadata = params.metadata.unwrap_or_default();
-    if metadata.len() > 16
-        || metadata
-            .iter()
-            .any(|(key, value)| key.chars().count() > 64 || value.chars().count() > 512)
-    {
-        return Err(invalid("metadata exceeds documented limits"));
-    }
+    let input = crate::input::message(params.input)?;
+    let metadata = crate::configuration::metadata(params.metadata)?;
     let mut saved = match params.agent_id {
         Some(id) => state
             .store
@@ -170,19 +128,13 @@ async fn create(
     let public = json!({"id":session.id,"object":"agent.session","agent":agent(&session.agent),
         "created_at":now(),"last_active_at":now(),"environment":{"type":"none"},"metadata":metadata,
         "vault_ids":[],"required_actions":[],"status":"in_progress","error":null,"usage":null});
-    crate::records::save_session(&state.store.0, &session.id, &public).await?;
+    crate::records::create_session(&state.store.0, &public).await?;
     let receiver = state.public_events.subscribe();
     crate::records::emit(
         &state,
         json!({"type":"agent.session.created","session":public}),
     );
-    if let Err(error) = crate::routes::input(
-        Extract(Arc::clone(&state)),
-        Path(session.id.clone()),
-        Json(InputParams { input }),
-    )
-    .await
-    {
+    if let Err(error) = crate::routes::start_turn(&state, &session.id, input).await {
         crate::records::session_status(&state, &session.id, "failed", Some(&error.1)).await?;
         return Err(error);
     }
@@ -200,93 +152,6 @@ async fn read(
     Ok(Json(crate::records::session(&state, &id).await?))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Inputs {
-    events: Vec<Input>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
-enum Input {
-    #[serde(rename = "agent.session.input.message")]
-    Message { input: Value },
-    #[serde(rename = "agent.session.input.cancel")]
-    Cancel,
-    #[serde(rename = "agent.session.input.tool_result")]
-    ToolResult {
-        call_id: String,
-        turn_id: String,
-        success: bool,
-        output: Option<String>,
-        error: Option<String>,
-    },
-}
-
-async fn input(
-    Extract(state): Extract<Arc<State>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(params): Json<Inputs>,
-) -> Result<StatusCode, ApiError> {
-    if headers.contains_key("idempotency-key") {
-        return Err(invalid("event idempotency keys are not implemented"));
-    }
-    if params.events.len() != 1 {
-        return Err(invalid("exactly one input event is currently supported"));
-    }
-    crate::records::session(&state, &id).await?;
-    match params
-        .events
-        .into_iter()
-        .next()
-        .ok_or_else(|| invalid("event required"))?
-    {
-        Input::Message { input } => {
-            let _ = crate::routes::input(
-                Extract(state),
-                Path(id),
-                Json(InputParams {
-                    input: text(input)?,
-                }),
-            )
-            .await?;
-        }
-        Input::Cancel => {
-            if let Some(turn) = crate::records::active_turn(&state, &id).await? {
-                let _ = crate::routes::cancel(Extract(state), Path((id, turn))).await?;
-            }
-        }
-        Input::ToolResult {
-            call_id,
-            turn_id,
-            success,
-            output,
-            error,
-        } => {
-            if success && error.is_some() {
-                return Err(invalid("a successful tool result cannot contain an error"));
-            }
-            if output.is_some() && error.is_some() {
-                return Err(invalid(
-                    "combined function output and error are not implemented",
-                ));
-            }
-            let _ = crate::actions::submit(
-                Extract(state),
-                Path((id, turn_id)),
-                Json(ToolResult {
-                    call_id,
-                    success,
-                    output: json!(error.or(output).unwrap_or_default()),
-                }),
-            )
-            .await?;
-        }
-    }
-    Ok(StatusCode::ACCEPTED)
-}
-
 async fn stream(
     Extract(state): Extract<Arc<State>>,
     Path(id): Path<String>,
@@ -300,9 +165,14 @@ async fn stream(
 }
 
 fn sse(receiver: tokio::sync::broadcast::Receiver<Value>, id: String) -> Response {
-    // Streams are live only. End on lag/disconnect so clients recover via saved state.
+    // Streams are live only. End on lag, backend loss, or deletion of this
+    // session so clients recover via saved state.
+    let owner = id.clone();
     let stream = BroadcastStream::new(receiver)
-        .take_while(|v| futures::future::ready(matches!(v, Ok(v) if v["type"] != "disconnect")))
+        .take_while(move |v| {
+            futures::future::ready(matches!(v, Ok(v) if v["type"] != "disconnect"
+                && !(v["type"] == crate::sessions::DELETED && v["session_id"] == owner)))
+        })
         .filter_map(move |v| {
             let event = v
                 .ok()
