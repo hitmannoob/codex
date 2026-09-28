@@ -182,9 +182,6 @@ pub(crate) fn configure(mut config: AgentConfig, patch: Value) -> Result<AgentCo
 pub(crate) fn validate_execution(config: &AgentConfig) -> Result<(), ApiError> {
     use crate::agent_tools::CapabilityTool;
     use crate::agent_tools::SearchMode;
-    if config.multi_agent.as_ref().is_some_and(|m| m.enabled) {
-        return Err(invalid("multi-agent execution is not implemented"));
-    }
     for tool in &config.tools {
         let unsupported = match tool {
             Tool::Function(tool) if tool.defer_loading => Some("deferred function discovery"),

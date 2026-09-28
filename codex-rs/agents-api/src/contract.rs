@@ -48,6 +48,30 @@ pub(crate) fn router() -> Router<Arc<State>> {
             "/v1/agents/sessions/{id}/turns/{turn_id}",
             get(crate::records::turn),
         )
+        .route(
+            "/v1/agents/sessions/{id}/subagents",
+            get(crate::subagents::list),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/subagents/{subagent_id}",
+            get(crate::subagents::retrieve),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/subagents/{subagent_id}/items",
+            get(crate::subagents::items),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/subagents/{subagent_id}/turns",
+            get(crate::subagents::turns),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/subagents/{subagent_id}/turns/{turn_id}",
+            get(crate::subagents::turn),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/subagents/{subagent_id}/turns/{turn_id}/items",
+            get(crate::subagents::turn_items),
+        )
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> ApiError {
@@ -183,7 +207,11 @@ fn sse(receiver: tokio::sync::broadcast::Receiver<Value>, id: String) -> Respons
         .filter_map(move |v| {
             let event = v
                 .ok()
-                .filter(|v| v["session_id"] == id || v["session"]["id"] == id)
+                .filter(|v| {
+                    v["session_id"] == id
+                        || v["session"]["id"] == id
+                        || v["subagent"]["session_id"] == id
+                })
                 .map(|v| {
                     Ok::<_, Infallible>(
                         Event::default()

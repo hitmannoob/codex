@@ -109,20 +109,23 @@ pub(crate) async fn session_status(
     Ok(())
 }
 
+/// Persist a public record. `subagent` tags records a subagent produced; an
+/// update keeps the record's original tag.
 pub(crate) async fn save<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
     executor: E,
     session_id: &str,
     kind: &str,
     data: &Value,
     turn_id: &str,
+    subagent: Option<&str>,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO public_records(session_id,kind,id,turn_id,data) VALUES(?,?,?,?,?) ON CONFLICT(session_id,kind,id) DO UPDATE SET data = excluded.data")
-        .bind(session_id).bind(kind).bind(data["id"].as_str()).bind(turn_id).bind(data.to_string()).execute(executor).await?;
+    sqlx::query("INSERT INTO public_records(session_id,kind,id,turn_id,data,subagent_id) VALUES(?,?,?,?,?,?) ON CONFLICT(session_id,kind,id) DO UPDATE SET data = excluded.data")
+        .bind(session_id).bind(kind).bind(data["id"].as_str()).bind(turn_id).bind(data.to_string()).bind(subagent).execute(executor).await?;
     Ok(())
 }
 
 pub(crate) async fn active_turn(state: &State, id: &str) -> Result<Option<String>, ApiError> {
-    sqlx::query_scalar("SELECT id FROM public_records WHERE session_id = ? AND kind = 'turn' AND json_extract(data, '$.status') IN ('queued','in_progress','waiting') ORDER BY seq DESC LIMIT 1")
+    sqlx::query_scalar("SELECT id FROM public_records WHERE session_id = ? AND kind = 'turn' AND subagent_id IS NULL AND json_extract(data, '$.status') IN ('queued','in_progress','waiting') ORDER BY seq DESC LIMIT 1")
         .bind(id).fetch_optional(&state.store.0).await.map_err(anyhow::Error::from).map_err(Into::into)
 }
 
@@ -153,16 +156,11 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(anyhow::Error::from)?;
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT p.id, json_extract(p.data, '$.agent.id') FROM sessions s JOIN public_sessions p ON p.id = s.id WHERE s.thread_id = ?",
-    )
-    .bind(thread_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(anyhow::Error::from)?;
-    let Some((id, agent_id)) = row else {
+    let Some(owner) = crate::subagents::owner(&mut tx, thread_id).await? else {
         return Ok(());
     };
+    let id = owner.session_id.clone();
+    let subagent = owner.subagent_id.as_deref();
     // Related records commit together; events are broadcast only afterwards.
     let mut events = Vec::new();
     match method {
@@ -177,20 +175,25 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             let turn_id = source["id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("turn missing ID"))?;
-            let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":agent_id,"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
-                "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":crate::usage::usage(&mut tx, &id, Some(turn_id)).await?,"subagent_id":null,
+            let turn = json!({"id":turn_id,"object":"agent.session.turn","session_id":id,"agent_id":owner.agent_id,"created_at":source["startedAt"].as_u64().unwrap_or_else(crate::contract::now),
+                "started_at":source["startedAt"],"completed_at":source["completedAt"],"status":status,"usage":crate::usage::usage(&mut tx, &id, Some(turn_id)).await?,"subagent_id":subagent,
                 "error":if status == "failed" {crate::turns::turn_error(&source["error"])} else {Value::Null}});
             if status != "in_progress" {
                 events.extend(close_items(&mut tx, &id, turn_id).await?);
                 state.streams.end_turn(&id, turn_id);
             }
-            save(&mut *tx, &id, "turn", &turn, turn_id).await?;
+            save(&mut *tx, &id, "turn", &turn, turn_id, subagent).await?;
+            // Only the session's own turns change its status; subagent turns
+            // appear on its stream tagged with their `subagent_id`.
+            let root = subagent.is_none();
             if method == "turn/started" {
-                events.extend(transition(&mut tx, &id, "in_progress", /*error*/ None).await?);
+                if root {
+                    events.extend(transition(&mut tx, &id, "in_progress", /*error*/ None).await?);
+                }
                 events.push(json!({"type":"agent.session.turn.created","session_id":id,"turn_id":turn_id,"turn":turn}));
             }
             events.push(json!({"type":format!("agent.session.turn.{status}"),"session_id":id,"turn_id":turn_id,"turn":turn}));
-            if status != "in_progress" {
+            if status != "in_progress" && root {
                 events.extend(transition(&mut tx, &id, "idle", /*error*/ None).await?);
             }
         }
@@ -198,9 +201,10 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             let Some(turn_id) = params["turnId"].as_str() else {
                 return Ok(());
             };
-            crate::usage::record(&mut tx, &id, turn_id, &params["tokenUsage"]).await?;
+            crate::usage::record(&mut tx, &id, thread_id, turn_id, &params["tokenUsage"]).await?;
         }
-        "session.requires_action" => {
+        // Subagents have no function tools, so only root turns wait on actions.
+        "session.requires_action" if subagent.is_none() => {
             let turn_id = params["action"]["turnId"].as_str();
             sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'waiting') WHERE session_id = ? AND kind = 'turn' AND id = ?").bind(&id).bind(turn_id).execute(&mut *tx).await.map_err(anyhow::Error::from)?;
             events.extend(transition(&mut tx, &id, "requires_action", /*error*/ None).await?);
@@ -234,6 +238,23 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 Some("dynamicToolCall") => {
                     json!({"type":"function_call","call_id":item["id"],"name":item["tool"],"arguments":item["arguments"]})
                 }
+                Some("subAgentActivity") => {
+                    let Some((subagent_id, created)) =
+                        crate::subagents::register(&mut tx, &owner, item).await?
+                    else {
+                        return Ok(());
+                    };
+                    events.extend(created);
+                    let Some(public) = crate::subagents::activity_item(&owner, &subagent_id, item)
+                    else {
+                        tx.commit().await.map_err(anyhow::Error::from)?;
+                        for event in events {
+                            emit(state, event);
+                        }
+                        return Ok(());
+                    };
+                    public
+                }
                 Some("mcpToolCall") => {
                     json!({"type":"mcp_call","server_label":item["server"],"name":item["tool"],"arguments":item["arguments"],
                         "output":item["result"]["content"],"error":item["error"]["message"]})
@@ -264,7 +285,7 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             }
             // The item and, for a resolved tool call, its output record share one
             // transaction so `output_index` counts them consistently.
-            let published = publish_item(&mut tx, &id, turn_id, &public, done).await?;
+            let published = publish_item(&mut tx, &id, turn_id, &public, done, subagent).await?;
             events.extend(published.added);
             if let Some(output_index) = published.output_index {
                 events.extend(if done {
@@ -303,7 +324,8 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                     (_, true) => (Value::Null, json!(text)),
                 };
                 let output = json!({"id":format!("output_{item_id}"),"type":"function_call_output","turn_id":turn_id,"call_id":item["id"],"status":if failed {"failed"} else {"completed"},"output":result,"error":error});
-                let published = publish_item(&mut tx, &id, turn_id, &output, /*done*/ true).await?;
+                let published =
+                    publish_item(&mut tx, &id, turn_id, &output, /*done*/ true, subagent).await?;
                 events.extend(published.added);
             }
         }
@@ -332,6 +354,7 @@ async fn publish_item(
     turn_id: &str,
     item: &Value,
     done: bool,
+    subagent: Option<&str>,
 ) -> anyhow::Result<Published> {
     let item_id = item["id"].as_str().unwrap_or_default();
     let previous: Option<i64> = sqlx::query_scalar(
@@ -341,7 +364,7 @@ async fn publish_item(
     .bind(item_id)
     .fetch_optional(&mut **tx)
     .await?;
-    save(&mut **tx, id, "item", item, turn_id).await?;
+    save(&mut **tx, id, "item", item, turn_id, subagent).await?;
     let input = item["role"] == "user" || item["type"] == "function_call_output";
     let output_index = if input {
         None
@@ -382,7 +405,10 @@ async fn close_items(
     for item in open {
         let mut item: Value = serde_json::from_str(&item)?;
         item["status"] = json!("incomplete");
-        save(&mut **tx, id, "item", &item, turn_id).await?;
+        save(
+            &mut **tx, id, "item", &item, turn_id, /*subagent*/ None,
+        )
+        .await?;
         let output_index =
             output_index(tx, id, turn_id, item["id"].as_str().unwrap_or_default()).await?;
         events.push(json!({"type":"agent.session.turn.item.done","session_id":id,"turn_id":turn_id,"item":item,"output_index":output_index}));
@@ -396,10 +422,18 @@ pub(crate) struct Page {
     after: Option<String>,
     limit: Option<u32>,
     order: Option<String>,
-    turn_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
 }
 
-async fn list(state: &State, id: &str, kind: &str, page: Page) -> Result<Json<Value>, ApiError> {
+/// List a session's records of one kind: its own when `subagent` is `None`,
+/// otherwise that subagent's.
+pub(crate) async fn list(
+    state: &State,
+    id: &str,
+    kind: &str,
+    page: Page,
+    subagent: Option<&str>,
+) -> Result<Json<Value>, ApiError> {
     session(state, id).await?;
     let limit = page.limit.unwrap_or(/*default*/ 20);
     let order = page.order.as_deref().unwrap_or("desc");
@@ -410,18 +444,19 @@ async fn list(state: &State, id: &str, kind: &str, page: Page) -> Result<Json<Va
         return Err(crate::contract::invalid("invalid pagination parameters"));
     }
     let cursor: Option<i64> = if let Some(after) = page.after {
-        Some(sqlx::query_scalar("SELECT seq FROM public_records WHERE session_id = ? AND kind = ? AND id = ? AND (? IS NULL OR turn_id = ?)").bind(id).bind(kind).bind(after).bind(&page.turn_id).bind(&page.turn_id).fetch_optional(&state.store.0).await.map_err(anyhow::Error::from)?.ok_or_else(|| crate::contract::invalid("invalid after cursor"))?)
+        Some(sqlx::query_scalar("SELECT seq FROM public_records WHERE session_id = ? AND kind = ? AND id = ? AND subagent_id IS ? AND (? IS NULL OR turn_id = ?)").bind(id).bind(kind).bind(after).bind(subagent).bind(&page.turn_id).bind(&page.turn_id).fetch_optional(&state.store.0).await.map_err(anyhow::Error::from)?.ok_or_else(|| crate::contract::invalid("invalid after cursor"))?)
     } else {
         None
     };
     let query = if order == "asc" {
-        "SELECT data FROM public_records WHERE session_id = ? AND kind = ? AND (? IS NULL OR seq > ?) AND (? IS NULL OR turn_id = ?) ORDER BY seq ASC LIMIT ?"
+        "SELECT data FROM public_records WHERE session_id = ? AND kind = ? AND subagent_id IS ? AND (? IS NULL OR seq > ?) AND (? IS NULL OR turn_id = ?) ORDER BY seq ASC LIMIT ?"
     } else {
-        "SELECT data FROM public_records WHERE session_id = ? AND kind = ? AND (? IS NULL OR seq < ?) AND (? IS NULL OR turn_id = ?) ORDER BY seq DESC LIMIT ?"
+        "SELECT data FROM public_records WHERE session_id = ? AND kind = ? AND subagent_id IS ? AND (? IS NULL OR seq < ?) AND (? IS NULL OR turn_id = ?) ORDER BY seq DESC LIMIT ?"
     };
     let rows: Vec<String> = sqlx::query_scalar(query)
         .bind(id)
         .bind(kind)
+        .bind(subagent)
         .bind(cursor)
         .bind(cursor)
         .bind(&page.turn_id)
@@ -447,23 +482,34 @@ pub(crate) async fn items(
     Path(id): Path<String>,
     Query(page): Query<Page>,
 ) -> Result<Json<Value>, ApiError> {
-    list(&state, &id, "item", page).await
+    list(&state, &id, "item", page, /*subagent*/ None).await
 }
 pub(crate) async fn turns(
     Extract(state): Extract<Arc<State>>,
     Path(id): Path<String>,
     Query(page): Query<Page>,
 ) -> Result<Json<Value>, ApiError> {
-    list(&state, &id, "turn", page).await
+    list(&state, &id, "turn", page, /*subagent*/ None).await
 }
 pub(crate) async fn turn(
     Extract(state): Extract<Arc<State>>,
     Path((id, turn_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
+    turn_record(&state, &id, /*subagent*/ None, &turn_id).await
+}
+
+/// One of a session's turns, or one of a subagent's when `subagent` is set.
+pub(crate) async fn turn_record(
+    state: &State,
+    id: &str,
+    subagent: Option<&str>,
+    turn_id: &str,
+) -> Result<Json<Value>, ApiError> {
     let data: Option<String> = sqlx::query_scalar(
-        "SELECT data FROM public_records WHERE session_id = ? AND kind = 'turn' AND id = ?",
+        "SELECT data FROM public_records WHERE session_id = ? AND kind = 'turn' AND subagent_id IS ? AND id = ?",
     )
     .bind(id)
+    .bind(subagent)
     .bind(turn_id)
     .fetch_optional(&state.store.0)
     .await

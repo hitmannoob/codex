@@ -171,13 +171,34 @@ Input admission is serialized per session: simultaneous inputs to one session
 are applied one at a time, starting or steering its turn, while other sessions
 proceed concurrently. Each Codex thread is resumed once per backend connection.
 
-Deferred functions, tool search, enabled web search, enabled programmatic calling,
-and enabled multi-agent configurations can be saved/retrieved but their
-execution is rejected. Deferred functions and web search depend on model and
+Deferred functions, tool search, enabled web search, and enabled programmatic
+calling can be saved/retrieved but their execution is rejected. Deferred functions and web search depend on model and
 provider support the worker does not report, so enabling them could leave the
 model silently without the tool. Disabled programmatic calling/web search are
 accepted. Vaults are rejected. Prototype size limits below still apply to the
 original routes.
+
+`multi_agent: {enabled: true}` turns on Codex's V2 multi-agent runtime. The
+root agent can spawn subagents, each a Codex child thread, up to
+`max_concurrent_subagents` (default 6). How subagents appear:
+- **Endpoints:** each subagent is available from `/subagents`, with its own
+  turn and item history there. Session item and turn lists hold only the root
+  agent's history.
+- **Events:** spawns emit `agent.session.subagent.created`. Subagent turn
+  events appear on the session stream with `turn.subagent_id`; only root turns
+  change the session's status.
+- **Call items:** root history records `create_subagent_call`,
+  `send_subagent_input_call`, and `interrupt_subagent_call`. Codex does not
+  report the task text, model, or effort for these, so `content` is empty and
+  the settings are null.
+- **Tools and usage:** subagents have no function tools, and their usage counts
+  toward the session.
+- **Deletion:** a session whose subagent is still working cannot be deleted.
+
+Not supported with V2: `wait_for_subagents_call`, `close_subagent_call`,
+`resume_subagent_call`, and `closed` status. Cancelling a turn does not stop
+running subagents, and subagent threads are not resumed after a restart.
+Codex's goal tools are disabled for every session.
 
 Public MCP servers run when they use HTTP with `connection_origin: service`
 (the default). Each becomes a session-scoped Codex server that sets only the

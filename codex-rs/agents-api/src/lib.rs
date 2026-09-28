@@ -13,6 +13,7 @@ mod routes;
 mod sessions;
 mod store;
 mod streaming;
+mod subagents;
 mod turns;
 mod usage;
 

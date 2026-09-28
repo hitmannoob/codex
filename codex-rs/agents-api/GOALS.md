@@ -108,7 +108,7 @@ fixture design may start earlier.
 | G05 | Complete events, items, turns, and usage (complete locally) | G00, G02 | Text deltas, item families, transitions, usage |
 | G06 | Complete function-tool behavior (complete locally except deferred functions) | G00, G04, G05 | Content/limits, deferred tools, failure cases |
 | G07 | Complete MCP and built-in controls (HTTP MCP complete locally) | G00, G03, G05 | MCP, built-in capabilities, isolation |
-| G08 | Expose remaining harness capabilities | G00, G03, G05, G07 | Delegation, compaction, programmatic calls, skills/plugins |
+| G08 | Expose remaining harness capabilities (subagents complete locally) | G00, G03, G05, G07 | Delegation, compaction, programmatic calls, skills/plugins |
 | G09 | Implement environment lifecycle | G00, G01, G02 | Self-hosted attachment, managed provisioning, lifecycle recovery |
 | G10 | Implement files and artifacts | G00, G02; G09 for environment transfer | Storage contract, transfer, publication, cleanup |
 | G11 | Implement credentials and service integrations | G00, G02, G05 | Vaults, webhooks, observability |
@@ -774,12 +774,12 @@ Remaining:
   that support.
 - Programmatic tool calling belongs to G08.
 
-## G08 — Remaining harness features
+## G08 — Remaining harness features (subagents complete locally)
 
 **Outcome:** supported harness features are configurable through the API and have
 correct session, event, and ownership semantics.
 
-- [ ] Map documented delegation/multi-agent configuration to existing Codex
+- [x] Map documented delegation/multi-agent configuration to existing Codex
   mechanisms. Define parent/child ownership, cancellation, inherited restrictions,
   persisted outcomes, and usage accounting before exposing it.
 - [ ] Expose supported compaction controls and observable outcomes. Preserve
@@ -788,13 +788,69 @@ correct session, event, and ownership semantics.
   suitable; define its execution boundary, callback handling, and limits.
 - [ ] Add supported skills/plugin selection and configuration. Persist selections
   so restart does not silently change the session's enabled behavior.
-- [ ] Keep API adaptation in this crate or an appropriate existing crate. Add to
+- [x] Keep API adaptation in this crate or an appropriate existing crate. Add to
   `codex-core` only when the missing behavior belongs in the harness itself.
 
 Acceptance: one contract fixture per capability plus combined scenarios: child
 cancellation, compaction followed by cold resume, nested function callbacks, and
 skills/plugins isolated between sessions. Harness logic changes require the
 repository's relevant integration tests in addition to API tests.
+
+Triage (2026-09-28):
+- **Compaction:** the pinned contract exposes no compaction controls or
+  outcomes ("Summarizing previous work to manage its context window" is
+  automatic), so there is nothing public to add.
+- **Skills and plugins:** these come from environment `capability_directories`,
+  the Skills API, and hosted environments, so they wait for G09/G10.
+- **Programmatic tool calling:** needs Codex's code-mode host, whose V8 build
+  was unavailable here, so it stays rejected.
+- **Subagents:** buildable now, and done first by decision.
+
+Evidence (2026-09-28, subagents). Experiments against the in-process worker
+established the following:
+- Forcing Codex's V2 runtime makes the root see a `collaboration` namespace.
+  Spawns surface as `subAgentActivity` items (`started`, `interacted`,
+  `interrupted`, `completed`) in the parent turn, not as collab tool-call items.
+- Every new child thread is attached to our connection.
+- Children get no dynamic function tools, as the guide requires.
+- Codex's goal tools were exposed on every session; they are now disabled, a
+  G07 inherited-helper fix.
+
+Implementation:
+- **Configuration:** sessions with `multi_agent.enabled` set
+  `features.multi_agent_v2 = {enabled, max_concurrent_threads_per_session = N + 1}`,
+  since the root counts toward the cap.
+- **Registry:** `src/subagents.rs` resolves each notification to its owner.
+  Spawn activity registers `subagent_<thread>` with the spawning agent as
+  parent and the path's last segment as its name, and emits
+  `subagent.created`.
+- **Call items:** started, interacted, and interrupted activity maps to
+  `create_subagent_call`, `send_subagent_input_call`, and
+  `interrupt_subagent_call`. Codex does not report the task text, model, or
+  effort for these.
+- **Records:** migration `0006` tags public records with `subagent_id`, so
+  session lists and retrieval stay root-only, and adds the six subagent
+  endpoints. Subagent turns stream tagged but never change session status.
+- **Usage:** stored usage totals move to per-thread keys, since each child has
+  its own running total. Subagent usage counts toward the session.
+- **Deletion:** refused while any subagent thread is active.
+
+Tests:
+- `subagents_are_registered_attributed_and_kept_apart` checks the registry
+  object and its created event; root-only history, with the spawn item and no
+  child output; the subagent turn, turn items, and usage; tagged stream events;
+  session usage that includes the child; function tools on the root but not the
+  child; no goal tools; 404s for unknown or mismatched IDs; deletion; and a 409
+  while a slow child is still running.
+- `tests/sdk_subagents.py` (strict SDK lifecycle) validates every streamed
+  event and all six subagent operations through the pinned SDK.
+
+Remaining:
+- Cancelling a root turn does not interrupt running subagents.
+- Subagent threads are not resumed after a restart.
+- Codex V2 never reports `wait_for_subagents_call`, `close_subagent_call`,
+  `resume_subagent_call`, `agent_message`, or `closed` status.
+- Subagent task text and settings are unavailable.
 
 ## G09 — Environments and executor lifecycle
 

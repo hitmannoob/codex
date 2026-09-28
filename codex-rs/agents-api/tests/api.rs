@@ -413,3 +413,6 @@ mod functions;
 
 #[path = "suite/mcp.rs"]
 mod mcp;
+
+#[path = "suite/subagents.rs"]
+mod subagents;

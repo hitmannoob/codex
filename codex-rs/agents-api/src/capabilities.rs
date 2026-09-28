@@ -160,11 +160,20 @@ pub(crate) async fn overrides(
         }
     }
     servers.extend(crate::mcp::overrides(config));
+    // Codex's V2 multi-agent runtime counts the root thread toward its cap, so
+    // it gets one more thread than the public subagent limit.
+    let multi_agent = match &config.multi_agent {
+        Some(settings) if settings.enabled => json!({"enabled": true,
+            "max_concurrent_threads_per_session": settings.max_concurrent_subagents.unwrap_or(6) + 1}),
+        _ => json!(false),
+    };
     // Disable other sources of MCP capabilities; never mutate global config.
     let mut overrides = json!({
         "mcp_servers": servers, "features.plugins": false, "features.apps": false,
         "features.enable_mcp_apps": false, "web_search": "disabled",
-        "agents.enabled": false, "features.multi_agent_v2": false,
+        "agents.enabled": false, "features.multi_agent_v2": multi_agent,
+        // Codex's goal tools are not an advertised capability.
+        "features.goals": false,
         "tools.experimental_request_user_input.enabled": false,
         "model_reasoning_summary": config.reasoning.as_ref().and_then(|r| r.summary.as_deref()).unwrap_or("none"),
         "model_verbosity": config.text.as_ref().and_then(|t| t.verbosity.as_ref()).map_or(json!("medium"), |v| json!(v)),

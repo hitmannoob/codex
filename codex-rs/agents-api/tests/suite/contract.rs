@@ -76,6 +76,29 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
         .up_to_n_times(/*n*/ 1)
         .mount(&model)
         .await;
+        // Subagent requests run concurrently with the root agent, so they are
+        // matched by their final input item rather than served in sequence.
+        let last_input = |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+            body["input"].as_array().and_then(|items| items.last()).map(Value::to_string).unwrap_or_default()
+        };
+        for (marker, response) in [
+            ("sdk-delegate", sse(&[
+                json!({"type":"response.created","response":{"id":"sdk-spawn"}}),
+                json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"sdk-spawn","namespace":"collaboration","name":"spawn_agent",
+                    "arguments":json!({"message":"sdk-child-task","task_name":"researcher","fork_turns":"none"}).to_string()}}),
+                json!({"type":"response.completed","response":{"id":"sdk-spawn","status":"completed","output":[]}}),
+            ])),
+            ("NEW_TASK", create_final_assistant_message_sse_response("child-report")?),
+            ("sdk-spawn", create_final_assistant_message_sse_response("delegated")?),
+        ] {
+            Mock::given(move |request: &wiremock::Request| last_input(request).contains(marker))
+                .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_raw(response, "text/event-stream"))
+                .with_priority(/*p*/ 1)
+                .up_to_n_times(/*n*/ 1)
+                .mount(&model)
+                .await;
+        }
         MockResponsesConfig::new(&model.uri())
             .with_root_config("features.plugins = false")
             .write(home.path())?;

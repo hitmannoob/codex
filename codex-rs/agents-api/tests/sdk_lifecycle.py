@@ -13,6 +13,7 @@ from sdk_events import check_event_stream
 from sdk_helpers import message
 from sdk_input import check_input_semantics
 from sdk_sessions import check_session_management
+from sdk_subagents import check_subagents
 
 
 client = sdk_client(sys.argv[1])
@@ -168,6 +169,8 @@ print("SDK: input semantics", file=sys.stderr, flush=True)
 check_input_semantics(client, agent.id)
 print("SDK: event stream", file=sys.stderr, flush=True)
 check_event_stream(client)
+print("SDK: subagents", file=sys.stderr, flush=True)
+check_subagents(client)
 
 # Cancel a stalled model request, and preserve the outcome in history.
 print("SDK: cancel turn", file=sys.stderr, flush=True)

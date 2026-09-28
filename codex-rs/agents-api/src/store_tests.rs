@@ -148,7 +148,10 @@ async fn migrations_record_a_ledger_and_adopt_a_legacy_database() -> anyhow::Res
         "DROP TABLE session_cleanup",
         "DROP TABLE input_requests",
         "DROP TABLE turn_usage",
-        "DROP TABLE usage_totals",
+        "DROP TABLE thread_usage_totals",
+        "DROP TABLE subagents",
+        "DROP TABLE public_records",
+        "CREATE TABLE public_records (seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, turn_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE (session_id, kind, id))",
         "CREATE TABLE public_sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL)",
         "INSERT INTO public_sessions (id, data) VALUES ('legacy-session', '{}')",
     ] {

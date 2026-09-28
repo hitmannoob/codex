@@ -75,7 +75,10 @@ pub(crate) async fn fail_unstarted_turn(
     failed["status"] = json!("failed");
     failed["completed_at"] = json!(now);
     failed["error"] = error.clone();
-    crate::records::save(&mut *tx, id, "turn", &failed, &turn_id).await?;
+    crate::records::save(
+        &mut *tx, id, "turn", &failed, &turn_id, /*subagent*/ None,
+    )
+    .await?;
     let mut events = vec![
         json!({"type":"agent.session.turn.created","session_id":id,"turn_id":turn_id,"turn":queued}),
         json!({"type":"error","session_id":id,"error":{"type":"error","code":error["code"],"message":error["message"],"param":null}}),

@@ -196,8 +196,15 @@ pub(crate) async fn delete(
             .fetch_one(&state.store.0)
             .await
             .map_err(anyhow::Error::from)?;
-    if let Some(thread_id) = &thread_id {
-        // Public status can trail the worker, whose thread status is authoritative.
+    // Public status can trail the worker, whose thread status is
+    // authoritative. A subagent still working is running execution too.
+    let subagent_threads: Vec<String> =
+        sqlx::query_scalar("SELECT thread_id FROM subagents WHERE session_id = ?")
+            .bind(&id)
+            .fetch_all(&state.store.0)
+            .await
+            .map_err(anyhow::Error::from)?;
+    for thread_id in thread_id.iter().chain(&subagent_threads) {
         let thread = state
             .rpc("thread/read", json!({"threadId": thread_id}))
             .await?;
@@ -216,7 +223,8 @@ pub(crate) async fn delete(
         "DELETE FROM tool_calls WHERE session_id = ?",
         "DELETE FROM input_requests WHERE session_id = ?",
         "DELETE FROM turn_usage WHERE session_id = ?",
-        "DELETE FROM usage_totals WHERE session_id = ?",
+        "DELETE FROM thread_usage_totals WHERE thread_id IN (SELECT thread_id FROM sessions WHERE id = ?1 UNION SELECT thread_id FROM subagents WHERE session_id = ?1)",
+        "DELETE FROM subagents WHERE session_id = ?",
         "DELETE FROM public_sessions WHERE id = ?",
         "DELETE FROM sessions WHERE id = ?",
     ] {

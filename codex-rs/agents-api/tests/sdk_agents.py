@@ -105,19 +105,6 @@ def check_saved_agents(client):
         else:
             raise AssertionError(f"unsupported execution was accepted: {tool['type']}")
     assert agents.update(agent.id, tools=None).tools == []
-    for patch in [{"multi_agent": {"enabled": True}}]:
-        agents.update(agent.id, **patch)
-        try:
-            client.beta.agents.sessions.create(
-                agent_id=agent.id,
-                environment={"type": "none"},
-                input="unsupported execution",
-            )
-        except openai.BadRequestError:
-            pass
-        else:
-            raise AssertionError(f"unsupported execution was accepted: {patch}")
-        agents.update(agent.id, multi_agent=None, service_tier=None)
     before = agents.retrieve(agent.id)
     for patch in [
         {"model": None},
