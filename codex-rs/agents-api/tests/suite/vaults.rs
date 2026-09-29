@@ -41,7 +41,7 @@ async fn mcp_server() -> anyhow::Result<(
     ))
 }
 
-fn files_containing(directory: &Path, needle: &str) -> anyhow::Result<Vec<String>> {
+pub(super) fn files_containing(directory: &Path, needle: &str) -> anyhow::Result<Vec<String>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();

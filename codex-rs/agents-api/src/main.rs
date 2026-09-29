@@ -33,6 +33,10 @@ struct Args {
     /// http. Repeat for each host.
     #[arg(long = "allow-mcp-host")]
     allow_mcp_hosts: Vec<String>,
+    /// Webhook receiver host the API may deliver to even when it is internal
+    /// or plain http. Repeat for each host.
+    #[arg(long = "allow-webhook-host")]
+    allow_webhook_hosts: Vec<String>,
     /// Passphrase that encrypts vault credentials in the data directory.
     /// Vault credentials are unavailable without it.
     #[arg(
@@ -100,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let api = AgentsApi::new(AppServerClient::Remote(client), directory, args.token).await?;
         api.allow_mcp_hosts(args.allow_mcp_hosts);
+        api.allow_webhook_hosts(args.allow_webhook_hosts);
         if let Some(passphrase) = args.vault_passphrase {
             api.configure_vault(passphrase).await?;
         }

@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true, features = ["http1", "json", "query", "tokio"] }
+base64 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
@@ -20,8 +21,12 @@ codex-tools = { workspace = true }
 codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 futures = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 sqlx-macros = { workspace = true }
 tempfile = { workspace = true }

@@ -112,6 +112,7 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             .await?;
             api.configure_vault("sdk-lifecycle-vault-passphrase-0123456789".into())
                 .await?;
+            api.allow_webhook_hosts(["127.0.0.1".to_string()]);
             let (base, server) = capabilities::serve(&api).await?;
             let mut command = tokio::process::Command::new(&python);
             command.arg(&script).arg(&base);

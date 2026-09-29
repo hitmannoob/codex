@@ -19,6 +19,8 @@ mod subagents;
 mod turns;
 mod usage;
 mod vaults;
+mod webhook_delivery;
+mod webhooks;
 
 use axum::Json;
 use axum::Router;
@@ -63,6 +65,8 @@ struct State {
     streams: streaming::Streams,
     /// Lower-case MCP hosts the operator allows to be internal or plain http.
     mcp_hosts: Mutex<HashSet<String>>,
+    /// Lower-case webhook hosts the operator allows to be internal or plain http.
+    webhook_hosts: Mutex<HashSet<String>>,
     /// Encrypted credential values, available once the operator supplies a passphrase.
     secrets: secrets::Secrets,
     events: broadcast::Sender<Value>,
@@ -186,6 +190,7 @@ impl AgentsApi {
             input_gates: gates::Gates::default(),
             streams: streaming::Streams::default(),
             mcp_hosts: Mutex::default(),
+            webhook_hosts: Mutex::default(),
             secrets: secrets::Secrets::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
@@ -282,6 +287,13 @@ impl AgentsApi {
     /// loopback, private, or link-local addresses, or use plain http.
     pub fn allow_mcp_hosts(&self, hosts: impl IntoIterator<Item = String>) {
         lock(&self.state.mcp_hosts).extend(hosts.into_iter().map(|host| host.to_ascii_lowercase()));
+    }
+
+    /// Allow webhook deliveries to these hosts even when they resolve to
+    /// loopback, private, or link-local addresses, or use plain http.
+    pub fn allow_webhook_hosts(&self, hosts: impl IntoIterator<Item = String>) {
+        lock(&self.state.webhook_hosts)
+            .extend(hosts.into_iter().map(|host| host.to_ascii_lowercase()));
     }
 
     /// Close the backend connection, allowing Codex to flush session state.

@@ -251,6 +251,30 @@ secrets directory.
   Rotating or deleting a credential, or deleting its vault, changes only
   sessions created afterwards, as the guide documents.
 
+Webhook endpoints are managed with the SDK's `client.webhooks` API
+(`/v1/webhook_endpoints`, plus `/v1/webhook_event_types`). They need the vault
+passphrase, because signing secrets are kept in the same encrypted store.
+- **Event types:** `agent.session.created`, `agent.session.action_required`,
+  `agent.session.in_progress`, `agent.session.idle`, and
+  `agent.session.failed`. Repeated types are collapsed. Other OpenAI event
+  types are rejected, since this service never produces them.
+- **Secrets:** the `whsec_` signing secret is returned only when an endpoint is
+  created or its secret rotated. Responses otherwise carry
+  `signing_secret_hint`. Rotation with
+  `keep_old_secret_active_for_24_hours` signs with both secrets for a day.
+- **Signing:** requests follow the Standard Webhooks scheme that
+  `client.webhooks.verify_signature` checks, using the `webhook-id`,
+  `webhook-timestamp`, and `webhook-signature` headers.
+- **Egress:** receiver URLs must use https and resolve only to public
+  addresses. The operator can allow specific hosts, internal or plain http,
+  with repeated `--allow-webhook-host <host>` flags or
+  `AgentsApi::allow_webhook_hosts`. Each delivery re-checks the addresses and
+  connects only to those it checked.
+- **Test deliveries:** `test` sends one signed sample event and reports the
+  receiver's status code. Redirects are not followed, and an unreachable
+  receiver returns 502.
+- **Not yet delivered:** session events themselves (outbox and retries).
+
 A successful function result carries `output`: a string, or an array of
 `input_text` and `input_image` parts. Images must be `data:image/` URLs, and
 JSON objects must be serialized to strings first. A failed result carries its

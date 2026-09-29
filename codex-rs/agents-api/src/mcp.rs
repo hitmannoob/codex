@@ -213,7 +213,7 @@ pub(crate) async fn check(
 }
 
 /// Addresses a service may reach without operator approval.
-fn public(address: &IpAddr) -> bool {
+pub(crate) fn public(address: &IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [first, second, ..] = address.octets();

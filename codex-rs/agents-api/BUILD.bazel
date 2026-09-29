@@ -19,5 +19,6 @@ codex_rust_crate(
         "tests/sdk_sessions.py",
         "tests/sdk_subagents.py",
         "tests/sdk_vaults.py",
+        "tests/sdk_webhooks.py",
     ],
 )

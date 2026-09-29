@@ -419,3 +419,6 @@ mod subagents;
 
 #[path = "suite/vaults.rs"]
 mod vaults;
+
+#[path = "suite/webhooks.rs"]
+mod webhooks;

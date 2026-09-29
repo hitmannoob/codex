@@ -52,6 +52,7 @@ pub(crate) fn router(state: Arc<State>) -> Router {
         .route("/v1/sessions/{id}/events", get(events))
         .merge(crate::contract::router())
         .merge(crate::vaults::router())
+        .merge(crate::webhooks::router())
         .layer(DefaultBodyLimit::max(/*limit*/ 16 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -65,7 +66,9 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Webhook endpoint requests come from the SDK without the beta header.
     let compatible = request.uri().path().starts_with("/v1/agents/sessions")
+        || request.uri().path().starts_with("/v1/webhook_")
         || request
             .headers()
             .get("openai-beta")

@@ -1083,11 +1083,57 @@ Remaining:
 
 Webhook work:
 
-- [ ] Verify subscription/event/signature/retry semantics from the pinned contract.
+- [x] Verify subscription/event/signature/retry semantics from the pinned contract.
 - [ ] Create an outbox transactionally with the state changes that cause delivery.
 - [ ] Implement bounded dispatch, documented signing, retries, and deduplication
   identifiers. A lost acknowledgment must not be presented as exactly-once delivery.
+  Signing is done (stage 1); dispatch, retries, and deduplication remain.
 - [ ] Persist delivery state and redact credentials/content appropriately in logs.
+
+Evidence (2026-09-29, webhook stage 1: endpoints and signing):
+
+Contract. The session webhook guide lists five events:
+`agent.session.created`, `.action_required` (with `required_action.type`),
+`.in_progress`, `.idle`, and `.failed`. Bodies are
+`{id: "evt_…", object: "event", created_at, type, data: {id, …}}`. Callers
+create an endpoint through the shared webhook setup, which the pinned SDK
+exposes as `client.webhooks`: create, retrieve, update, list, delete,
+`rotate_secret`, `test`, and `event_types.list`. The shared guide defines
+delivery:
+- Standard Webhooks signing, verified by the SDK's `verify_signature`.
+- Any status other than 2xx fails the attempt, and redirects are not followed.
+- Retries use exponential backoff for up to 72 hours.
+- Receivers deduplicate on `webhook-id`.
+
+The SDK's `event_types` literals omit the agent events, but its runtime does
+not enforce them. The inventory gained WHK-001..008 as a recorded amendment.
+
+Decisions (2026-09-29): implement the SDK-compatible endpoint API, and keep
+signing secrets in the encrypted vault store, so webhooks need the vault
+passphrase. Receivers get the MCP egress policy. Because the service connects
+itself, each delivery also pins the addresses it checked, which closes the DNS
+change window MCP still has. Operators allow specific hosts with
+`--allow-webhook-host`.
+
+Implementation. `src/webhooks.rs` holds the endpoint routes, with endpoint
+metadata in migration `0008`. `src/webhook_delivery.rs` holds secrets, signing,
+destination checks, and single attempts. A rotation that keeps the old secret
+signs with both for 24 hours.
+
+Tests:
+- `webhook_endpoints_sign_test_deliveries_and_keep_secrets_private`
+  (tests/suite/webhooks.rs) covers:
+  - 501 without a passphrase, and validation errors with their exact messages;
+  - response shapes, and an unchanged update keeping `updated_at`;
+  - signed test deliveries checked against an independent HMAC;
+  - 500 and redirect statuses reported rather than followed, and 502 for an
+    unreachable receiver;
+  - rotation with and without the old secret, and pagination;
+  - deletion, and no signing secret in the data directory.
+- `tests/sdk_webhooks.py` runs every operation through the pinned SDK with
+  strict validation, and checks deliveries with the SDK's `verify_signature`.
+
+Run on macOS with local receivers.
 
 Observability work:
 

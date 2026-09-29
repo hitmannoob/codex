@@ -16,16 +16,18 @@ operations required by documented Agents API workflows.
 - SDK baseline: official Python SDK `openai==3.17.0`.
 - Review date: 2026-09-22.
 - Agents requests use `OpenAI-Beta: agents=v1` unless the operation is a listed
-  Files or Skills dependency with its own contract.
+  Files, Skills, or Webhooks dependency with its own contract.
 
-The operation denominator is 59:
+The operation denominator is 67:
 
 - 43 Agents API operations, including raw-HTTP trace export.
 - 5 Files API operations needed for `file_id` environment inputs and cleanup.
 - 11 Skills API operations needed for hosted `skill_reference` inputs and
   version selection.
+- 8 Webhooks API operations (endpoints and event types). The session webhook
+  guide has callers create an endpoint and select Agents API events.
 
-The SDK resource surface contains 58 of those operations. Trace export is
+The SDK resource surface contains 66 of those operations. Trace export is
 documented as `GET /v1/agents/sessions/{session_id}/traces` but has no Python
 SDK 3.17.0 resource method, so it stays in the inventory with raw-HTTP
 acceptance coverage required.
@@ -47,7 +49,7 @@ response variants and documented errors:
 - `verified`: the complete operation passed its required behavioral contract
   tests in the recorded environment.
 
-The current count is 30 partial and 29 missing. No operation is called
+The current count is 38 partial and 29 missing. No operation is called
 implemented or verified yet because the existing tests cover only constrained
 variants. A partial operation does not count as completed parity.
 
@@ -107,3 +109,11 @@ inventory diff, record added or removed behavior with a source, update fixtures
 and acceptance tests, and explain whether the change is compatible. Mock,
 real-provider, and platform evidence remain separate fields; one must not be
 substituted for another.
+
+Amendments under the same `openai==3.17.0` pin:
+- 2026-09-29: added WHK-001..008, the SDK's `client.webhooks` endpoint and
+  event-type operations. The session webhook guide has callers create an
+  endpoint and select Agents API events, so these operations are required
+  dependencies that the G00 review missed. The change is additive: no existing
+  entry changed meaning. `tests/sdk_inventory.py` checks the new resources, and
+  `tests/sdk_webhooks.py` validates their responses.
