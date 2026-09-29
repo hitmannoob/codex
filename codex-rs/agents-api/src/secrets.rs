@@ -54,12 +54,31 @@ struct Store {
 pub(crate) struct Secrets(OnceLock<Arc<Mutex<Store>>>);
 
 impl Secrets {
-    /// Enable the store. Only the first passphrase takes effect.
-    pub(crate) fn configure(&self, directory: std::path::PathBuf, passphrase: String) {
+    /// Enable the store once the passphrase is shown to read any secrets
+    /// already stored, so a wrong passphrase stops startup instead of failing
+    /// every later request. Only the first accepted passphrase takes effect.
+    pub(crate) async fn configure(
+        &self,
+        directory: std::path::PathBuf,
+        passphrase: String,
+    ) -> anyhow::Result<()> {
+        let secrets = directory.join("secrets");
+        let backend = LocalSecretsBackend::new(directory, Arc::new(OperatorPassphrase(passphrase)));
+        let backend = tokio::task::spawn_blocking(move || {
+            backend.list(/*scope_filter*/ None).map(|_| backend)
+        })
+        .await?
+        .map_err(|error| {
+            error.context(format!(
+                "the vault passphrase cannot read the secrets stored in {}",
+                secrets.display()
+            ))
+        })?;
         let _ = self.0.set(Arc::new(Mutex::new(Store {
-            backend: LocalSecretsBackend::new(directory, Arc::new(OperatorPassphrase(passphrase))),
+            backend,
             cache: HashMap::new(),
         })));
+        Ok(())
     }
 
     async fn with<T: Send + 'static>(

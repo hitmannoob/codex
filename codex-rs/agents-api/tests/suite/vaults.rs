@@ -174,9 +174,16 @@ async fn vault_credentials_authenticate_mcp_as_session_snapshots() -> anyhow::Re
         explicit["agent"]["tools"][0]["credential_id"] = a["id"].clone();
         request(&client, reqwest::Method::POST, &sessions, explicit).await?;
 
-        // Snapshots survive a restart under the same passphrase.
+        // A different passphrase cannot read the stored secrets, so it is
+        // refused at startup rather than failing each later request.
         server.abort();
         api.shutdown().await?;
+        let api = start(false).await?;
+        let refused = api.configure_vault("a-different-operator-passphrase-0123456789".into()).await.err().context("a different passphrase was accepted")?;
+        assert_eq!(refused.to_string(), format!("the vault passphrase cannot read the secrets stored in {}", data_path.join("secrets").display()));
+        api.shutdown().await?;
+
+        // Snapshots survive a restart under the same passphrase.
         let api = start(true).await?;
         let (base, server) = capabilities::serve(&api).await?;
         let second_url = format!("{base}/agents/sessions/{}", second["id"].as_str().context("second id")?);

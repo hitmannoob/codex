@@ -266,7 +266,7 @@ impl AgentsApi {
 
     /// Enable vault credentials, encrypting their values in the data directory
     /// under this passphrase. The same passphrase must be supplied on every
-    /// start to read credentials stored earlier.
+    /// start; one that cannot read the credentials stored earlier is refused.
     pub async fn configure_vault(&self, passphrase: String) -> anyhow::Result<()> {
         anyhow::ensure!(
             passphrase.len() >= 32,
@@ -274,8 +274,8 @@ impl AgentsApi {
         );
         self.state
             .secrets
-            .configure(self.directory.to_path_buf(), passphrase);
-        Ok(())
+            .configure(self.directory.to_path_buf(), passphrase)
+            .await
     }
 
     /// Allow public MCP servers on these hosts even when they resolve to

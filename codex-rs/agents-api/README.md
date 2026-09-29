@@ -229,7 +229,9 @@ URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
 Vaults hold MCP credentials. They are available only when the operator
 supplies a passphrase of at least 32 bytes with `--vault-passphrase` (or
 `CODEX_AGENTS_API_VAULT_PASSPHRASE`); otherwise credential operations return
-501. Keep that passphrase: stored secrets cannot be read without it.
+501. Keep that passphrase: stored secrets cannot be read without it, and a
+start with a passphrase that cannot read them fails with an error naming the
+secrets directory.
 - **Storage:** vault and credential metadata live in the API database. Secret
   values are encrypted with age (scrypt) in `DATA_DIRECTORY/secrets`. They are
   never returned by the API or stored in public records, and they never reach

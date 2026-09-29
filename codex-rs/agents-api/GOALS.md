@@ -1009,7 +1009,9 @@ session's (server label, credential) choices. Secret values go to the
 repository's `codex-secrets` file store (age with scrypt) at
 `DATA_DIRECTORY/secrets`, encrypted under an operator passphrase
 (`--vault-passphrase`, at least 32 bytes) that stands in for the OS keyring.
-Without the passphrase, credential operations return 501.
+Without the passphrase, credential operations return 501. Startup reads any
+stored secrets once and refuses a passphrase that cannot decrypt them, rather
+than failing each later request with a 500.
 
 Every write re-encrypts the whole file with a deliberately slow scrypt, about
 one second in a release build, and each operation holds a lock. Credential
@@ -1054,6 +1056,24 @@ Test: `vault_credentials_authenticate_mcp_as_session_snapshots`
 `tests/sdk_vaults.py` runs vault and credential CRUD, rotation, and rejected
 variants through the pinned SDK with strict validation. Run on macOS with a
 mock provider.
+
+Live run (2026-09-29): the CLI binary and its managed app-server, driven
+through the pinned SDK against a Python mock model and a mock MCP server that
+recorded the `Authorization` header of each call. The API was restarted
+between phases on the same data directory:
+1. With a passphrase: a session sent `Bearer <token 1>`. After rotation it kept
+   token 1 while a new session sent token 2.
+2. After a restart, with the passphrase from the environment: snapshots held.
+   After credential deletion, the old session kept its token and a new session
+   sent no header. A deleted vault was rejected at session creation.
+3. Without a passphrase: vault reads worked, while credential writes and turns
+   needing a snapshot returned 501.
+4. With a different passphrase: startup was refused, and the managed worker was
+   cleaned up.
+5. With the original passphrase: every session worked again.
+
+Neither token nor the passphrase appeared in the data directory, the worker
+home, model requests, or the API log.
 
 Remaining:
 - `environment_variable` credentials and their networking scope (G09).
