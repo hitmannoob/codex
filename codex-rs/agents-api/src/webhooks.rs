@@ -244,11 +244,18 @@ async fn delete(
     }
     // Remove the secret first, so a failure leaves the endpoint intact.
     state.secrets.delete(vec![secret_name(&id)]).await?;
-    sqlx::query("DELETE FROM webhook_endpoints WHERE id = ?")
-        .bind(&id)
-        .execute(&state.store.0)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
+    for statement in [
+        "DELETE FROM webhook_deliveries WHERE endpoint_id = ? AND status = 'pending'",
+        "DELETE FROM webhook_endpoints WHERE id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+    tx.commit().await.map_err(anyhow::Error::from)?;
     Ok(Json(
         json!({"id":id,"object":"webhook_endpoint.deleted","deleted":true}),
     ))

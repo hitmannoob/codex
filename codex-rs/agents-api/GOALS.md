@@ -1084,11 +1084,10 @@ Remaining:
 Webhook work:
 
 - [x] Verify subscription/event/signature/retry semantics from the pinned contract.
-- [ ] Create an outbox transactionally with the state changes that cause delivery.
-- [ ] Implement bounded dispatch, documented signing, retries, and deduplication
+- [x] Create an outbox transactionally with the state changes that cause delivery.
+- [x] Implement bounded dispatch, documented signing, retries, and deduplication
   identifiers. A lost acknowledgment must not be presented as exactly-once delivery.
-  Signing is done (stage 1); dispatch, retries, and deduplication remain.
-- [ ] Persist delivery state and redact credentials/content appropriately in logs.
+- [x] Persist delivery state and redact credentials/content appropriately in logs.
 
 Evidence (2026-09-29, webhook stage 1: endpoints and signing):
 
@@ -1134,6 +1133,57 @@ Tests:
   strict validation, and checks deliveries with the SDK's `verify_signature`.
 
 Run on macOS with local receivers.
+
+Evidence (2026-09-29, webhook stage 2: session event delivery):
+
+Outbox. Migration `0009` adds `webhook_deliveries`, one row per event per
+subscribed endpoint. Rows are written in the transaction that records the
+change:
+- session creation: `records::create_session`;
+- every status change: `records::transition`, where `requires_action` becomes
+  `agent.session.action_required`;
+- the bulk failure of running sessions on a lost backend or restart:
+  `records::disconnected`.
+
+An event is therefore never lost to a crash, and never sent for a change that
+did not commit. Each endpoint gets its own `wh_` delivery ID, which is the
+`webhook-id` on every attempt. The `evt_` event ID is shared across endpoints.
+
+Dispatcher. `src/webhook_outbox.rs` starts with the API and is aborted on
+shutdown.
+- **Scheduling:** lifecycle events wake it after their commit; otherwise it
+  polls every five seconds. Each round claims up to 64 due deliveries and
+  serves up to eight endpoints at once, each endpoint's in event order.
+- **Failures:** any status other than 2xx, a redirect, a refused destination,
+  or an unavailable signing secret fails the attempt. Retries back off from 5
+  seconds, doubling to an hour, until 72 hours after the event; then the
+  delivery is marked failed and logged by ID only.
+- **Outages:** an unreachable receiver pushes the endpoint's later deliveries
+  to the same retry time, so an outage costs one attempt per round rather than
+  one per event.
+- **Retention:** finished rows are kept seven days.
+- **Guarantees:** delivery is at least once, because an attempt cut short by a
+  crash or shutdown is repeated. Ordering is not guaranteed after a failure,
+  since a retry can land after later events; the guide promises no ordering.
+- **Endpoint changes:** deleting an endpoint drops its pending deliveries. An
+  updated URL applies to deliveries not yet attempted.
+
+Test: `session_events_are_queued_retried_and_survive_restart`
+(tests/suite/webhooks.rs, about 31 seconds) covers:
+- a function-calling session delivering created, in_progress,
+  action_required, in_progress, and idle in order, each signed;
+- a receiver that fails the first attempt, retried with the same `webhook-id`
+  and body;
+- one event reaching two endpoints under distinct delivery IDs;
+- no delivery for an event an endpoint did not select;
+- after a restart, a queued delivery reaching the endpoint's updated URL, and
+  `agent.session.failed` delivered for the session the restart interrupted.
+
+The first version of this test assumed an unreachable endpoint's retries stay
+in order. They did not: the first round after a restart retried the older
+event before its URL changed, so a newer event arrived first. That case is
+now documented as unordered, and an unreachable receiver now defers all later
+deliveries, not only those claimed in the same round.
 
 Observability work:
 

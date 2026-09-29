@@ -16,7 +16,10 @@ use uuid::Uuid;
 
 pub(crate) async fn disconnected(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE public_sessions SET data = json_set(data, '$.status', 'failed', '$.error', 'backend connection lost') WHERE json_extract(data, '$.status') IN ('in_progress', 'requires_action')").execute(&mut *tx).await?;
+    let failed: Vec<String> = sqlx::query_scalar("UPDATE public_sessions SET data = json_set(data, '$.status', 'failed', '$.error', 'backend connection lost') WHERE json_extract(data, '$.status') IN ('in_progress', 'requires_action') RETURNING id").fetch_all(&mut *tx).await?;
+    for id in failed {
+        crate::webhook_outbox::session_status(&mut tx, &id, "failed").await?;
+    }
     sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'failed', '$.completed_at', ?, '$.error', json(?)) WHERE kind = 'turn' AND json_extract(data, '$.status') IN ('queued', 'in_progress', 'waiting')")
         .bind(crate::contract::now() as i64).bind(json!({"code":crate::reconcile::CONNECTION_LOST_CODE,"message":"backend connection lost"}).to_string()).execute(&mut *tx).await?;
     sqlx::query("UPDATE public_records SET data = json_set(data, '$.status', 'incomplete') WHERE kind = 'item' AND json_extract(data, '$.status') = 'in_progress'").execute(&mut *tx).await?;
@@ -25,11 +28,15 @@ pub(crate) async fn disconnected(pool: &sqlx::SqlitePool) -> anyhow::Result<()> 
 }
 
 pub(crate) async fn create_session(pool: &sqlx::SqlitePool, data: &Value) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO public_sessions (id,data) VALUES (?,?)")
         .bind(data["id"].as_str())
         .bind(data.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    crate::webhook_outbox::enqueue(&mut tx, "agent.session.created", json!({"id":data["id"]}))
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -47,6 +54,7 @@ pub(crate) async fn transition(
     let Some(data) = data else {
         return Ok(None);
     };
+    crate::webhook_outbox::session_status(tx, id, status).await?;
     let session = decorate(&mut **tx, id, serde_json::from_str(&data)?).await?;
     Ok(Some(
         json!({"type": format!("agent.session.{status}"), "session": session}),
@@ -85,6 +93,19 @@ pub(crate) async fn session(state: &State, id: &str) -> Result<Value, ApiError> 
 }
 
 pub(crate) fn emit(state: &State, mut event: Value) {
+    // Lifecycle events follow a commit that may have queued webhooks.
+    if matches!(
+        event["type"].as_str(),
+        Some(
+            "agent.session.created"
+                | "agent.session.in_progress"
+                | "agent.session.requires_action"
+                | "agent.session.idle"
+                | "agent.session.failed"
+        )
+    ) {
+        state.webhook_wake.notify_one();
+    }
     event["event_id"] = json!(Uuid::new_v4().to_string());
     let _ = state.public_events.send(event);
 }

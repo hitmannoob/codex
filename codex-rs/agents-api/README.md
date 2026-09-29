@@ -273,7 +273,19 @@ passphrase, because signing secrets are kept in the same encrypted store.
 - **Test deliveries:** `test` sends one signed sample event and reports the
   receiver's status code. Redirects are not followed, and an unreachable
   receiver returns 502.
-- **Not yet delivered:** session events themselves (outbox and retries).
+- **Session events:** each status change queues one delivery per subscribed
+  endpoint, in the transaction that records the change. The body is
+  `{id: "evt_…", object: "event", created_at, type, data: {id: <session>}}`,
+  and `action_required` adds `required_action: {type: "function_call"}`.
+  Sessions the service fails on a lost backend or restart report
+  `agent.session.failed`.
+- **Retries:** any status other than 2xx, a redirect, or an unreachable
+  receiver fails the attempt. Retries back off from 5 seconds, doubling to at
+  most an hour, for 72 hours, and continue across restarts. Delivery is at
+  least once: each retry repeats the `webhook-id`, so receivers can drop
+  duplicates. Events to an endpoint are attempted in order, but a failed one
+  retries on its own schedule, so order by `created_at` when it matters.
+  Given-up deliveries are logged without their content.
 
 A successful function result carries `output`: a string, or an array of
 `input_text` and `input_image` parts. Images must be `data:image/` URLs, and

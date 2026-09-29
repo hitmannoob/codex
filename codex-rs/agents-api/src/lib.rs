@@ -20,6 +20,7 @@ mod turns;
 mod usage;
 mod vaults;
 mod webhook_delivery;
+mod webhook_outbox;
 mod webhooks;
 
 use axum::Json;
@@ -69,6 +70,8 @@ struct State {
     webhook_hosts: Mutex<HashSet<String>>,
     /// Encrypted credential values, available once the operator supplies a passphrase.
     secrets: secrets::Secrets,
+    /// Wakes the webhook dispatcher after a commit that may have queued deliveries.
+    webhook_wake: tokio::sync::Notify,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -170,6 +173,7 @@ pub struct AgentsApi {
     directory: AbsolutePathBuf,
     router: Router,
     pump: Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
+    dispatcher: tokio::task::JoinHandle<()>,
     reconnect_gate: Semaphore,
     stop: watch::Sender<bool>,
 }
@@ -192,6 +196,7 @@ impl AgentsApi {
             mcp_hosts: Mutex::default(),
             webhook_hosts: Mutex::default(),
             secrets: secrets::Secrets::default(),
+            webhook_wake: tokio::sync::Notify::new(),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
             // behind is closed and recovers from saved records.
@@ -199,13 +204,19 @@ impl AgentsApi {
             token,
         });
         let router = routes::router(Arc::clone(&state));
+        let stop = watch::channel(/*stopping*/ false).0;
+        let dispatcher = tokio::spawn(webhook_outbox::dispatch(
+            Arc::clone(&state),
+            stop.subscribe(),
+        ));
         let api = Self {
             state,
             directory,
             router,
             pump: Mutex::new(None),
+            dispatcher,
             reconnect_gate: Semaphore::new(/*permits*/ 1),
-            stop: watch::channel(/*stopping*/ false).0,
+            stop,
         };
         api.reconnect(client).await?;
         Ok(api)
@@ -299,6 +310,8 @@ impl AgentsApi {
     /// Close the backend connection, allowing Codex to flush session state.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let _ = self.stop.send(true);
+        // An interrupted delivery stays queued and is repeated after restart.
+        self.dispatcher.abort();
         let pump = lock(&self.pump).take();
         if let Some(pump) = pump {
             pump.await??;
