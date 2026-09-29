@@ -24,8 +24,8 @@ The worker executable defaults to the sibling `codex-app-server`; override it wi
 `--app-server-bin /absolute/path/codex-app-server`. Its persistent `CODEX_HOME`
 defaults to `DATA_DIRECTORY/codex-home`; use `--codex-home` to select an existing
 configured home. Configure provider credentials and MCP there, or through the
-worker's inherited environment. The HTTP bearer token is not forwarded to the
-worker. This dedicated home is not the operator's default `~/.codex`.
+worker's inherited environment. The HTTP bearer token and the vault passphrase
+are not forwarded to the worker. This dedicated home is not the operator's default `~/.codex`.
 
 Managed startup locks the worker home, creates a private temporary socket, and
 waits for the app-server initialization handshake before accepting HTTP requests.
@@ -53,9 +53,9 @@ Operational diagnostics:
   `status`.
 - **Handshake lines:** the `agents-api managed worker pid=` and
   `agents-api listening on` lines stay plain, because supervisors parse them.
-- **Request IDs:** every routed response carries `x-request-id: req_…`, which
-  the OpenAI SDK exposes as `_request_id`, so a client error can be matched to
-  the log.
+- **Request IDs:** every response carries `x-request-id: req_…`, including
+  errors, rejected credentials, and unknown routes. The OpenAI SDK exposes it
+  as `_request_id`, so a failed call can be matched to the log.
 - **Export:** `--otlp-endpoint <collector base URL>` (or
   `CODEX_AGENTS_API_OTLP_ENDPOINT`) sends spans and metrics to
   `<url>/v1/traces` and `<url>/v1/metrics` over OTLP/HTTP, through the
@@ -115,7 +115,7 @@ remain available without that header. New session routes are:
 | --- | --- | --- |
 | POST / GET | `/v1/agents` | Create saved agents / list in creation order |
 | GET / POST / DELETE | `/v1/agents/{id}` | Retrieve, update, or delete a saved agent |
-| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, required initial input, optional SSE |
+| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, required initial input (the pinned SDK requires it for environment `none`), optional SSE |
 | GET | `/v1/agents/sessions` | List in creation order, optionally filtered by `agent_id` |
 | GET | `/v1/agents/sessions/{id}` | Configuration snapshot, status, metadata and current `required_actions` |
 | POST | `/v1/agents/sessions/{id}` | Replace metadata; change model, reasoning effort, or service tier for later turns |

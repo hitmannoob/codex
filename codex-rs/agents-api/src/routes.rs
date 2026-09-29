@@ -54,12 +54,15 @@ pub(crate) fn router(state: Arc<State>) -> Router {
         .merge(crate::vaults::router())
         .merge(crate::webhooks::router())
         // Route layers see the matched route template, which labels metrics.
-        .route_layer(middleware::from_fn(crate::telemetry::observe))
+        .route_layer(middleware::from_fn(crate::telemetry::route))
         .layer(DefaultBodyLimit::max(/*limit*/ 16 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             authorize,
         ))
+        // Outermost, so rebuilt error responses and rejected credentials also
+        // carry a request ID.
+        .layer(middleware::from_fn(crate::telemetry::observe))
         .with_state(state)
 }
 

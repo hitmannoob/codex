@@ -69,12 +69,19 @@ impl Worker {
             .arg(format!("unix://{}", socket.display()))
             .arg("--strict-config")
             .env("CODEX_HOME", home.as_path())
-            .env_remove("CODEX_AGENTS_API_TOKEN")
             .current_dir(home.as_path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // The worker runs model-driven work, so it must not inherit the
+        // service's own secrets.
+        for name in [
+            "CODEX_AGENTS_API_TOKEN",
+            "CODEX_AGENTS_API_VAULT_PASSPHRASE",
+        ] {
+            command.env_remove(name);
+        }
         #[cfg(windows)]
         command.env(codex_app_server_transport::DAEMON_SHUTDOWN_SOCKET_ENV, "1");
         let child = command

@@ -8,6 +8,8 @@ use axum::extract::Request;
 use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
@@ -39,30 +41,36 @@ pub(crate) fn elapsed(name: &str, duration: Duration, tags: &[(&str, &str)]) {
     }
 }
 
-/// Give each request an ID, returned as `x-request-id` as OpenAI's API does,
-/// and a span that correlates the request's events; then record its outcome.
+/// The matched route template, noted by [`route`] once routing succeeds. The
+/// outer [`observe`] reads it after the response is built, because error
+/// responses are rebuilt on the way out and would lose anything attached to
+/// them.
+#[derive(Clone, Default)]
+struct Route(Arc<OnceLock<String>>);
+
+/// Outermost layer: give every request an ID, returned as `x-request-id` as
+/// OpenAI's API does (including on errors and rejected credentials), and a
+/// span that correlates the request's events; then record its outcome.
 #[tracing::instrument(name = "http.request", skip_all, fields(
     method = %request.method(),
     route = tracing::field::Empty,
     request_id = tracing::field::Empty,
     status = tracing::field::Empty,
 ))]
-pub(crate) async fn observe(request: Request, next: Next) -> Response {
+pub(crate) async fn observe(mut request: Request, next: Next) -> Response {
     let span = tracing::Span::current();
     let method = request.method().to_string();
-    // Route templates hold braces, which metric tags do not allow.
-    let route = codex_otel::sanitize_metric_tag_value(
-        request
-            .extensions()
-            .get::<MatchedPath>()
-            .map_or("unmatched", MatchedPath::as_str),
-    );
     let request_id = format!("req_{}", Uuid::new_v4().simple());
-    span.record("route", route.as_str());
     span.record("request_id", request_id.as_str());
+    let matched = Route::default();
+    request.extensions_mut().insert(matched.clone());
     let started = Instant::now();
     let mut response = next.run(request).await;
     let status = response.status();
+    // Route templates hold braces, which metric tags do not allow.
+    let route =
+        codex_otel::sanitize_metric_tag_value(matched.0.get().map_or("unmatched", String::as_str));
+    span.record("route", route.as_str());
     span.record("status", status.as_u16());
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
@@ -78,4 +86,15 @@ pub(crate) async fn observe(request: Request, next: Next) -> Response {
         tracing::warn!(status = status.as_u16(), "request failed");
     }
     response
+}
+
+/// Route layer: note the matched route template for [`observe`].
+pub(crate) async fn route(request: Request, next: Next) -> Response {
+    if let (Some(path), Some(matched)) = (
+        request.extensions().get::<MatchedPath>(),
+        request.extensions().get::<Route>(),
+    ) {
+        let _ = matched.0.set(path.as_str().to_owned());
+    }
+    next.run(request).await
 }

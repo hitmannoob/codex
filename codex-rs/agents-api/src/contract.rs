@@ -95,7 +95,7 @@ struct Create {
     environment: Environment,
     agent_id: Option<String>,
     agent: Option<Value>,
-    input: Value,
+    input: Option<Value>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -112,7 +112,13 @@ async fn create(
             "only environment none is implemented on this API path",
         ));
     }
-    let input = crate::input::message(params.input)?;
+    // The pinned SDK requires initial input for environment `none`.
+    let input = match params.input {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) if items.is_empty() => None,
+        Some(input) => Some(crate::input::message(input)?),
+    }
+    .ok_or_else(|| invalid("input is required when environment.type is none"))?;
     let metadata = crate::configuration::metadata(params.metadata)?;
     let mut saved = match params.agent_id {
         Some(id) => state

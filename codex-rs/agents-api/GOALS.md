@@ -1340,6 +1340,56 @@ Evidence (2026-09-29, inventory audit, cleanup, and upgrade baseline):
   now follows the same order. The vault test simulates the crash window and
   checks that the orphan is removed while referenced secrets remain.
 
+Evidence (2026-09-29, real-provider run through OpenRouter):
+
+Setup. The CLI and its managed app-server used `openai/gpt-5-nano` through
+OpenRouter's Responses API, driven by the pinned SDK with strict validation.
+- **Key:** only in the environment. A scan found it in no file of the data
+  directory, worker home, or logs.
+- **Cost:** $0.0048 for both passes, from the key's usage counter.
+- **Protocol:** Codex now speaks only the Responses protocol, which OpenRouter
+  serves, including usage and namespace tools.
+- **Outcomes:** each scenario is PASS, FAIL (service contract), or MODEL (the
+  model ignored the prompt, so the service could not be judged).
+
+| Scenario | Result |
+| --- | --- |
+| Plain answer with turn and session usage | PASS (4,358 input, 56 output tokens) |
+| Streamed follow-up; deltas equal the saved text | PASS |
+| Function tool: required action, submitted result, answer uses it | PASS |
+| Structured output (`json_schema`) | PASS |
+| Cancel a running turn | PASS |
+| Trace export: two responses with usage and the tool span | PASS |
+| Signed webhook deliveries (idle, action_required) | PASS |
+| MCP tool with a vault bearer credential | MODEL, with a policy gap (below) |
+| Subagent delegation | Structure PASS; result not delivered (below) |
+
+Findings. A logging proxy between the worker and OpenRouter recorded request
+bodies, never headers.
+- **MCP:** `lookup` reached the model as namespace `mcp__warehouse`, and
+  namespace tools do work through OpenRouter. The model chose Codex's MCP
+  resource tools instead (`list_mcp_resources`, `read_mcp_resource`).
+  - Codex registers those tools whenever any MCP server exists
+    (`core/src/tools/spec_plan.rs::add_mcp_resource_tools`).
+  - They can list and read any resource on a public server, which bypasses
+    `allowed_tools`.
+  - Their calls appear publicly as `mcp_call` items with `server_label` `codex`.
+  - No configuration controls this, so closing it needs a Codex MCP or core
+    change. It is open.
+- **Subagents:** the root spawned a subagent and called `wait_agent`, which
+  returned "Wait completed." with no content, then timed out. The child's
+  answer never reached the root within the turn.
+  - The model also passed an opaque `gAAAAAB…` string as the spawn message.
+    That is model or provider behavior.
+  - How V2 hands a finished child's answer to its parent needs verification
+    against Codex's mailbox delivery. It is open.
+- **Worker environment:** the worker inherited the environment, so the vault
+  passphrase reached model-driven work. The worker now drops
+  `CODEX_AGENTS_API_VAULT_PASSPHRASE` as well as the API token.
+
+This is real-provider evidence for OpenRouter, not for OpenAI's API, so the
+real-provider item stays open.
+
 Completion gate: all inventoried target behaviors have passed their required
 acceptance tests, remaining unsupported capabilities are zero within the declared
 parity target, and real-provider/platform gaps are closed. Mock-only or partial

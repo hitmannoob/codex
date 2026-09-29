@@ -96,6 +96,24 @@ async fn requests_turns_and_tool_calls_are_measured_and_correlated() -> anyhow::
         let read = client.get(&url).bearer_auth(TOKEN).send().await?;
         let second = request_id(&read).context("second request id")?;
         assert!(first.starts_with("req_") && second.starts_with("req_") && first != second, "{first} {second}");
+        // Errors carry one too: rebuilt error bodies, rejected credentials, and
+        // unknown routes.
+        let missing = client.get(format!("{sessions}/missing")).bearer_auth(TOKEN).send().await?;
+        let unauthorized = client.get(&sessions).send().await?;
+        let unrouted = client.get(format!("{base}/nowhere")).bearer_auth(TOKEN).send().await?;
+        assert_eq!(
+            [&missing, &unauthorized, &unrouted].map(|response| (response.status(), request_id(response).is_some_and(|id| id.starts_with("req_")))),
+            [(reqwest::StatusCode::NOT_FOUND, true), (reqwest::StatusCode::UNAUTHORIZED, true), (reqwest::StatusCode::NOT_FOUND, true)]
+        );
+        // Environment `none` needs initial input, however it is left out.
+        for body in [json!({"agent":{"model":"mock-model"},"environment":{"type":"none"}}),
+                     json!({"agent":{"model":"mock-model"},"environment":{"type":"none"},"input":null}),
+                     json!({"agent":{"model":"mock-model"},"environment":{"type":"none"},"input":[]})] {
+            let response = client.post(&sessions).bearer_auth(TOKEN).json(&body).send().await?;
+            let has_id = request_id(&response).is_some();
+            assert_eq!((response.status(), has_id, response.json::<Value>().await?["error"]["message"].clone()),
+                (reqwest::StatusCode::BAD_REQUEST, true, json!("input is required when environment.type is none")), "{body}");
+        }
 
         let pending = loop {
             let session = request(&client, reqwest::Method::GET, &url, Value::Null).await?;
