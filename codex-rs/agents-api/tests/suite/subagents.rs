@@ -122,6 +122,17 @@ async fn subagents_are_registered_attributed_and_kept_apart() -> anyhow::Result<
         assert_eq!(completions.iter().filter(|id| id.is_null()).count(), 1);
         // Session usage includes the subagent's.
         assert_eq!(request(&client, reqwest::Method::GET, &url, Value::Null).await?["usage"], child_usage);
+        // The turn's trace nests the subagent's agent span, with its own model
+        // response and usage, beneath the root agent.
+        let traces = request(&client, reqwest::Method::GET, &format!("{url}/traces"), Value::Null).await?;
+        let spans = traces::spans(&traces["data"][0]);
+        let root = spans.iter().find(|span| span["parentSpanId"] == "").context("root span")?;
+        let child = spans.iter().find(|span| traces::attribute(span, "openai.agents.agent_type") == "subagent").context("subagent span")?;
+        assert_eq!(json!({"parent":child["parentSpanId"],"name":child["name"],"agent":traces::attribute(child, "gen_ai.agent.id"),"input":traces::attribute(child, "gen_ai.usage.input_tokens")}),
+            json!({"parent":root["spanId"],"name":"invoke_agent researcher","agent":sub_id,"input":20}));
+        let child_work = spans.iter().filter(|span| span["parentSpanId"] == child["spanId"]).map(|span| span["name"].clone()).collect::<Vec<_>>();
+        assert_eq!(child_work, vec![json!("chat")]);
+        assert!(spans.iter().any(|span| span["parentSpanId"] == root["spanId"] && span["name"] == "execute_tool create_subagent_call"), "{spans:?}");
 
         // Subagents get no function tools, and Codex goal tools stay off.
         let captures = provider.received_requests().await.context("captures")?;

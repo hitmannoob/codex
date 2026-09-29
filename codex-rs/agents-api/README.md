@@ -251,6 +251,28 @@ secrets directory.
   Rotating or deleting a credential, or deleting its vault, changes only
   sessions created afterwards, as the guide documents.
 
+`GET /v1/agents/sessions/{id}/traces` exports each finished turn as one
+OpenTelemetry (OTLP JSON) trace, paged with `limit` (default 20, at most 100),
+`order` (default `desc`), and `after`. The pinned SDK has no method for it, so
+call it over HTTP. Each page item is
+`{id: "trace_<turn>", object: "agent.session.trace", session_id, turn_id, created_at, otlp: {resourceSpans}}`,
+so `jq '{resourceSpans: [.data[].otlp.resourceSpans[]]}'` makes one payload
+for an OTLP/HTTP collector, as the tracing guide shows.
+- **Spans:** the root agent's span holds the turn's model responses (`chat`)
+  and tool calls (`execute_tool <name>`). Each subagent that ran during the
+  turn gets its own agent span beneath the root, holding its own work.
+  Attributes use the OpenTelemetry GenAI names (`gen_ai.*`), with
+  `openai.agents.*` for the agent type, status, and tool call and result.
+  String attributes are cut at 32 KiB.
+- **Timing:** times are when the service observed each turn and item.
+  Responses are split by item order: a response starts when its input is ready
+  and ends at its last output. Usage is attached per response when every
+  response in the turn reported it. Turns recorded before this version export
+  with turn-level timing only.
+- **Not recorded:** the model (a session update can change it between turns)
+  and subagent instructions. Span IDs are derived from the records, so a
+  repeated export returns the same trace.
+
 Webhook endpoints are managed with the SDK's `client.webhooks` API
 (`/v1/webhook_endpoints`, plus `/v1/webhook_event_types`). They need the vault
 passphrase, because signing secrets are kept in the same encrypted store.

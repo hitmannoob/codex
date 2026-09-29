@@ -44,6 +44,7 @@ pub(crate) fn router() -> Router<Arc<State>> {
         )
         .route("/v1/agents/sessions/{id}/items", get(crate::records::items))
         .route("/v1/agents/sessions/{id}/turns", get(crate::records::turns))
+        .route("/v1/agents/sessions/{id}/traces", get(crate::traces::list))
         .route(
             "/v1/agents/sessions/{id}/turns/{turn_id}",
             get(crate::records::turn),

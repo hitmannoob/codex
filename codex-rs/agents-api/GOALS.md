@@ -1191,6 +1191,62 @@ Observability work:
   to diagnose startup, reconnect, provider latency, tool failures, and cleanup.
 - [ ] Expose only documented public usage/observability fields; keep operational
   worker health and restart counters distinct from SDK response schemas.
+  Session trace export is done (evidence below); operational counters remain.
+
+Evidence (2026-09-29, session trace export):
+
+Contract. The tracing guide documents `GET /v1/agents/sessions/{id}/traces`:
+- Parameters `limit`, `order`, and `after`, and a page of `data[].otlp` with
+  `has_more` and `last_id`.
+- One trace per turn, built after the turn ends.
+- Agent spans for the root and each subagent, each with its own usage.
+- Generation spans holding each response's input and output.
+- Tool spans with the call, result, status, and error; MCP calls keep their
+  response in the call.
+
+No API reference page exists, and the pinned SDK has no method, so trace
+object fields and attribute keys are local choices. Attributes use the
+OpenTelemetry GenAI conventions.
+
+Recording. Migration `0010` adds the times each turn and item was first
+observed starting and ending (`records::observed`), and a `generations` table
+holding each response's usage in report order (`usage::record`).
+
+A first design took each usage report as the end of a model response. The test
+showed Codex reports a response's usage only after that response's tool calls
+return, so windows placed that way swallowed the tool result. Responses are
+now split by item order instead. A response's outputs run until the model
+waits for an input or for a tool it called. Usage attaches by position when
+every response reported it.
+
+Export. `src/traces.rs` builds traces from records on each request, and
+`src/otlp.rs` encodes OTLP JSON.
+- **Scope:** a trace covers one finished root turn, plus the subagent turns
+  that started while it was the latest root turn.
+- **IDs:** the trace ID is the turn's UUID, and span IDs hash stable keys, so
+  exports are repeatable.
+- **Status:** completed is OK, failed is ERROR with its message, and cancelled
+  or incomplete is UNSET, with the literal status in `openai.agents.status`.
+
+Tests:
+- `finished_turns_export_as_otlp_traces` (tests/suite/traces.rs) covers:
+  - the trace object and resource;
+  - the root span, two responses, and the function tool with its submitted
+    result;
+  - the second response's input being the function result, and per-response
+    usage;
+  - unique span IDs inside the root's time range;
+  - a running turn being excluded;
+  - pagination, repeatable exports, and query validation;
+  - 404 for an unknown session, and a cancelled turn's status.
+- The subagent test checks the subagent's agent span beneath the root, with
+  its usage and its own response.
+
+Remaining:
+- The per-response model, which is not recorded.
+- Subagent instructions.
+- Environment command spans (G09).
+- Operational correlation and metrics (the first item above).
 
 Acceptance: scoped credential access, rotation/revocation, secret redaction,
 webhook signature checks, delivery retries across restart, duplicate handling,

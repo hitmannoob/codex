@@ -61,6 +61,10 @@ pub(crate) async fn record(
     }
     sqlx::query("INSERT INTO turn_usage (session_id, turn_id, input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, turn_id) DO UPDATE SET input_tokens = input_tokens + excluded.input_tokens, cached_tokens = cached_tokens + excluded.cached_tokens, output_tokens = output_tokens + excluded.output_tokens, reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens, total_tokens = total_tokens + excluded.total_tokens")
         .bind(id).bind(turn_id).bind(increase[0]).bind(increase[1]).bind(increase[2]).bind(increase[3]).bind(increase[4]).execute(&mut **tx).await?;
+    // Codex reports usage once per model response, in order, which gives each
+    // response in the turn's trace its usage.
+    sqlx::query("INSERT INTO generations (session_id, turn_id, input_tokens, output_tokens, total_tokens) VALUES (?, ?, ?, ?, ?)")
+        .bind(id).bind(turn_id).bind(increase[0]).bind(increase[2]).bind(increase[4]).execute(&mut **tx).await?;
     let turn_usage = usage(tx, id, Some(turn_id)).await?;
     sqlx::query("UPDATE public_records SET data = json_set(data, '$.usage', json(?)) WHERE session_id = ? AND kind = 'turn' AND id = ?")
         .bind(turn_usage.to_string()).bind(id).bind(turn_id).execute(&mut **tx).await?;

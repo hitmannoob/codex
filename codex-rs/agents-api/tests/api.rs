@@ -422,3 +422,6 @@ mod vaults;
 
 #[path = "suite/webhooks.rs"]
 mod webhooks;
+
+#[path = "suite/traces.rs"]
+mod traces;

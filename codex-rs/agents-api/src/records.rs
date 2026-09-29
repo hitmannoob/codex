@@ -92,6 +92,26 @@ pub(crate) async fn session(state: &State, id: &str) -> Result<Value, ApiError> 
     Ok(decorate(&state.store.0, id, data).await?)
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// Note when the service saw a turn or item start and, once `finished`, end,
+/// keeping the first observation of each for trace export.
+async fn observed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    kind: &str,
+    record_id: &str,
+    finished: bool,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE public_records SET started_ms = coalesce(started_ms, ?1), completed_ms = CASE WHEN ?2 THEN coalesce(completed_ms, ?1) ELSE completed_ms END WHERE session_id = ?3 AND kind = ?4 AND id = ?5")
+        .bind(now_ms()).bind(finished).bind(id).bind(kind).bind(record_id).execute(&mut **tx).await?;
+    Ok(())
+}
+
 pub(crate) fn emit(state: &State, mut event: Value) {
     // Lifecycle events follow a commit that may have queued webhooks.
     if matches!(
@@ -209,6 +229,7 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 state.streams.end_turn(&id, turn_id);
             }
             save(&mut *tx, &id, "turn", &turn, turn_id, subagent).await?;
+            observed(&mut tx, &id, "turn", turn_id, status != "in_progress").await?;
             // Only the session's own turns change its status; subagent turns
             // appear on its stream tagged with their `subagent_id`.
             let root = subagent.is_none();
@@ -391,6 +412,7 @@ async fn publish_item(
     .fetch_optional(&mut **tx)
     .await?;
     save(&mut **tx, id, "item", item, turn_id, subagent).await?;
+    observed(tx, id, "item", item_id, done).await?;
     let input = item["role"] == "user" || item["type"] == "function_call_output";
     let output_index = if input {
         None
