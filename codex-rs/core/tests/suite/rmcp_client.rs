@@ -609,6 +609,91 @@ async fn mcp_namespace_instructions_are_preserved_without_hiding_tools() -> anyh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_resource_tools_follow_the_mcp_resources_feature() -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    // Resource tools let the model list and read any resource of any server,
+    // so hosts that expose only chosen tools can turn them off.
+    for resources in [true, false] {
+        let server = responses::start_mock_server().await;
+        let response = mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "done"),
+                responses::ev_completed("resp-1"),
+            ]),
+        )
+        .await;
+        let command = remote_aware_stdio_server_bin()?;
+        let fixture = test_codex()
+            .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+            .with_config(move |config| {
+                if !resources {
+                    config
+                        .features
+                        .disable(Feature::McpResources)
+                        .expect("test config should allow disabling MCP resources");
+                }
+                insert_mcp_server(
+                    config,
+                    "resourceful",
+                    stdio_transport(command, /*env*/ None, Vec::new()),
+                    TestMcpServerOptions {
+                        environment_id: remote_aware_environment_id(),
+                        ..Default::default()
+                    },
+                );
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        wait_for_mcp_server(&fixture.codex, "resourceful").await?;
+        fixture
+            .codex
+            .start_or_steer_turn(read_only_user_turn(&fixture, "use the MCP tools"))
+            .await?;
+        wait_for_event(&fixture.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        let body = response.single_request().body_json();
+        let offered: Vec<&str> = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource"
+                )
+            })
+            .collect();
+        let expected: Vec<&str> = if resources {
+            vec![
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+            ]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(offered, expected, "resources feature enabled: {resources}");
+        assert!(
+            responses::namespace_child_tool(&body, "mcp__resourceful", "echo").is_some(),
+            "the server's own tools stay available either way"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_only_mcp_content_uses_content_items() -> anyhow::Result<()> {
     skip_if_wine_exec!(
         Ok(()),

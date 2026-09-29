@@ -335,6 +335,8 @@ pub enum Feature {
     GuardianExt,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
+    /// Offer the model tools that list and read MCP server resources.
+    McpResources,
     /// Add current context-window metadata to model-visible context.
     TokenBudget,
     /// Enables experimental context management.
@@ -1665,6 +1667,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Goals,
         key: "goals",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::McpResources,
+        key: "mcp_resources",
         stage: Stage::Stable,
         default_enabled: true,
     },

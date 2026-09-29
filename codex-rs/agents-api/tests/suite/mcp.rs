@@ -117,6 +117,8 @@ async fn public_mcp_servers_are_scoped_filtered_and_egress_checked() -> anyhow::
         let with_mcp = bodies.iter().find(|body| body.to_string().contains("use-mcp")).context("scoped request")?;
         let without_mcp = bodies.iter().find(|body| body.to_string().contains("no-mcp")).context("plain request")?;
         assert!(tool_names(with_mcp).contains("lookup") && !tool_names(with_mcp).contains("secret"), "{}", tool_names(with_mcp));
+        // Resource tools would reach past `allowed_tools`, so none are offered.
+        assert!(!tool_names(with_mcp).contains("mcp_resource"), "{}", tool_names(with_mcp));
         assert!(!tool_names(without_mcp).contains("warehouse"), "{}", tool_names(without_mcp));
         assert!(bodies.iter().any(|body| body["input"].to_string().contains("mcp-result-731")));
         // A required server that cannot initialize fails the turn, not the request.

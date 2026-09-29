@@ -775,6 +775,8 @@ and the required-server failed turn. Unit test:
 `only_public_addresses_are_reachable_without_approval` (src/mcp_tests.rs).
 
 Remaining:
+- MCP resources: Codex's resource tools are off for every session (G12 fix),
+  so `allowed_tools` covers everything the model can reach on a server.
 - MCP credentials: vault credentials work (G11). Inline `authorization` and
   `Authorization` headers stay rejected, because the transport is stored and
   returned as non-secret configuration.
@@ -1361,7 +1363,7 @@ OpenRouter's Responses API, driven by the pinned SDK with strict validation.
 | Cancel a running turn | PASS |
 | Trace export: two responses with usage and the tool span | PASS |
 | Signed webhook deliveries (idle, action_required) | PASS |
-| MCP tool with a vault bearer credential | MODEL, with a policy gap (below) |
+| MCP tool with a vault bearer credential | MODEL, with a policy gap (below); PASS after the fix |
 | Subagent delegation | Structure PASS; result not delivered (below) |
 
 Findings. A logging proxy between the worker and OpenRouter recorded request
@@ -1374,8 +1376,15 @@ bodies, never headers.
   - They can list and read any resource on a public server, which bypasses
     `allowed_tools`.
   - Their calls appear publicly as `mcp_call` items with `server_label` `codex`.
-  - No configuration controls this, so closing it needs a Codex MCP or core
-    change. It is open.
+  - Fixed (2026-09-29): Codex gained a default-on `mcp_resources` feature
+    gating the three resource tools (`core/src/tools/spec_plan.rs`), covered by
+    the core test `mcp_resource_tools_follow_the_mcp_resources_feature`. The
+    Agents API turns it off for every session, so `allowed_tools` is the
+    complete list, as the MCP integration test asserts.
+  - Rerun on the real model: only `mcp__warehouse` was offered, the model
+    called `lookup` once with the vault token, and it answered with the stock.
+  - The API and worker must come from the same revision: an older worker's
+    strict config rejects the unknown feature key.
 - **Subagents:** the root spawned a subagent and called `wait_agent`, which
   returned "Wait completed." with no content, then timed out. The child's
   answer never reached the root within the turn.

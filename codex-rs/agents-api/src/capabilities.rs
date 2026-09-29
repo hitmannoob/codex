@@ -173,8 +173,11 @@ pub(crate) async fn overrides(
         "mcp_servers": servers, "features.plugins": false, "features.apps": false,
         "features.enable_mcp_apps": false, "web_search": "disabled",
         "agents.enabled": false, "features.multi_agent_v2": multi_agent,
-        // Codex's goal tools are not an advertised capability.
+        // Codex's goal tools are not an advertised capability, and its MCP
+        // resource tools would read any resource of a server, beyond the
+        // caller's allowed tools.
         "features.goals": false,
+        "features.mcp_resources": false,
         "tools.experimental_request_user_input.enabled": false,
         "model_reasoning_summary": config.reasoning.as_ref().and_then(|r| r.summary.as_deref()).unwrap_or("none"),
         "model_verbosity": config.text.as_ref().and_then(|t| t.verbosity.as_ref()).map_or(json!("medium"), |v| json!(v)),

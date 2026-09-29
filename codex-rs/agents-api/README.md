@@ -253,6 +253,11 @@ URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
   checked at admission and could still change before Codex connects.
 - **Approvals:** tool calls run without approval prompts; the caller's
   `allowed_tools` is the approval.
+- **Resources:** Codex's MCP resource tools (`list_mcp_resources`,
+  `read_mcp_resource`, `list_mcp_resource_templates`) are turned off through
+  its `mcp_resources` feature. They would let the model read any resource of
+  a server, beyond `allowed_tools`, and the public schema has no resource
+  selection.
 - **Items:** calls appear as `mcp_call` items with the server label, tool name,
   arguments, output content, and error.
 - **Required servers:** a `required` server that cannot initialize fails the
@@ -437,9 +442,10 @@ agent spawning are disabled for these threads. Omitted `tools`/`mcpServers` mean
 empty lists, including when loading older Agent records. This replaces the first
 stage's inherited MCP behavior. Addresses, credentials, and approval policy remain
 server-side; configure MCP tools for unattended use there if appropriate.
-The `allowedTools` list filters tools, not resources exposed by a selected server.
-Other Codex helper tools (for example, goals and MCP resource access) remain under
-the harness policy; `tools` is not an allowlist for all built-in Codex tools.
+The `allowedTools` list is the complete set of a server's capabilities the model
+can use: Codex's goal and MCP resource tools are turned off for every session.
+Other Codex helper tools remain under the harness policy; `tools` is not an
+allowlist for all built-in Codex tools.
 
 Application function requests are persisted before `session.requires_action` is
 emitted. Retrieve `requiredActions` if the event was missed. Each action contains

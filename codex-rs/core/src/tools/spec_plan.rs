@@ -1088,7 +1088,13 @@ fn unified_exec_should_include_shell_parameter(
 
 #[instrument(level = "trace", skip_all)]
 fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
-    if context.mcp.has_servers() {
+    if context.mcp.has_servers()
+        && context
+            .turn_context
+            .config
+            .features
+            .enabled(Feature::McpResources)
+    {
         registry.add(ListMcpResourcesHandler);
         registry.add(ListMcpResourceTemplatesHandler);
         registry.add(ReadMcpResourceHandler);
