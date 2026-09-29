@@ -3,6 +3,7 @@ mod agent_tools;
 mod capabilities;
 mod configuration;
 mod contract;
+mod credentials;
 mod gates;
 mod input;
 mod mcp;
@@ -10,12 +11,14 @@ mod reconcile;
 mod records;
 mod resources;
 mod routes;
+mod secrets;
 mod sessions;
 mod store;
 mod streaming;
 mod subagents;
 mod turns;
 mod usage;
+mod vaults;
 
 use axum::Json;
 use axum::Router;
@@ -60,6 +63,8 @@ struct State {
     streams: streaming::Streams,
     /// Lower-case MCP hosts the operator allows to be internal or plain http.
     mcp_hosts: Mutex<HashSet<String>>,
+    /// Encrypted credential values, available once the operator supplies a passphrase.
+    secrets: secrets::Secrets,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -158,6 +163,7 @@ impl ApiError {
 /// Dropping this owner requests shutdown; call `shutdown` to wait for completion.
 pub struct AgentsApi {
     state: Arc<State>,
+    directory: AbsolutePathBuf,
     router: Router,
     pump: Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
     reconnect_gate: Semaphore,
@@ -175,11 +181,12 @@ impl AgentsApi {
             "API token must contain at least 32 bytes"
         );
         let state = Arc::new(State {
-            store: store::Store::open(directory).await?,
+            store: store::Store::open(directory.clone()).await?,
             backend: Mutex::new(None),
             input_gates: gates::Gates::default(),
             streams: streaming::Streams::default(),
             mcp_hosts: Mutex::default(),
+            secrets: secrets::Secrets::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
             // behind is closed and recovers from saved records.
@@ -189,6 +196,7 @@ impl AgentsApi {
         let router = routes::router(Arc::clone(&state));
         let api = Self {
             state,
+            directory,
             router,
             pump: Mutex::new(None),
             reconnect_gate: Semaphore::new(/*permits*/ 1),
@@ -254,6 +262,20 @@ impl AgentsApi {
 
     pub fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    /// Enable vault credentials, encrypting their values in the data directory
+    /// under this passphrase. The same passphrase must be supplied on every
+    /// start to read credentials stored earlier.
+    pub async fn configure_vault(&self, passphrase: String) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            passphrase.len() >= 32,
+            "vault passphrase must contain at least 32 bytes"
+        );
+        self.state
+            .secrets
+            .configure(self.directory.to_path_buf(), passphrase);
+        Ok(())
     }
 
     /// Allow public MCP servers on these hosts even when they resolve to

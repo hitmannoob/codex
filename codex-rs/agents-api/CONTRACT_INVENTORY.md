@@ -47,7 +47,7 @@ response variants and documented errors:
 - `verified`: the complete operation passed its required behavioral contract
   tests in the recorded environment.
 
-The current count is 9 partial and 50 missing. No operation is called
+The current count is 30 partial and 29 missing. No operation is called
 implemented or verified yet because the existing tests cover only constrained
 variants. A partial operation does not count as completed parity.
 

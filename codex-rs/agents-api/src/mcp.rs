@@ -56,6 +56,26 @@ fn servers(config: &AgentConfig) -> impl Iterator<Item = Server<'_>> {
     })
 }
 
+/// Executable servers that may use a vault credential: (label, URL, explicit
+/// credential ID).
+pub(crate) fn credential_targets(
+    config: &AgentConfig,
+) -> impl Iterator<Item = (&str, &str, Option<&str>)> {
+    config.tools.iter().filter_map(|tool| match tool {
+        Tool::Capability(CapabilityTool::Mcp {
+            server_label,
+            transport: McpTransport::Http { server_url, .. },
+            credential_id,
+            ..
+        }) => Some((
+            server_label.as_str(),
+            server_url.as_str(),
+            credential_id.as_deref(),
+        )),
+        Tool::Capability(_) | Tool::Function(_) => None,
+    })
+}
+
 /// Shape checks applied whenever MCP configuration is saved.
 pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
     let mut labels = HashSet::new();
@@ -110,7 +130,7 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
             // Headers are stored and returned as non-secret configuration.
             if name == axum::http::header::AUTHORIZATION {
                 return Err(invalid(
-                    "MCP authorization requires vault credentials, which are not implemented",
+                    "MCP authorization must come from a vault credential, not a header",
                 ));
             }
         }
@@ -123,7 +143,6 @@ pub(crate) fn unsupported(tool: &CapabilityTool) -> Option<&'static str> {
     let CapabilityTool::Mcp {
         transport,
         connection_origin,
-        credential_id,
         request_metadata,
         ..
     } = tool
@@ -134,8 +153,6 @@ pub(crate) fn unsupported(tool: &CapabilityTool) -> Option<&'static str> {
         Some("stdio MCP server")
     } else if *connection_origin == ConnectionOrigin::Environment {
         Some("environment-origin MCP connection")
-    } else if credential_id.is_some() {
-        Some("MCP vault credential")
     } else if !request_metadata.is_empty() {
         Some("MCP request metadata")
     } else {
@@ -227,14 +244,23 @@ fn public(address: &IpAddr) -> bool {
 /// Session-scoped Codex server entries. Only these fields are ever set from
 /// public configuration, so no public field can reach worker-local options such
 /// as header helper commands. Public tool calls need no interactive approval:
-/// the caller's `allowed_tools` selection is the approval.
-pub(crate) fn overrides(config: &AgentConfig) -> Map<String, Value> {
+/// the caller's `allowed_tools` selection is the approval. `tokens` holds the
+/// session's credential snapshots by server label; they travel only in this
+/// in-memory thread configuration.
+pub(crate) fn overrides(
+    config: &AgentConfig,
+    tokens: &BTreeMap<String, String>,
+) -> Map<String, Value> {
     servers(config)
         .map(|server| {
             let mut entry = json!({"url": server.url, "enabled": true, "required": server.required,
                 "default_tools_approval_mode": "approve"});
-            if !server.headers.is_empty() {
-                entry["http_headers"] = json!(server.headers);
+            let mut headers = server.headers.clone();
+            if let Some(token) = tokens.get(server.label) {
+                headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
+            }
+            if !headers.is_empty() {
+                entry["http_headers"] = json!(headers);
             }
             if let Some(tools) = server.allowed_tools {
                 entry["enabled_tools"] = json!(tools);

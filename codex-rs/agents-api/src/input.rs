@@ -17,6 +17,8 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Most input events accepted in one request.
 const MAX_EVENTS: usize = 32;
@@ -24,6 +26,8 @@ const MAX_EVENTS: usize = 32;
 const MAX_TEXT_BYTES: usize = 8192;
 /// How long an `Idempotency-Key` outcome stays available for replay.
 const KEY_RETENTION_SECS: u64 = 24 * 60 * 60;
+/// Longest a cancel waits for tool results sent earlier in its batch to land.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 
 /// A call's item event can reach clients before the worker's request registers
 /// it, and the pinned SDK retries a tool result rejected with exactly this
@@ -209,6 +213,10 @@ async fn check(state: &State, id: &str, events: &[Event]) -> Result<(), ApiError
 }
 
 async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(), ApiError> {
+    // Codex applies a tool result on a task of its own but interrupts at once,
+    // so a cancel could overtake a result sent just before it. Watch for the
+    // results this batch sends until a cancel waits for them to land.
+    let mut sent = None;
     for event in events {
         match event {
             Event::Message(items) => {
@@ -217,6 +225,9 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
             // Cancelling stops all of the session's running work: its own turn
             // and any turn a subagent is running.
             Event::Cancel => {
+                if let Some((receiver, calls)) = sent.take() {
+                    settle(state, id, receiver, calls).await?;
+                }
                 for (thread_id, turn_id, subagent) in
                     crate::records::running_turns(state, id).await?
                 {
@@ -235,10 +246,46 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
                 }
             }
             Event::ToolResult { turn_id, result } => {
+                let (_, calls) = sent.get_or_insert_with(|| (state.events.subscribe(), Vec::new()));
+                calls.push((turn_id.clone(), result.call_id.clone()));
                 crate::actions::resolve_call(state, id.to_owned(), turn_id, result).await?;
             }
         }
     }
+    Ok(())
+}
+
+/// Wait until Codex has applied each sent tool result (its call completes) or
+/// the call's turn has ended, for at most [`SETTLE_TIMEOUT`].
+async fn settle(
+    state: &State,
+    id: &str,
+    mut receiver: broadcast::Receiver<Value>,
+    mut calls: Vec<(String, String)>,
+) -> Result<(), ApiError> {
+    // Subscribed before sending, so a turn still running here reports its end.
+    let running = crate::records::running_turns(state, id).await?;
+    calls.retain(|(turn, _)| running.iter().any(|(_, running, _)| running == turn));
+    let _ = tokio::time::timeout(SETTLE_TIMEOUT, async {
+        while !calls.is_empty() {
+            let event = match receiver.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
+            let params = &event["params"];
+            match event["method"].as_str() {
+                Some("item/completed") if params["item"]["type"] == "dynamicToolCall" => {
+                    calls.retain(|(_, call)| params["item"]["id"] != call.as_str());
+                }
+                Some("turn/completed") => {
+                    calls.retain(|(turn, _)| params["turn"]["id"] != turn.as_str());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
     Ok(())
 }
 

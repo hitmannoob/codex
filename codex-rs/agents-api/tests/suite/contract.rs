@@ -28,7 +28,7 @@ fn pinned_sdk_matches_operation_inventory() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires CODEX_AGENTS_API_SDK_PYTHON pointing to a Python with openai==3.17.0"]
 async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(/*secs*/ 45), async {
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 120), async {
         let python = std::env::var("CODEX_AGENTS_API_SDK_PYTHON")?;
         let script = find_resource!("tests/sdk_lifecycle.py")?;
         let home = tempfile::tempdir()?;
@@ -110,6 +110,8 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
                 TOKEN.into(),
             )
             .await?;
+            api.configure_vault("sdk-lifecycle-vault-passphrase-0123456789".into())
+                .await?;
             let (base, server) = capabilities::serve(&api).await?;
             let mut command = tokio::process::Command::new(&python);
             command.arg(&script).arg(&base);
@@ -119,8 +121,9 @@ async fn official_sdk_session_lifecycle() -> anyhow::Result<()> {
             command
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit());
+            // Vault credential writes run a deliberately slow key derivation.
             let output = tokio::time::timeout(
-                Duration::from_secs(/*secs*/ 30),
+                Duration::from_secs(/*secs*/ 90),
                 command
                     .kill_on_drop(/*kill_on_drop*/ true)
                     .spawn()?

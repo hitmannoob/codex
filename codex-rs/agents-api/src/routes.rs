@@ -51,6 +51,7 @@ pub(crate) fn router(state: Arc<State>) -> Router {
         )
         .route("/v1/sessions/{id}/events", get(events))
         .merge(crate::contract::router())
+        .merge(crate::vaults::router())
         .layer(DefaultBodyLimit::max(/*limit*/ 16 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -325,8 +326,10 @@ pub(crate) async fn start_turn(
     let _admission = state.input_gates.lock(id).await;
     let Json(session) = read_session(Extract(Arc::clone(state)), Path(id.to_owned())).await?;
     crate::configuration::validate_execution(&session.agent.config)?;
+    let tokens = crate::credentials::load(state, id).await?;
     let config =
-        crate::capabilities::overrides(state, &session.agent.config, &session.environment).await?;
+        crate::capabilities::overrides(state, &session.agent.config, &session.environment, &tokens)
+            .await?;
     let loaded = state.loaded_threads()?;
     let thread = async {
         Ok::<_, ApiError>(if let Some(thread_id) = session.thread_id {

@@ -416,3 +416,6 @@ mod mcp;
 
 #[path = "suite/subagents.rs"]
 mod subagents;
+
+#[path = "suite/vaults.rs"]
+mod vaults;

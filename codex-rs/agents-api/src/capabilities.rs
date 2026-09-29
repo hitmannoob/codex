@@ -78,6 +78,7 @@ pub(crate) async fn overrides(
     state: &State,
     config: &AgentConfig,
     environment: &Environment,
+    mcp_tokens: &std::collections::BTreeMap<String, String>,
 ) -> Result<Value, ApiError> {
     if matches!(config.service_tier.as_deref(), Some("priority" | "fast")) {
         let mut cursor = Value::Null;
@@ -159,7 +160,7 @@ pub(crate) async fn overrides(
             server["enabled_tools"] = json!(selection.allowed_tools);
         }
     }
-    servers.extend(crate::mcp::overrides(config));
+    servers.extend(crate::mcp::overrides(config, mcp_tokens));
     // Codex's V2 multi-agent runtime counts the root thread toward its cap, so
     // it gets one more thread than the public subagent limit.
     let multi_agent = match &config.multi_agent {

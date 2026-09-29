@@ -18,5 +18,6 @@ codex_rust_crate(
         "tests/sdk_lifecycle.py",
         "tests/sdk_sessions.py",
         "tests/sdk_subagents.py",
+        "tests/sdk_vaults.py",
     ],
 )

@@ -111,9 +111,6 @@ async fn create(
             "only environment none is implemented on this API path",
         ));
     }
-    if params.vault_ids.is_some_and(|ids| !ids.is_empty()) {
-        return Err(invalid("vaults are not implemented"));
-    }
     let input = crate::input::message(params.input)?;
     let metadata = crate::configuration::metadata(params.metadata)?;
     let mut saved = match params.agent_id {
@@ -141,7 +138,15 @@ async fn create(
     crate::configuration::validate_execution(&saved.config)?;
     // Resolve worker configuration now so an unreachable MCP server or an
     // unsupported tier is rejected before a session is created.
-    crate::capabilities::overrides(&state, &saved.config, &Environment::None).await?;
+    crate::capabilities::overrides(
+        &state,
+        &saved.config,
+        &Environment::None,
+        &Default::default(),
+    )
+    .await?;
+    let vault_ids = crate::credentials::vaults(&state, params.vault_ids).await?;
+    let credentials = crate::credentials::resolve(&state, &saved.config, &vault_ids).await?;
     let session = state
         .store
         .create_session(
@@ -154,8 +159,12 @@ async fn create(
         .await?;
     let public = json!({"id":session.id,"object":"agent.session","agent":agent(&session.agent),
         "created_at":now(),"last_active_at":now(),"environment":{"type":"none"},"metadata":metadata,
-        "vault_ids":[],"required_actions":[],"status":"in_progress","error":null,"usage":null});
+        "vault_ids":vault_ids,"required_actions":[],"status":"in_progress","error":null,"usage":null});
     crate::records::create_session(&state.store.0, &public).await?;
+    if let Err(error) = crate::credentials::snapshot(&state, &session.id, credentials).await {
+        crate::records::session_status(&state, &session.id, "failed", Some(&error.1)).await?;
+        return Err(error);
+    }
     let receiver = state.public_events.subscribe();
     crate::records::emit(
         &state,

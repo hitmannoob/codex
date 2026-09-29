@@ -212,6 +212,12 @@ pub(crate) async fn delete(
             return Err(running());
         }
     }
+    let credential_labels: Vec<String> =
+        sqlx::query_scalar("SELECT server_label FROM session_credentials WHERE session_id = ?")
+            .bind(&id)
+            .fetch_all(&state.store.0)
+            .await
+            .map_err(anyhow::Error::from)?;
     let mut tx = state
         .store
         .0
@@ -219,6 +225,7 @@ pub(crate) async fn delete(
         .await
         .map_err(anyhow::Error::from)?;
     for statement in [
+        "DELETE FROM session_credentials WHERE session_id = ?",
         "DELETE FROM public_records WHERE session_id = ?",
         "DELETE FROM tool_calls WHERE session_id = ?",
         "DELETE FROM input_requests WHERE session_id = ?",
@@ -244,6 +251,7 @@ pub(crate) async fn delete(
     }
     tx.commit().await.map_err(anyhow::Error::from)?;
     drop(admission);
+    crate::credentials::forget(&state, &id, credential_labels).await?;
     let _ = state
         .public_events
         .send(json!({"type": DELETED, "session_id": id}));

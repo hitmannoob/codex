@@ -508,6 +508,15 @@ Codex runs dynamic tools one at a time, so a batch resolving two pending calls
 cannot occur against this worker and is not exercised. Run on macOS with a mock
 provider.
 
+Follow-up fix (2026-09-29): under full-suite load the `[tool_result, cancel]`
+case failed 3 of 4 runs, with the call left `incomplete` and no
+`function_call_output`. The app-server forwards a tool result to Codex from a
+spawned task (`app-server/src/dynamic_tools.rs`) but handles `turn/interrupt`
+directly, so the interrupt could arrive first and discard the result. A cancel
+now first waits for each tool result sent earlier in its batch to land: until
+Codex completes the call or its turn ends, for at most five seconds. After the
+fix, four full-suite runs passed with retries disabled.
+
 Slice evidence (2026-09-28, per-session coordination): `src/gates.rs` replaces
 the global input semaphore with one async mutex per session. An entry lives only
 while a caller holds or awaits it. Turn start and session deletion take their
@@ -698,8 +707,9 @@ configuration, with verified execution behavior.
 - [x] Translate public MCP configuration into session-scoped server connections.
   Use `codex-mcp/src/mcp_connection_manager.rs` for tool mutation/call behavior
   where applicable; avoid duplicating connection management in the HTTP layer.
-- [ ] Wire scoped credentials through G11. Keep secrets out of persisted public
-  configuration, API responses, model-visible text, and routine logs.
+- [x] Wire scoped credentials through G11. Keep secrets out of persisted public
+  configuration, API responses, model-visible text, and routine logs. Vault
+  bearer credentials authenticate service-origin HTTP servers (G11 evidence).
 - [x] Enforce selection across tools and resources, including changes on cold
   resume. Define the requested behavior for approvals and interactive actions.
 - [ ] Add each built-in capability as its own implementation/test slice. Validate
@@ -765,7 +775,9 @@ and the required-server failed turn. Unit test:
 `only_public_addresses_are_reachable_without_approval` (src/mcp_tests.rs).
 
 Remaining:
-- MCP credentials: `[ ]` wire scoped credentials through G11.
+- MCP credentials: vault credentials work (G11). Inline `authorization` and
+  `Authorization` headers stay rejected, because the transport is stored and
+  returned as non-secret configuration.
 - Built-in web search (decision 2026-09-28): stays rejected, like deferred
   functions. The hosted tool is only sent when the provider reports
   web-search capability, and some models use Codex's standalone `web.run`.
@@ -963,18 +975,91 @@ Acceptance: upload/use/retrieve a file in an actual environment; verify content
 integrity, interrupted transfer recovery, limits, missing/deleted files, traversal
 attempts, scope isolation, and artifact behavior after environment termination.
 
-## G11 — Credentials, webhooks, and observability
+## G11 — Credentials, webhooks, and observability (vaults complete locally for MCP)
 
 **Outcome:** remaining service integrations follow verified public contracts and
 have durable, testable failure handling.
 
 Credential/vault work:
 
-- [ ] Finish the resource and scope inventory before selecting the storage model.
-- [ ] Implement required CRUD/binding operations with encryption and explicit
+- [x] Finish the resource and scope inventory before selecting the storage model.
+- [x] Implement required CRUD/binding operations with encryption and explicit
   access checks. Keep public metadata separate from secret material.
-- [ ] Define rotation/revocation behavior for already-running sessions, MCP
+- [x] Define rotation/revocation behavior for already-running sessions, MCP
   connections, and environments; test the actual propagation path.
+  Environments are covered when G09 lands.
+
+Evidence (2026-09-29, vaults and MCP credentials):
+
+Inventory. The pinned SDK has four vault operations (create, retrieve, list,
+delete) and five credential operations (create, retrieve, update, list,
+delete), with three `auth` types:
+- `static_bearer`: a token for one MCP server URL.
+- `mcp_oauth`: an access token, optional expiry, and optional refresh settings.
+- `environment_variable`: a secret for OpenAI-hosted environments, with a
+  networking scope.
+
+The guide says sessions attach `vault_ids` and that each MCP server uses the
+credential its `credential_id` names or the one matching its URL. It also says
+new secrets require a fresh session. The API has one tenant, holding the
+operator token, so project scoping has no counterpart here.
+
+Storage. Migration `0007` holds vault and credential metadata and each
+session's (server label, credential) choices. Secret values go to the
+repository's `codex-secrets` file store (age with scrypt) at
+`DATA_DIRECTORY/secrets`, encrypted under an operator passphrase
+(`--vault-passphrase`, at least 32 bytes) that stands in for the OS keyring.
+Without the passphrase, credential operations return 501.
+
+Every write re-encrypts the whole file with a deliberately slow scrypt, about
+one second in a release build, and each operation holds a lock. Credential
+writes and session creation with credentials therefore take about a second
+each and run one at a time. That suits the expected handful of credentials. A
+write-through cache means turn starts read snapshots without decrypting again.
+
+Modules:
+- `src/vaults.rs`: vault routes and shared paging.
+- `src/credentials.rs`: credential routes, session matching, and snapshots.
+- `src/secrets.rs`: the store, run on blocking threads behind a std mutex.
+
+Behavior:
+- **Credential types:** `static_bearer` and `mcp_oauth` become the MCP server's
+  `Authorization: Bearer` header, added to its session-scoped Codex
+  configuration at each turn start. Rotation must keep the type. Setting a new
+  `mcp_oauth` access token clears an expiry the update does not restate.
+  Refresh settings are rejected because the service does not refresh tokens.
+- **Rejected types and URLs:** `environment_variable` is rejected until G09.
+  Server URLs must be https, or http for an operator-allowed MCP host.
+- **Matching:** at session creation, each service-origin HTTP server takes the
+  credential its `credential_id` names (which must be in the session's vaults),
+  or the only credential whose URL matches. Several matches are rejected with
+  a request to set `credential_id`.
+- **Snapshots:** the session copies each chosen secret into its own entry.
+  Rotating or deleting the credential, or deleting its vault, affects only
+  later sessions, as the guide documents. Deleting the session removes its
+  copies.
+
+Test: `vault_credentials_authenticate_mcp_as_session_snapshots`
+(tests/suite/vaults.rs, about 35 seconds because of scrypt) covers:
+- 501 without a passphrase, and validation errors;
+- the bearer token reaching a mock MCP server;
+- rotation and deletion leaving older sessions on their snapshot while new
+  sessions get the new token;
+- ambiguous and explicit credential choice;
+- snapshots surviving an API restart;
+- vault deletion;
+- no secret in any API response, the data directory's database, the worker
+  home, or any model request.
+
+`tests/sdk_vaults.py` runs vault and credential CRUD, rotation, and rejected
+variants through the pinned SDK with strict validation. Run on macOS with a
+mock provider.
+
+Remaining:
+- `environment_variable` credentials and their networking scope (G09).
+- OAuth token refresh.
+- Inline MCP `authorization`.
+- External key management (KMS/HSM) in place of an operator passphrase.
 
 Webhook work:
 

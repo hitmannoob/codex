@@ -13,6 +13,8 @@ axum = { workspace = true, features = ["http1", "json", "query", "tokio"] }
 clap = { workspace = true, features = ["derive", "env"] }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
+codex-keyring-store = { workspace = true }
+codex-secrets = { workspace = true }
 codex-state = { workspace = true }
 codex-tools = { workspace = true }
 codex-uds = { workspace = true }

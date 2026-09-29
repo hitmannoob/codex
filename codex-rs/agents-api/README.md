@@ -175,8 +175,7 @@ Deferred functions, tool search, enabled web search, and enabled programmatic
 calling can be saved/retrieved but their execution is rejected. Deferred functions and web search depend on model and
 provider support the worker does not report, so enabling them could leave the
 model silently without the tool. Disabled programmatic calling/web search are
-accepted. Vaults are rejected. Prototype size limits below still apply to the
-original routes.
+accepted. Prototype size limits below still apply to the original routes.
 
 `multi_agent: {enabled: true}` turns on Codex's V2 multi-agent runtime. The
 root agent can spawn subagents, each a Codex child thread, up to
@@ -207,9 +206,10 @@ Public MCP servers run when they use HTTP with `connection_origin: service`
 URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
 `required`.
 - **Unsupported configurations:** stdio servers and environment-origin
-  connections need an execution environment. `credential_id`, an
-  `Authorization` header, and `request_metadata` are rejected, as is a label
-  that matches a server configured in the worker.
+  connections need an execution environment. An `Authorization` header, inline
+  `authorization`, and `request_metadata` are rejected, as is a label that
+  matches a server configured in the worker. Authenticate with a vault
+  credential instead (below).
 - **Egress:** the worker host makes these connections, so a server URL must use
   https and resolve only to public addresses. Loopback, private, link-local
   (including cloud metadata), and shared addresses are refused. The check runs
@@ -225,6 +225,29 @@ URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
   turn with `connection_failed`, as the guide documents. The request itself
   succeeds. The failed turn gets a service-assigned ID, because Codex never
   starts it.
+
+Vaults hold MCP credentials. They are available only when the operator
+supplies a passphrase of at least 32 bytes with `--vault-passphrase` (or
+`CODEX_AGENTS_API_VAULT_PASSPHRASE`); otherwise credential operations return
+501. Keep that passphrase: stored secrets cannot be read without it.
+- **Storage:** vault and credential metadata live in the API database. Secret
+  values are encrypted with age (scrypt) in `DATA_DIRECTORY/secrets`. They are
+  never returned by the API or stored in public records, and they never reach
+  the model. The deliberately slow key derivation makes each credential write
+  take about a second.
+- **Credential types:** `static_bearer` and `mcp_oauth` send their token as the
+  MCP server's `Authorization: Bearer` header. `mcp_server_url` must use https
+  (plain http only for an operator-allowed MCP host). `mcp_oauth` refresh
+  settings are rejected, since the service does not refresh tokens.
+  `environment_variable` credentials need an OpenAI-hosted environment and are
+  rejected.
+- **Matching:** a session lists up to 32 `vault_ids`. Each HTTP MCP server
+  takes the credential its `credential_id` names, which must be in those
+  vaults, or else the only credential whose `mcp_server_url` equals its URL.
+  Several matches are rejected; set `credential_id` to choose.
+- **Rotation and deletion:** a session copies its secrets when it is created.
+  Rotating or deleting a credential, or deleting its vault, changes only
+  sessions created afterwards, as the guide documents.
 
 A successful function result carries `output`: a string, or an array of
 `input_text` and `input_image` parts. Images must be `data:image/` URLs, and
@@ -258,8 +281,8 @@ CODEX_AGENTS_API_SDK_PYTHON=/tmp/codex-agents-api-sdk/bin/python just test -p co
 The inventory test detects drift in the pinned SDK resource surface. The
 lifecycle test uses strict SDK response validation against real in-process Codex
 with a mock model, and covers reconnect, function success/error, pagination,
-cancellation, snapshot overrides, and completed-session resume after service
-restart.
+cancellation, snapshot overrides, vaults and credentials, and completed-session
+resume after service restart.
 
 ## Original prototype routes
 
