@@ -1364,7 +1364,7 @@ OpenRouter's Responses API, driven by the pinned SDK with strict validation.
 | Trace export: two responses with usage and the tool span | PASS |
 | Signed webhook deliveries (idle, action_required) | PASS |
 | MCP tool with a vault bearer credential | MODEL, with a policy gap (below); PASS after the fix |
-| Subagent delegation | Structure PASS; result not delivered (below) |
+| Subagent delegation | Structure PASS; child ignores its task on non-V2 models (below) |
 
 Findings. A logging proxy between the worker and OpenRouter recorded request
 bodies, never headers.
@@ -1388,10 +1388,25 @@ bodies, never headers.
 - **Subagents:** the root spawned a subagent and called `wait_agent`, which
   returned "Wait completed." with no content, then timed out. The child's
   answer never reached the root within the turn.
-  - The model also passed an opaque `gAAAAAB…` string as the spawn message.
-    That is model or provider behavior.
-  - How V2 hands a finished child's answer to its parent needs verification
-    against Codex's mailbox delivery. It is open.
+  - Investigated (2026-09-29) with request captures. The service and Codex
+    deliver correctly:
+    - The task reaches the child as an `agent_message` whose payload is
+      provider-encrypted (`gAAAAAB…`). Replayed through OpenRouter, it decrypts
+      to "Compute 6 * 7".
+    - The child's final answer returns to the parent as an `agent_message`
+      (`FINAL_ANSWER`) right after `wait_agent`.
+  - The failure is the child's behavior:
+    - Codex gives a V2 child collaboration tools only when the model's catalog
+      entry declares V2 support (`collab_tools_enabled`,
+      `core/src/tools/spec_plan.rs`). OpenRouter model IDs do not, so the child
+      gets no tools at all.
+    - The child still gets the V2 team prompt ("you can spawn sub-agents") and
+      the parent's forked conversation, including "use a subagent".
+    - gpt-5-nano and gpt-5-mini children both announced a spawn instead of
+      doing the task. With gpt-5-mini the root answered on its own.
+  - Not an Agents API defect. Codex should align a child's prompt with the
+    tools it actually has; that is open as a Codex change. With catalog models
+    that declare V2, children get the tools.
 - **Worker environment:** the worker inherited the environment, so the vault
   passphrase reached model-driven work. The worker now drops
   `CODEX_AGENTS_API_VAULT_PASSPHRASE` as well as the API token.
