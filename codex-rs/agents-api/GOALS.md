@@ -1404,9 +1404,29 @@ bodies, never headers.
       the parent's forked conversation, including "use a subagent".
     - gpt-5-nano and gpt-5-mini children both announced a spawn instead of
       doing the task. With gpt-5-mini the root answered on its own.
-  - Not an Agents API defect. Codex should align a child's prompt with the
-    tools it actually has; that is open as a Codex change. With catalog models
-    that declare V2, children get the tools.
+  - Upstream check (2026-09-29, 392 commits past our base): collaboration-tool
+    gating, subagent prompt selection, and the default subagent text are
+    unchanged in `openai/codex`, so there is no fix to adopt.
+  - Catalog test (2026-09-29): a model catalog entry mirroring Codex's fallback
+    metadata, with only `multi_agent_version: "v2"` added, gave gpt-5-mini
+    children the collaboration tools.
+    - The children then delegated recursively: 25 `spawn_agent` calls across
+      the run. A child answered "42", but the root was still running after
+      five minutes and 29 model requests.
+    - Cause: `spawn_agent`'s `fork_turns` defaults to `all`, and the model never
+      set it. Every child inherits the parent's conversation and reads the
+      user's "use a subagent" as addressed to itself.
+    - Without tools a child only narrates a spawn; with tools it actually
+      recurses.
+  - Decision (2026-09-29): leave it documented, with no code change and no
+    catalog workaround. The Agents API delivers tasks and results correctly.
+    Delegation quality depends on the model:
+    - With models Codex does not treat as V2, children cannot delegate.
+    - Declaring V2 in a catalog enables delegation but can recurse, because
+      children inherit the parent's conversation by default.
+    - A config override of `features.multi_agent_v2.subagent_usage_hint_text`
+      could steer children, but that is per-model prompt tuning and is not
+      adopted.
 - **Worker environment:** the worker inherited the environment, so the vault
   passphrase reached model-driven work. The worker now drops
   `CODEX_AGENTS_API_VAULT_PASSPHRASE` as well as the API token.
