@@ -115,7 +115,7 @@ remain available without that header. New session routes are:
 | --- | --- | --- |
 | POST / GET | `/v1/agents` | Create saved agents / list in creation order |
 | GET / POST / DELETE | `/v1/agents/{id}` | Retrieve, update, or delete a saved agent |
-| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, required initial input (the pinned SDK requires it for environment `none`), optional SSE |
+| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, environment `none` (`openai_hosted` and `self_hosted` return 400 as not implemented), required initial input (the pinned SDK requires it for environment `none`), optional SSE |
 | GET | `/v1/agents/sessions` | List in creation order, optionally filtered by `agent_id` |
 | GET | `/v1/agents/sessions/{id}` | Configuration snapshot, status, metadata and current `required_actions` |
 | POST | `/v1/agents/sessions/{id}` | Replace metadata; change model, reasoning effort, or service tier for later turns |
@@ -223,7 +223,13 @@ root agent can spawn subagents, each a Codex child thread, up to
 - **Call items:** root history records `create_subagent_call`,
   `send_subagent_input_call`, and `interrupt_subagent_call`. Codex does not
   report the task text, model, or effort for these, so `content` is empty and
-  the settings are null.
+  the settings are null. A `create_subagent_call`'s `agent_id` is the agent
+  that requested it, as the SDK documents. The new subagent's ID arrives in
+  `agent.session.subagent.created`, and its `parent_agent_id` names the
+  requester.
+- **Delegation quality depends on the model:** see G12 in GOALS.md. With models
+  Codex does not treat as V2, subagents cannot delegate and may announce a
+  spawn instead of doing their task.
 - **Tools and usage:** subagents have no function tools, and their usage counts
   toward the session.
 - **Deletion:** a session whose subagent is still working cannot be deleted.
@@ -261,7 +267,11 @@ URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
 - **Items:** calls appear as `mcp_call` items with the server label, tool name,
   arguments, output content, and error.
 - **Required servers:** a `required` server that cannot initialize fails the
-  turn with `connection_failed`, as the guide documents. The request itself
+  turn with `connection_failed`, as the guide documents. Other provider
+  rejections keep only the provider's error message, never its raw body (which
+  can name the provider account). They are classified by HTTP status: 4xx is
+  `invalid_request` (401/403 `authentication_error`, 429
+  `rate_limit_exceeded`), and 5xx is `server_error`. The request itself
   succeeds. The failed turn gets a service-assigned ID, because Codex never
   starts it.
 

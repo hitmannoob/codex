@@ -267,35 +267,77 @@ pub(crate) async fn delete(
     ))
 }
 
-/// Delete the worker threads of deleted sessions. A queue entry is removed only
-/// after the worker confirms deletion, so an API crash or backend loss retries
-/// on the next connection; a thread that is already gone counts as removed.
+/// Worker answers after which a thread deletion is given up.
+const CLEANUP_ATTEMPTS: i64 = 6;
+/// Delay after the first failed deletion; each later one doubles it.
+const CLEANUP_FIRST_BACKOFF_SECS: i64 = 30;
+
+/// Delete the worker threads of deleted sessions. A queue entry is removed
+/// once the worker confirms deletion or reports the thread already gone, so an
+/// API crash or backend loss retries on the next connection. Other failures
+/// back off and are given up after [`CLEANUP_ATTEMPTS`], each logged once, so
+/// no failure can retry and log on every later deletion.
 pub(crate) async fn cleanup(state: &State) -> anyhow::Result<()> {
-    let pending: Vec<(String, String)> =
-        sqlx::query_as("SELECT session_id, thread_id FROM session_cleanup")
-            .fetch_all(&state.store.0)
-            .await?;
-    for (session_id, thread_id) in pending {
+    let now = crate::contract::now() as i64;
+    let pending: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT session_id, thread_id, attempts FROM session_cleanup WHERE next_attempt_at <= ?",
+    )
+    .bind(now)
+    .fetch_all(&state.store.0)
+    .await?;
+    for (session_id, thread_id, attempts) in pending {
         match state
             .rpc("thread/delete", json!({"threadId": thread_id}))
             .await
         {
             Ok(_) => {}
-            // An earlier attempt deleted it but did not record completion.
+            // Already gone: an earlier attempt deleted it without recording
+            // completion, or its first turn never saved any history.
             Err(error)
                 if error.0 == StatusCode::BAD_GATEWAY
-                    && error.1.starts_with("thread not found") => {}
+                    && (error.1.starts_with("thread not found")
+                        || error.1.starts_with("no rollout found for thread id")) => {}
+            // The worker did not answer; the next connection retries without
+            // counting this.
+            Err(error) if error.0 != StatusCode::BAD_GATEWAY => return Ok(()),
             Err(error) => {
-                tracing::warn!(
-                    session_id,
-                    thread_id,
-                    error = error.1,
-                    "deleting session thread failed"
-                );
+                let attempts = attempts + 1;
+                if attempts >= CLEANUP_ATTEMPTS {
+                    tracing::error!(
+                        session_id,
+                        thread_id,
+                        attempts,
+                        error = error.1,
+                        "gave up deleting a deleted session's worker thread"
+                    );
+                    crate::telemetry::count(
+                        crate::telemetry::SESSION_CLEANUP,
+                        &[("outcome", "abandoned")],
+                    );
+                    sqlx::query("DELETE FROM session_cleanup WHERE session_id = ?")
+                        .bind(&session_id)
+                        .execute(&state.store.0)
+                        .await?;
+                    continue;
+                }
+                if attempts == 1 {
+                    tracing::warn!(
+                        session_id,
+                        thread_id,
+                        error = error.1,
+                        "deleting session thread failed; retrying with backoff"
+                    );
+                }
                 crate::telemetry::count(
                     crate::telemetry::SESSION_CLEANUP,
                     &[("outcome", "failed")],
                 );
+                sqlx::query("UPDATE session_cleanup SET attempts = ?, next_attempt_at = ? WHERE session_id = ?")
+                    .bind(attempts)
+                    .bind(now + CLEANUP_FIRST_BACKOFF_SECS * (1 << (attempts - 1)))
+                    .bind(&session_id)
+                    .execute(&state.store.0)
+                    .await?;
                 continue;
             }
         }

@@ -53,5 +53,6 @@ def check_subagents(client):
 
     root = list(sessions.items.list(session_id))
     spawns = [item for item in root if item.type == "create_subagent_call"]
-    assert [item.agent_id for item in spawns] == [subagent.id]
+    # A creation names the agent that requested it; the subagent records it too.
+    assert [item.agent_id for item in spawns] == [subagent.parent_agent_id]
     assert [turn.subagent_id for turn in sessions.turns.list(session_id)] == [None]

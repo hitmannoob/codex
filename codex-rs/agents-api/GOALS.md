@@ -1434,6 +1434,63 @@ bodies, never headers.
 This is real-provider evidence for OpenRouter, not for OpenAI's API, so the
 real-provider item stays open.
 
+Evidence (2026-09-29, multi-model evaluation from the Agent_Testing session):
+
+A separate client ran `test_agents_api.py` (23 checks) against the local
+service on 15 models from 11 providers through OpenRouter, costing about $2.14.
+Every non-subagent check passed on every model with a working route, including:
+- steering a running turn;
+- bad, failed, and duplicate tool results (400, handled, 409);
+- several tool calls in one turn, and switching models mid-session;
+- four concurrent sessions, and Idempotency-Key deduplication;
+- delete-while-running (409, then success after cancel);
+- pagination in both orders, and saved agents;
+- upstream 429s reported as `rate_limit_exceeded`.
+
+Findings and outcomes:
+- **Unknown model leaked the provider body (fixed).** OpenRouter's raw JSON,
+  including the account `user_id`, was returned as the turn error with
+  `internal_error`. `turns::provider_error` covers each form Codex reports:
+  - the raw body of a failure inside a response stream;
+  - its status text, `unexpected status 400 Bad Request: <message>`;
+  - a provider's friendly message.
+
+  It strips Codex's appended URL, cf-ray, request-ID, and auth diagnostics,
+  keeps only a body's error message, and replaces HTML or empty bodies with a
+  generic message. Messages are capped at 500 characters. Unmapped kinds are
+  classified by the HTTP status. The full text goes to the operator log.
+  `src/turns_tests.rs` covers each real format.
+- **Unsupported environments returned deserializer text (fixed).** The text
+  also revealed the prototype's `local` type. Creation now validates the type
+  itself: `openai_hosted` and `self_hosted` return "not implemented; use none",
+  and unknown types list the public ones. Covered in the contract test.
+- **Delete log spam (fixed).** The app-server reports a thread without history
+  as "no rollout found for thread id …", which cleanup did not treat as
+  already deleted. The entry was retried and logged on every later delete
+  until a worker restart: 392 threads, up to 29 times each.
+  - That message now counts as already deleted.
+  - Generally, migration `0011` bounds retries for any failure the worker
+    answers: back off from 30 seconds, doubling; log once; give up after six
+    answers with a single error.
+  - A disconnected worker does not use up attempts.
+  - The sessions test covers backoff and giving up.
+- **`create_subagent_call.agent_id` (fixed).** It held the subagent's ID; the
+  SDK defines it as the requesting agent's.
+- **Not changed, working as documented:**
+  - Subagent `status` stays `active` between turns, which the SDK defines as
+    "remains available, including while idle between turns".
+  - Empty `content` on subagent calls (Codex does not report the task, which
+    V2 encrypts).
+  - No `wait_for_subagents_call` under V2.
+- **Subagent handoffs: 0 of 28 across 14 models.** This matches the catalog
+  test above; it is model-dependent delegation, not a service defect.
+- **Codex issue, not changed here:** `wait_agent` declares `timeout_ms` as an
+  integer, so whole-number floats (`120000.0`, sent by Grok and DeepSeek) fail
+  to parse. Upstream is unchanged.
+- **Not reproduced:** a deepseek-v4.1-flash turn stuck `in_progress` past
+  240s (every rerun passed), and Qwen sometimes ignoring the user message.
+  Both likely upstream.
+
 Completion gate: all inventoried target behaviors have passed their required
 acceptance tests, remaining unsupported capabilities are zero within the declared
 parity target, and real-provider/platform gaps are closed. Mock-only or partial

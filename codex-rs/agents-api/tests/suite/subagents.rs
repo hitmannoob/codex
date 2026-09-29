@@ -99,7 +99,7 @@ async fn subagents_are_registered_attributed_and_kept_apart() -> anyhow::Result<
         let root_items = root_items["data"].as_array().context("items")?;
         let spawn = root_items.iter().find(|item| item["type"] == "create_subagent_call").context("spawn item")?;
         assert_eq!(json!({"agent_id":spawn["agent_id"],"content":spawn["content"],"model":spawn["model"],"reasoning_effort":spawn["reasoning_effort"],"status":spawn["status"]}),
-            json!({"agent_id":sub_id,"content":[],"model":null,"reasoning_effort":null,"status":"completed"}));
+            json!({"agent_id":session["agent"]["id"],"content":[],"model":null,"reasoning_effort":null,"status":"completed"}));
         assert!(!root_items.iter().any(|item| item.to_string().contains("child-report")), "{root_items:?}");
         let root_turns = request(&client, reqwest::Method::GET, &format!("{url}/turns"), Value::Null).await?;
         assert_eq!(root_turns["data"].as_array().map(Vec::len), Some(1));

@@ -97,11 +97,13 @@ pub(crate) async fn register(
 /// The public call item for a subagent activity in a parent turn. Codex does
 /// not report the task text, model, or effort with these activities, so the
 /// content is empty and the settings are null. A subagent's completion has no
-/// item of its own: its turn events report it.
+/// item of its own: its turn events report it. A creation names the agent that
+/// requested it, as the SDK documents; the new subagent's ID is on its
+/// `subagent.created` event.
 pub(crate) fn activity_item(owner: &Owner, subagent_id: &str, activity: &Value) -> Option<Value> {
     match activity["kind"].as_str()? {
         "started" => Some(
-            json!({"type":"create_subagent_call","agent_id":subagent_id,"content":[],
+            json!({"type":"create_subagent_call","agent_id":owner.agent_id,"content":[],
             "model":null,"reasoning_effort":null}),
         ),
         "interacted" => Some(

@@ -92,7 +92,7 @@ pub(crate) use crate::configuration::configure;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Create {
-    environment: Environment,
+    environment: Value,
     agent_id: Option<String>,
     agent: Option<Value>,
     input: Option<Value>,
@@ -107,10 +107,25 @@ async fn create(
     Extract(state): Extract<Arc<State>>,
     Json(params): Json<Create>,
 ) -> Result<Response, ApiError> {
-    if !matches!(params.environment, Environment::None) {
-        return Err(invalid(
-            "only environment none is implemented on this API path",
-        ));
+    // Checked here rather than by deserialization, so errors name the public
+    // environment types instead of the prototype's.
+    match params.environment["type"].as_str() {
+        Some("none")
+            if params
+                .environment
+                .as_object()
+                .is_some_and(|fields| fields.len() == 1) => {}
+        Some("none") => return Err(invalid("environment none takes no other fields")),
+        Some(kind @ ("openai_hosted" | "self_hosted")) => {
+            return Err(invalid(format!(
+                "environment type {kind} is not implemented; use none"
+            )));
+        }
+        _ => {
+            return Err(invalid(
+                "environment.type must be none, openai_hosted, or self_hosted",
+            ));
+        }
     }
     // The pinned SDK requires initial input for environment `none`.
     let input = match params.input {

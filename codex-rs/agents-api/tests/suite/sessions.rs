@@ -157,10 +157,21 @@ async fn session_updates_apply_next_turn_and_deletion_waits_then_cleans_up() -> 
             sqlx::query(statement).bind(kept_id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        // Deletions the worker keeps refusing back off and are given up after
+        // a limit, instead of retrying and logging on every later deletion.
+        sqlx::query("INSERT INTO session_cleanup (session_id, thread_id, attempts) VALUES ('refused-once', 'not-a-thread-id', 0), ('refused-last', 'also-not-a-thread-id', 5)")
+            .execute(&pool).await?;
         pool.close().await;
         let restarted = AgentsApi::new(backend(home.path()).await?, AbsolutePathBuf::from_absolute_path(data.path())?, TOKEN.into()).await?;
         assert_eq!(rollouts(&session_dir)?, 0);
         restarted.shutdown().await?;
+        let pool = codex_state::SqliteConfig::from_sqlite_home(AbsolutePathBuf::from_absolute_path(data.path())?)
+            .open_read_write_pool(data.path().join("agents-api.sqlite").as_path()).await?;
+        let now = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+        let queued: Vec<(String, i64, bool)> = sqlx::query_as("SELECT session_id, attempts, next_attempt_at > ? FROM session_cleanup ORDER BY session_id")
+            .bind(now).fetch_all(&pool).await?;
+        assert_eq!(queued, vec![("refused-once".to_string(), 1, true)]);
+        pool.close().await;
         Ok::<_, anyhow::Error>(())
     }).await?
 }
