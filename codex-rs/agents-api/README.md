@@ -284,6 +284,11 @@ secrets directory.
 - **Rotation and deletion:** a session copies its secrets when it is created.
   Rotating or deleting a credential, or deleting its vault, changes only
   sessions created afterwards, as the guide documents.
+- **Removal:** deleting a credential, vault, session, or webhook endpoint
+  commits first, then removes its secrets. Anything a crash or a missing
+  passphrase leaves behind is removed the next time the passphrase is
+  configured. Startup already reads the store once to check the passphrase, so
+  this costs one extra write only when orphans exist.
 
 `GET /v1/agents/sessions/{id}/traces` exports each finished turn as one
 OpenTelemetry (OTLP JSON) trace, paged with `limit` (default 20, at most 100),

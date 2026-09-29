@@ -1305,12 +1305,40 @@ and traceable failures across API, worker, provider, and environment boundaries.
   shutdown and cross-OS execution. Do not count a macOS pass as Windows evidence.
 - [ ] Exercise concurrent sessions, slow subscribers, process crashes, network
   interruptions, expired credentials, partial persistence, and resource cleanup.
-- [ ] Verify upgrade compatibility for saved configuration/history and any retained
+- [x] Verify upgrade compatibility for saved configuration/history and any retained
   prototype routes; declare intentional breaking changes explicitly.
 - [ ] Define operational deployment requirements separately: authentication scope,
   network exposure, secret storage, backup/restore, admission limits, resource
   quotas, health checks, and graceful deployment. Add distributed worker routing
   only if deployment requirements call for it; it is not proof of public parity.
+
+Evidence (2026-09-29, inventory audit, cleanup, and upgrade baseline):
+
+- **Inventory audit:** every partial operation names tests that exist in the
+  suite. Every missing operation (artifacts, environments, templates, Files,
+  Skills) and missing behavior depends on environments (G09) or their inputs
+  (G10).
+- **Upgrade baseline:** `main` has no Agents API, so nothing has been released
+  to stay compatible with. The prototype's pre-migration database is adopted in
+  place, as `migrations_record_a_ledger_and_adopt_a_legacy_database` tests. The
+  prototype routes remain and keep their tests. Later schema changes go through
+  the ordered migration ledger, and no breaking change has been declared.
+- **Resource cleanup:** `leftover_rows` (tests/api.rs) lists every table with a
+  `session_id` column and fails if any row outlives its session's deletion, so
+  tables added later are covered automatically. The trace test runs it after
+  deletion. It found a real leak: the `generations` table from the trace
+  export change was not cleared on session deletion. It reported three rows
+  until the deletion was fixed.
+- **Partial persistence:** a crash between committing a deletion and removing
+  its secret used to leave encrypted secrets of deleted credentials, sessions,
+  or webhook endpoints on disk. The first configured start now removes every
+  stored secret that no record names (`credentials::sweep`). It reuses the
+  passphrase check's read, so it costs one write only when orphans exist.
+  Deletions commit first and then discard secrets, logging instead of failing
+  if the store is unavailable. Webhook endpoint deletion used to remove the
+  secret first, which a crash could turn into an endpoint that cannot sign; it
+  now follows the same order. The vault test simulates the crash window and
+  checks that the orphan is removed while referenced secrets remain.
 
 Completion gate: all inventoried target behaviors have passed their required
 acceptance tests, remaining unsupported capabilities are zero within the declared

@@ -57,15 +57,22 @@ impl Secrets {
     /// Enable the store once the passphrase is shown to read any secrets
     /// already stored, so a wrong passphrase stops startup instead of failing
     /// every later request. Only the first accepted passphrase takes effect.
+    /// Returns the names already stored, or none when already configured.
     pub(crate) async fn configure(
         &self,
         directory: std::path::PathBuf,
         passphrase: String,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         let secrets = directory.join("secrets");
         let backend = LocalSecretsBackend::new(directory, Arc::new(OperatorPassphrase(passphrase)));
-        let backend = tokio::task::spawn_blocking(move || {
-            backend.list(/*scope_filter*/ None).map(|_| backend)
+        let (backend, stored) = tokio::task::spawn_blocking(move || {
+            backend.list(/*scope_filter*/ None).map(|entries| {
+                let stored: Vec<String> = entries
+                    .into_iter()
+                    .map(|entry| entry.name.as_str().to_owned())
+                    .collect();
+                (backend, stored)
+            })
         })
         .await?
         .map_err(|error| {
@@ -74,11 +81,28 @@ impl Secrets {
                 secrets.display()
             ))
         })?;
-        let _ = self.0.set(Arc::new(Mutex::new(Store {
-            backend,
-            cache: HashMap::new(),
-        })));
-        Ok(())
+        let configured = self
+            .0
+            .set(Arc::new(Mutex::new(Store {
+                backend,
+                cache: HashMap::new(),
+            })))
+            .is_ok();
+        Ok(if configured { stored } else { Vec::new() })
+    }
+
+    /// Remove the secrets of records already deleted. If that fails, for
+    /// example without a passphrase, the startup sweep removes them later.
+    pub(crate) async fn discard(&self, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        if let Err(error) = self.delete(names).await {
+            tracing::warn!(
+                error = error.1,
+                "secrets of deleted records left for the startup sweep"
+            );
+        }
     }
 
     async fn with<T: Send + 'static>(

@@ -293,10 +293,16 @@ impl AgentsApi {
             passphrase.len() >= 32,
             "vault passphrase must contain at least 32 bytes"
         );
-        self.state
+        let stored = self
+            .state
             .secrets
             .configure(self.directory.to_path_buf(), passphrase)
-            .await
+            .await?;
+        let removed = credentials::sweep(&self.state, stored).await?;
+        if removed > 0 {
+            tracing::info!(removed, "removed secrets left by interrupted deletions");
+        }
+        Ok(())
     }
 
     /// Allow public MCP servers on these hosts even when they resolve to

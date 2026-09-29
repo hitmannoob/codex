@@ -242,8 +242,6 @@ async fn delete(
     if endpoint(&state, &id).await?.is_none() {
         return Err(not_found());
     }
-    // Remove the secret first, so a failure leaves the endpoint intact.
-    state.secrets.delete(vec![secret_name(&id)]).await?;
     let mut tx = state.store.0.begin().await.map_err(anyhow::Error::from)?;
     for statement in [
         "DELETE FROM webhook_deliveries WHERE endpoint_id = ? AND status = 'pending'",
@@ -256,6 +254,7 @@ async fn delete(
             .map_err(anyhow::Error::from)?;
     }
     tx.commit().await.map_err(anyhow::Error::from)?;
+    state.secrets.discard(vec![secret_name(&id)]).await;
     Ok(Json(
         json!({"id":id,"object":"webhook_endpoint.deleted","deleted":true}),
     ))

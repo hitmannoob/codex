@@ -230,6 +230,7 @@ pub(crate) async fn delete(
         "DELETE FROM tool_calls WHERE session_id = ?",
         "DELETE FROM input_requests WHERE session_id = ?",
         "DELETE FROM turn_usage WHERE session_id = ?",
+        "DELETE FROM generations WHERE session_id = ?",
         "DELETE FROM thread_usage_totals WHERE thread_id IN (SELECT thread_id FROM sessions WHERE id = ?1 UNION SELECT thread_id FROM subagents WHERE session_id = ?1)",
         "DELETE FROM subagents WHERE session_id = ?",
         "DELETE FROM public_sessions WHERE id = ?",
@@ -251,7 +252,7 @@ pub(crate) async fn delete(
     }
     tx.commit().await.map_err(anyhow::Error::from)?;
     drop(admission);
-    crate::credentials::forget(&state, &id, credential_labels).await?;
+    crate::credentials::forget(&state, &id, credential_labels).await;
     let _ = state
         .public_events
         .send(json!({"type": DELETED, "session_id": id}));

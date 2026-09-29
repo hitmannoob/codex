@@ -41,6 +41,49 @@ async fn mcp_server() -> anyhow::Result<(
     ))
 }
 
+/// Reads the secrets store the way the service does, with its passphrase.
+#[derive(Debug)]
+struct StorePassphrase;
+
+impl codex_keyring_store::KeyringStore for StorePassphrase {
+    fn load(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<Option<String>, codex_keyring_store::CredentialStoreError> {
+        Ok(Some(PASSPHRASE.into()))
+    }
+
+    fn save(
+        &self,
+        _service: &str,
+        _account: &str,
+        _value: &str,
+    ) -> Result<(), codex_keyring_store::CredentialStoreError> {
+        Ok(())
+    }
+
+    fn delete(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<bool, codex_keyring_store::CredentialStoreError> {
+        Ok(false)
+    }
+}
+
+/// The names in the encrypted secrets store.
+async fn stored_secrets(data: &Path) -> anyhow::Result<Vec<String>> {
+    let backend =
+        codex_secrets::LocalSecretsBackend::new(data.to_path_buf(), Arc::new(StorePassphrase));
+    let entries =
+        tokio::task::spawn_blocking(move || backend.list(/*scope_filter*/ None)).await??;
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.name.as_str().to_owned())
+        .collect())
+}
+
 pub(super) fn files_containing(directory: &Path, needle: &str) -> anyhow::Result<Vec<String>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(directory)? {
@@ -164,7 +207,7 @@ async fn vault_credentials_authenticate_mcp_as_session_snapshots() -> anyhow::Re
 
         // Credential choice is validated before a session exists.
         let a = request(&client, reqwest::Method::POST, &format!("{vault_url}/credentials"), bearer("secret-token-3")).await?;
-        request(&client, reqwest::Method::POST, &format!("{vault_url}/credentials"), bearer("secret-token-4")).await?;
+        let d = request(&client, reqwest::Method::POST, &format!("{vault_url}/credentials"), bearer("secret-token-4")).await?;
         let ambiguous = client.post(&sessions).bearer_auth(TOKEN).json(&create("call-mcp ambiguous")).send().await?;
         assert_eq!(ambiguous.status(), reqwest::StatusCode::BAD_REQUEST);
         let mut foreign = create("call-mcp foreign");
@@ -183,8 +226,20 @@ async fn vault_credentials_authenticate_mcp_as_session_snapshots() -> anyhow::Re
         assert_eq!(refused.to_string(), format!("the vault passphrase cannot read the secrets stored in {}", data_path.join("secrets").display()));
         api.shutdown().await?;
 
-        // Snapshots survive a restart under the same passphrase.
+        // Leave what a crash between deleting a credential and removing its
+        // secret would: the next configured start removes the orphan and
+        // keeps every secret a record still names.
+        let pool = codex_state::SqliteConfig::from_sqlite_home(AbsolutePathBuf::from_absolute_path(&data_path)?)
+            .open_read_write_pool(data_path.join("agents-api.sqlite").as_path()).await?;
+        sqlx::query("DELETE FROM vault_credentials WHERE id = ?").bind(d["id"].as_str()).execute(&pool).await?;
+        pool.close().await;
+        let secret_name = |credential: &Value| credential["id"].as_str().map(|id| format!("VAULT_{}", id.to_ascii_uppercase()));
+        assert_eq!(stored_secrets(&data_path).await?.contains(&secret_name(&d).context("orphan")?), true);
         let api = start(true).await?;
+        let stored = stored_secrets(&data_path).await?;
+        assert_eq!((stored.contains(&secret_name(&d).context("orphan")?), stored.contains(&secret_name(&a).context("kept")?)), (false, true));
+
+        // Snapshots survive a restart under the same passphrase.
         let (base, server) = capabilities::serve(&api).await?;
         let second_url = format!("{base}/agents/sessions/{}", second["id"].as_str().context("second id")?);
         follow_up(second_url.clone(), "call-mcp after restart").await?;

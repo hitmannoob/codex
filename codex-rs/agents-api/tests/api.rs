@@ -81,6 +81,39 @@ async fn request(
     Ok(body)
 }
 
+/// Rows that still name `session_id` after its deletion, as (table, count):
+/// every table with a `session_id` column except the durable thread-cleanup
+/// queue, which empties once the worker confirms. Finds tables added later
+/// without being told about them.
+async fn leftover_rows(data: &Path, session_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
+    let pool =
+        codex_state::SqliteConfig::from_sqlite_home(AbsolutePathBuf::from_absolute_path(data)?)
+            .open_read_write_pool(data.join("agents-api.sqlite").as_path())
+            .await?;
+    let tables: Vec<String> = sqlx::query_scalar("SELECT m.name FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type = 'table' AND p.name = 'session_id' AND m.name != 'session_cleanup' ORDER BY m.name")
+        .fetch_all(&pool)
+        .await?;
+    let mut leftover = Vec::new();
+    for (table, column) in tables
+        .iter()
+        .map(|table| (table.as_str(), "session_id"))
+        .chain([("public_sessions", "id"), ("sessions", "id")])
+    {
+        // Table names come from the schema itself.
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table} WHERE {column} = ?"
+        )))
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await?;
+        if count > 0 {
+            leftover.push((table.to_owned(), count));
+        }
+    }
+    pool.close().await;
+    Ok(leftover)
+}
+
 /// Encode Responses stream events as an SSE body for the mock provider.
 fn sse(events: &[Value]) -> String {
     events

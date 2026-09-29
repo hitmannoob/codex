@@ -152,8 +152,12 @@ async fn finished_turns_export_as_otlp_traces() -> anyhow::Result<()> {
         let cancelled = spans(&latest["data"][0]);
         let root = cancelled.iter().find(|span| span["parentSpanId"] == "").context("cancelled root")?;
         assert_eq!(json!({"status":root["status"],"outcome":attribute(root, "openai.agents.status")}), json!({"status":{"code":0},"outcome":"cancelled"}));
+
+        // Deleting the session removes every record it left, traces included.
+        request(&client, reqwest::Method::DELETE, &url, Value::Null).await?;
         server.abort();
         api.shutdown().await?;
+        assert_eq!(leftover_rows(data.path(), &id).await?, Vec::<(String, i64)>::new());
         Ok::<_, anyhow::Error>(())
     }).await?
 }

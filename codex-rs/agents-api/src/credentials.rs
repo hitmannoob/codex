@@ -152,23 +152,58 @@ pub(crate) async fn load(
 }
 
 /// Remove a deleted session's snapshots.
-pub(crate) async fn forget(
-    state: &State,
-    session_id: &str,
-    labels: Vec<String>,
-) -> Result<(), ApiError> {
-    if labels.is_empty() {
-        return Ok(());
-    }
+pub(crate) async fn forget(state: &State, session_id: &str, labels: Vec<String>) {
     state
         .secrets
-        .delete(
+        .discard(
             labels
                 .iter()
                 .map(|label| snapshot_name(session_id, label))
                 .collect(),
         )
-        .await
+        .await;
+}
+
+/// Remove stored secrets that no credential, session snapshot, or webhook
+/// endpoint names: what a crash between a deletion's commit and its secret
+/// removal leaves behind. Runs once, when the passphrase is configured and
+/// before any request can store a secret. Returns how many were removed.
+pub(crate) async fn sweep(state: &State, stored: Vec<String>) -> anyhow::Result<usize> {
+    let pool = &state.store.0;
+    let mut referenced = std::collections::HashSet::new();
+    for id in sqlx::query_scalar::<_, String>("SELECT id FROM vault_credentials")
+        .fetch_all(pool)
+        .await?
+    {
+        referenced.insert(crate::secrets::credential_name(&id));
+    }
+    for (session_id, label) in sqlx::query_as::<_, (String, String)>(
+        "SELECT session_id, server_label FROM session_credentials",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        referenced.insert(snapshot_name(&session_id, &label));
+    }
+    for id in sqlx::query_scalar::<_, String>("SELECT id FROM webhook_endpoints")
+        .fetch_all(pool)
+        .await?
+    {
+        referenced.insert(crate::webhook_delivery::secret_name(&id));
+    }
+    let orphans: Vec<String> = stored
+        .into_iter()
+        .filter(|name| !referenced.contains(name))
+        .collect();
+    let removed = orphans.len();
+    if removed > 0 {
+        state
+            .secrets
+            .delete(orphans)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.1))?;
+    }
+    Ok(removed)
 }
 
 pub(crate) async fn credential(
@@ -430,8 +465,8 @@ pub(crate) async fn delete_credential(
     }
     state
         .secrets
-        .delete(vec![crate::secrets::credential_name(&credential_id)])
-        .await?;
+        .discard(vec![crate::secrets::credential_name(&credential_id)])
+        .await;
     Ok(Json(
         json!({"id":credential_id,"object":"vault.credential.deleted","deleted":true}),
     ))

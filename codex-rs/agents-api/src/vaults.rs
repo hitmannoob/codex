@@ -229,17 +229,15 @@ async fn delete_vault(
         return Err(not_found("vault"));
     }
     tx.commit().await.map_err(anyhow::Error::from)?;
-    if !credentials.is_empty() {
-        state
-            .secrets
-            .delete(
-                credentials
-                    .iter()
-                    .map(|id| crate::secrets::credential_name(id))
-                    .collect(),
-            )
-            .await?;
-    }
+    state
+        .secrets
+        .discard(
+            credentials
+                .iter()
+                .map(|id| crate::secrets::credential_name(id))
+                .collect(),
+        )
+        .await;
     Ok(Json(
         json!({"id":vault_id,"object":"vault.deleted","deleted":true}),
     ))
