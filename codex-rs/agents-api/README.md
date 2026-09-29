@@ -45,6 +45,40 @@ Throughout the gap, saved history stays readable, mutations return 503
 and stale callbacks cannot resolve the replacement's work. Interrupted work is
 not replayed. Externally managed workers are never restarted.
 
+Operational diagnostics:
+- **Logs:** go to stderr through `tracing`. `RUST_LOG` filters them (default
+  `codex_agents_api=info`), and `LOG_FORMAT=json` writes JSON lines. Events
+  carry `session_id`, `turn_id`, and similar fields. Events inside a request
+  also carry its `http.request` span: `request_id`, `method`, `route`, and
+  `status`.
+- **Handshake lines:** the `agents-api managed worker pid=` and
+  `agents-api listening on` lines stay plain, because supervisors parse them.
+- **Request IDs:** every routed response carries `x-request-id: req_…`, which
+  the OpenAI SDK exposes as `_request_id`, so a client error can be matched to
+  the log.
+- **Export:** `--otlp-endpoint <collector base URL>` (or
+  `CODEX_AGENTS_API_OTLP_ENDPOINT`) sends spans and metrics to
+  `<url>/v1/traces` and `<url>/v1/metrics` over OTLP/HTTP, through the
+  workspace's `codex-otel`. `--otlp-header NAME=VALUE` adds a header, repeated
+  as needed, and `--otel-environment` names the deployment. Nothing is
+  exported without an endpoint, and shutdown flushes pending exports.
+
+Metrics (route tags use the route template, with braces replaced):
+
+| Metric | Tags |
+| --- | --- |
+| `agents_api.http.request`, `.duration_ms` | `method`, `route`, `status` |
+| `agents_api.turn`, `.duration_ms` | `status`, `agent_type` (root or subagent) |
+| `agents_api.tool.call` | `type` (item type), `status` |
+| `agents_api.webhook.delivery` | `outcome` (delivered, retry, failed) |
+| `agents_api.backend.connection` | `event` (connected, lost) |
+| `agents_api.session.cleanup` | `outcome` (deleted, failed) |
+| `agents_api.worker.startup.duration_ms` | `reason` (start, restart) |
+| `agents_api.worker.restart` | `outcome` (restarted, failed) |
+
+Model request latency is measured inside the worker. Configure its own
+`[otel]` section in the worker home's `config.toml` to export it.
+
 An API-process crash (for example SIGKILL of the API itself) skips graceful
 shutdown, orphaning the managed worker. On Unix, the next managed start reclaims
 it before spawning: an ownership record written at spawn time

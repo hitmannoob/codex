@@ -975,7 +975,7 @@ Acceptance: upload/use/retrieve a file in an actual environment; verify content
 integrity, interrupted transfer recovery, limits, missing/deleted files, traversal
 attempts, scope isolation, and artifact behavior after environment termination.
 
-## G11 — Credentials, webhooks, and observability (vaults complete locally for MCP)
+## G11 — Credentials, webhooks, and observability (complete locally except environment-dependent parts)
 
 **Outcome:** remaining service integrations follow verified public contracts and
 have durable, testable failure handling.
@@ -1187,11 +1187,10 @@ deliveries, not only those claimed in the same round.
 
 Observability work:
 
-- [ ] Add request/session/turn/worker correlation and lifecycle metrics sufficient
+- [x] Add request/session/turn/worker correlation and lifecycle metrics sufficient
   to diagnose startup, reconnect, provider latency, tool failures, and cleanup.
-- [ ] Expose only documented public usage/observability fields; keep operational
+- [x] Expose only documented public usage/observability fields; keep operational
   worker health and restart counters distinct from SDK response schemas.
-  Session trace export is done (evidence below); operational counters remain.
 
 Evidence (2026-09-29, session trace export):
 
@@ -1246,7 +1245,47 @@ Remaining:
 - The per-response model, which is not recorded.
 - Subagent instructions.
 - Environment command spans (G09).
-- Operational correlation and metrics (the first item above).
+- Operational correlation and metrics: done (evidence below).
+
+Evidence (2026-09-29, operational diagnostics):
+
+Decision (2026-09-29): use `tracing` and the workspace's `codex-otel`, like
+app-server and exec. The API configures `codex-otel` from CLI flags, not
+Codex's `config.toml`, so it gains no `codex-core` dependency.
+
+Implementation:
+- **Library** (`src/telemetry.rs`): every former `eprintln!` is now a
+  structured event with session, turn, thread, endpoint, or delivery fields.
+- **Request middleware:** a route layer (so the matched route template labels
+  metrics) gives each request an `http.request` span, an `x-request-id`
+  response header, and request metrics.
+- **Lifecycle metrics:** turns (count and duration, by status and agent type),
+  tool calls (by item type and status), webhook deliveries, backend
+  connections and losses, and session cleanup.
+- **No-op by default:** metrics go to `codex_otel::global()`, which does nothing
+  until an exporter is installed.
+- **CLI** (`src/exporters.rs`): installs the stderr subscriber (`RUST_LOG`, and
+  `LOG_FORMAT=json`, colored only on a terminal). `--otlp-endpoint`,
+  `--otlp-header`, and `--otel-environment` configure OTLP/HTTP export of
+  spans and metrics. The CLI records worker startup duration and restart
+  outcomes, and flushes exports at exit.
+- **Unchanged:** the two plain handshake lines, which supervisors and the CLI
+  tests parse.
+
+Provider latency is measured inside the worker (`codex.turn.ttft`, and
+`codex.api_request` among its metrics). The operator exports it through the
+worker's own `[otel]` configuration; the API reports turn duration.
+
+Tests:
+- `requests_turns_and_tool_calls_are_measured_and_correlated`
+  (tests/suite/telemetry.rs) installs an in-memory metrics client. It checks
+  distinct `x-request-id` values, HTTP metrics labeled by route template and
+  status, a completed root turn's count and duration, a failed function call,
+  and the backend connection. Tests in the same process share the global
+  client, so it checks presence, not exact counts.
+- A live CLI run against a local OTLP collector received `/v1/traces` and
+  `/v1/metrics` protobuf exports with the configured header on SIGTERM. The
+  process exited 0, and the stderr lines were plain on a non-terminal.
 
 Acceptance: scoped credential access, rotation/revocation, secret redaction,
 webhook signature checks, delivery retries across restart, duplicate handling,

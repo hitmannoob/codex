@@ -38,7 +38,11 @@ pub(crate) async fn run(state: &State) -> anyhow::Result<()> {
     sessions.extend(calls);
     for session_id in sessions {
         if let Err(error) = reconcile_session(state, &session_id).await {
-            eprintln!("agents-api: reconciling session {session_id} failed: {error:#}");
+            tracing::warn!(
+                session_id,
+                error = format!("{error:#}"),
+                "reconciling session failed"
+            );
         }
     }
     Ok(())

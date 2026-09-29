@@ -1,3 +1,4 @@
+mod exporters;
 mod runtime;
 
 use anyhow::Context;
@@ -9,6 +10,7 @@ use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Parser)]
 struct Args {
@@ -45,6 +47,17 @@ struct Args {
         hide_env_values = true
     )]
     vault_passphrase: Option<String>,
+    /// OTLP/HTTP collector base URL (for example `http://localhost:4318`) that
+    /// receives the API's spans and metrics. Nothing is exported without it.
+    #[arg(long, env = "CODEX_AGENTS_API_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+    /// Header sent with each export, as NAME=VALUE, such as a collector key.
+    /// Repeat for each header.
+    #[arg(long = "otlp-header", value_parser = exporters::header)]
+    otlp_headers: Vec<(String, String)>,
+    /// `deployment.environment` reported with exported telemetry.
+    #[arg(long, default_value = "production")]
+    otel_environment: String,
 }
 
 #[tokio::main]
@@ -59,6 +72,12 @@ async fn main() -> anyhow::Result<()> {
         "API token must contain at least 32 bytes"
     );
     let directory = AbsolutePathBuf::relative_to_current_dir(args.data_directory)?;
+    let telemetry = exporters::install(exporters::Export {
+        endpoint: args.otlp_endpoint,
+        headers: args.otlp_headers,
+        environment: args.otel_environment,
+        data_directory: directory.to_path_buf(),
+    })?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let startup_timeout = Duration::from_secs(args.worker_startup_timeout_secs);
     // Register SIGTERM before starting the child, including during readiness.
@@ -68,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     // Managed executable/home are retained so a crashed worker can be respawned;
     // external-socket mode leaves this `None` and is never restarted.
     let mut managed = None;
+    let starting = Instant::now();
     let socket = match args.app_server_socket {
         Some(socket) => AbsolutePathBuf::relative_to_current_dir(socket)?,
         None => {
@@ -86,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
             // starting our own, so two app-servers never share this home.
             runtime::reclaim_orphan(&home).await?;
             let owned = runtime::Worker::spawn(executable.clone(), home.clone()).await?;
+            // This line and the listening line stay plain, outside `tracing`:
+            // supervisors read the worker PID and the address from them.
             eprintln!(
                 "agents-api managed worker pid={}",
                 owned.id().context("worker process ID")?
@@ -102,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             result = runtime::worker_exit(&mut worker) => return result,
             result = &mut stopping => return result,
         };
+        exporters::elapsed(exporters::WORKER_STARTUP_DURATION, starting.elapsed(), &[("reason", "start")]);
         let api = AgentsApi::new(AppServerClient::Remote(client), directory, args.token).await?;
         api.allow_mcp_hosts(args.allow_mcp_hosts);
         api.allow_webhook_hosts(args.allow_webhook_hosts);
@@ -128,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
                 result = &mut http => break http_result(result),
                 result = &mut stopping => break result,
                 _ = runtime::worker_exit(&mut worker) => {
-                    eprintln!("agents-api: managed worker exited; attempting restart");
+                    tracing::warn!("managed worker exited; attempting restart");
                     let restarted = tokio::select! {
                         result = restart_worker(&mut worker, &api, &managed, startup_timeout) => result,
                         result = &mut http => break http_result(result),
@@ -158,7 +181,10 @@ async fn main() -> anyhow::Result<()> {
     };
     // Run both cleanups even when serving or initialization fails.
     if let Err(error) = &cleanup {
-        eprintln!("agents-api: worker cleanup failed: {error:#}");
+        tracing::error!(error = format!("{error:#}"), "worker cleanup failed");
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
     }
     serving.and(cleanup)
 }
@@ -189,7 +215,10 @@ async fn restart_worker(
     if let Some(dead) = worker.take()
         && let Err(error) = dead.shutdown().await
     {
-        eprintln!("agents-api: reaping crashed worker failed: {error:#}");
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "reaping crashed worker failed"
+        );
     }
     let mut backoff = WORKER_RESTART_BACKOFF;
     let mut last_error = None;
@@ -200,11 +229,17 @@ async fn restart_worker(
                 let pid = replacement.id().context("worker process ID")?;
                 api.reconnect(client).await?;
                 *worker = Some(replacement);
-                eprintln!("agents-api managed worker restarted pid={pid} attempt={attempt}");
+                tracing::info!(pid, attempt, "managed worker restarted");
+                exporters::count(exporters::WORKER_RESTART, &[("outcome", "restarted")]);
                 return Ok(());
             }
             Err(error) => {
-                eprintln!("agents-api: worker restart attempt {attempt} failed: {error:#}");
+                tracing::warn!(
+                    attempt,
+                    error = format!("{error:#}"),
+                    "worker restart attempt failed"
+                );
+                exporters::count(exporters::WORKER_RESTART, &[("outcome", "failed")]);
                 last_error = Some(error);
                 backoff = (backoff * 2).min(WORKER_RESTART_BACKOFF_MAX);
             }
@@ -221,6 +256,7 @@ async fn respawn(
     home: &AbsolutePathBuf,
     startup_timeout: Duration,
 ) -> anyhow::Result<(runtime::Worker, AppServerClient)> {
+    let starting = Instant::now();
     let mut worker = Some(runtime::Worker::spawn(executable.clone(), home.clone()).await?);
     let socket = match &worker {
         Some(worker) => worker.socket().clone(),
@@ -235,6 +271,11 @@ async fn respawn(
                 .context("managed worker exited before initialization"));
         }
     };
+    exporters::elapsed(
+        exporters::WORKER_STARTUP_DURATION,
+        starting.elapsed(),
+        &[("reason", "restart")],
+    );
     match worker {
         Some(worker) => Ok((worker, AppServerClient::Remote(client))),
         None => anyhow::bail!("worker vanished during initialization"),

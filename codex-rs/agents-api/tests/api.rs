@@ -425,3 +425,6 @@ mod webhooks;
 
 #[path = "suite/traces.rs"]
 mod traces;
+
+#[path = "suite/telemetry.rs"]
+mod telemetry;

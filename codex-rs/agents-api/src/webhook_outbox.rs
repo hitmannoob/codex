@@ -91,7 +91,7 @@ pub(crate) async fn dispatch(state: Arc<State>, mut stopping: watch::Receiver<bo
         let wait = match round(&state).await {
             Ok(wait) => wait,
             Err(error) => {
-                eprintln!("agents-api: webhook dispatch failed: {error:#}");
+                tracing::error!(error = format!("{error:#}"), "webhook dispatch failed");
                 IDLE_POLL
             }
         };
@@ -193,6 +193,10 @@ async fn deliver(state: &State, deliveries: Vec<Due>) -> anyhow::Result<()> {
         let attempts = delivery.attempts + 1;
         let (status_code, error) = match outcome {
             Ok(status_code) if (200..300).contains(&status_code) => {
+                crate::telemetry::count(
+                    crate::telemetry::WEBHOOK_DELIVERY,
+                    &[("outcome", "delivered")],
+                );
                 sqlx::query("UPDATE webhook_deliveries SET status = 'delivered', attempts = ?, last_status_code = ?, last_error = NULL WHERE id = ?")
                     .bind(attempts)
                     .bind(i64::from(status_code))
@@ -206,10 +210,13 @@ async fn deliver(state: &State, deliveries: Vec<Due>) -> anyhow::Result<()> {
         };
         let now = now() as i64;
         if now - delivery.created_at >= RETRY_WINDOW_SECS {
-            eprintln!(
-                "agents-api: gave up webhook delivery {} to endpoint {} after {attempts} attempts",
-                delivery.id, delivery.endpoint_id
+            tracing::warn!(
+                delivery_id = delivery.id,
+                endpoint_id = delivery.endpoint_id,
+                attempts,
+                "gave up webhook delivery"
             );
+            crate::telemetry::count(crate::telemetry::WEBHOOK_DELIVERY, &[("outcome", "failed")]);
             sqlx::query("UPDATE webhook_deliveries SET status = 'failed', attempts = ?, last_status_code = ?, last_error = ? WHERE id = ?")
                 .bind(attempts)
                 .bind(status_code)
@@ -219,6 +226,7 @@ async fn deliver(state: &State, deliveries: Vec<Due>) -> anyhow::Result<()> {
                 .await?;
             continue;
         }
+        crate::telemetry::count(crate::telemetry::WEBHOOK_DELIVERY, &[("outcome", "retry")]);
         let backoff = FIRST_BACKOFF_SECS
             .saturating_mul(1 << (attempts - 1).clamp(0, 20))
             .min(MAX_BACKOFF_SECS);

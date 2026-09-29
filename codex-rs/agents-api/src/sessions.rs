@@ -258,7 +258,7 @@ pub(crate) async fn delete(
     let cleaner = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(error) = cleanup(&cleaner).await {
-            eprintln!("agents-api: session cleanup failed: {error:#}");
+            tracing::warn!(error = format!("{error:#}"), "session cleanup failed");
         }
     });
     Ok(Json(
@@ -285,9 +285,15 @@ pub(crate) async fn cleanup(state: &State) -> anyhow::Result<()> {
                 if error.0 == StatusCode::BAD_GATEWAY
                     && error.1.starts_with("thread not found") => {}
             Err(error) => {
-                eprintln!(
-                    "agents-api: deleting thread {thread_id} of session {session_id} failed: {}",
-                    error.1
+                tracing::warn!(
+                    session_id,
+                    thread_id,
+                    error = error.1,
+                    "deleting session thread failed"
+                );
+                crate::telemetry::count(
+                    crate::telemetry::SESSION_CLEANUP,
+                    &[("outcome", "failed")],
                 );
                 continue;
             }
@@ -296,6 +302,7 @@ pub(crate) async fn cleanup(state: &State) -> anyhow::Result<()> {
             .bind(&session_id)
             .execute(&state.store.0)
             .await?;
+        crate::telemetry::count(crate::telemetry::SESSION_CLEANUP, &[("outcome", "deleted")]);
     }
     Ok(())
 }

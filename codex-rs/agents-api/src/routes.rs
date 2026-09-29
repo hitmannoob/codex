@@ -53,6 +53,8 @@ pub(crate) fn router(state: Arc<State>) -> Router {
         .merge(crate::contract::router())
         .merge(crate::vaults::router())
         .merge(crate::webhooks::router())
+        // Route layers see the matched route template, which labels metrics.
+        .route_layer(middleware::from_fn(crate::telemetry::observe))
         .layer(DefaultBodyLimit::max(/*limit*/ 16 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),

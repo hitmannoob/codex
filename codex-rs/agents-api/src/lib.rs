@@ -17,6 +17,7 @@ mod sessions;
 mod store;
 mod streaming;
 mod subagents;
+mod telemetry;
 mod traces;
 mod turns;
 mod usage;
@@ -134,7 +135,7 @@ struct ApiError(StatusCode, String);
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        eprintln!("agents-api: {error:#}");
+        tracing::error!(error = format!("{error:#}"), "internal error");
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal API error".into(),
@@ -268,12 +269,14 @@ impl AgentsApi {
         // Correct any turns a prior disconnect failed provisionally against the
         // now-reachable rollout history. Best-effort: a failure here must not
         // fail the reconnect, since the service is otherwise ready.
+        tracing::info!("backend connected");
+        telemetry::count(telemetry::BACKEND_CONNECTION, &[("event", "connected")]);
         if let Err(error) = reconcile::run(&self.state).await {
-            eprintln!("agents-api: reconciliation failed: {error:#}");
+            tracing::warn!(error = format!("{error:#}"), "reconciliation failed");
         }
         // Retry thread deletions a previous connection or process left queued.
         if let Err(error) = sessions::cleanup(&self.state).await {
-            eprintln!("agents-api: session cleanup failed: {error:#}");
+            tracing::warn!(error = format!("{error:#}"), "session cleanup failed");
         }
         Ok(())
     }
@@ -366,7 +369,7 @@ async fn pump(
                         break;
                     }
                     if let Err(error) = streaming::notification(&state, &value).await {
-                        eprintln!("agents-api: stream event dropped: {error:#}");
+                        tracing::warn!(error = format!("{error:#}"), "stream event dropped");
                     }
                     let _ = state.events.send(value);
                 }
@@ -414,12 +417,19 @@ async fn pump(
             *slot = None;
         }
     }
+    if lost {
+        tracing::warn!("backend connection lost");
+        telemetry::count(telemetry::BACKEND_CONNECTION, &[("event", "lost")]);
+    }
     if let Err(error) = disconnect_bookkeeping(&state).await {
-        eprintln!("agents-api: disconnect bookkeeping failed: {error:#}");
+        tracing::error!(
+            error = format!("{error:#}"),
+            "disconnect bookkeeping failed"
+        );
     }
     match client.shutdown().await {
         Err(error) if lost => {
-            eprintln!("agents-api: backend cleanup after connection loss: {error}");
+            tracing::warn!(%error, "backend cleanup after connection loss failed");
             Ok(())
         }
         result => result,

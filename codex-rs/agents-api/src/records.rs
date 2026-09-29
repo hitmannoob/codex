@@ -230,6 +230,25 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             }
             save(&mut *tx, &id, "turn", &turn, turn_id, subagent).await?;
             observed(&mut tx, &id, "turn", turn_id, status != "in_progress").await?;
+            if status != "in_progress" {
+                let took: Option<i64> = sqlx::query_scalar("SELECT completed_ms - started_ms FROM public_records WHERE session_id = ? AND kind = 'turn' AND id = ?")
+                    .bind(&id).bind(turn_id).fetch_optional(&mut *tx).await.map_err(anyhow::Error::from)?.flatten();
+                let agent_type = if subagent.is_some() {
+                    "subagent"
+                } else {
+                    "root"
+                };
+                let tags = [("status", status), ("agent_type", agent_type)];
+                crate::telemetry::count(crate::telemetry::TURN, &tags);
+                if let Some(took) = took.and_then(|took| u64::try_from(took).ok()) {
+                    crate::telemetry::elapsed(
+                        crate::telemetry::TURN_DURATION,
+                        std::time::Duration::from_millis(took),
+                        &tags,
+                    );
+                }
+                tracing::info!(session_id = %id, turn_id, status, agent_type, "turn finished");
+            }
             // Only the session's own turns change its status; subagent turns
             // appear on its stream tagged with their `subagent_id`.
             let root = subagent.is_none();
@@ -413,6 +432,25 @@ async fn publish_item(
     .await?;
     save(&mut **tx, id, "item", item, turn_id, subagent).await?;
     observed(tx, id, "item", item_id, done).await?;
+    // Function calls finish with their result; other calls carry their own
+    // outcome.
+    let kind = item["type"].as_str().unwrap_or_default();
+    let tool = match kind {
+        "function_call_output" => Some("function_call"),
+        "message" | "reasoning" | "function_call" => None,
+        other => Some(other),
+    };
+    if let Some(tool) = tool.filter(|_| done) {
+        let status = if kind != "function_call_output" && !item["error"].is_null() {
+            "failed"
+        } else {
+            item["status"].as_str().unwrap_or("completed")
+        };
+        crate::telemetry::count(
+            crate::telemetry::TOOL_CALL,
+            &[("type", tool), ("status", status)],
+        );
+    }
     let input = item["role"] == "user" || item["type"] == "function_call_output";
     let output_index = if input {
         None

@@ -45,7 +45,7 @@ in [GOALS.md](GOALS.md).
 | Harness features | Configurable multi-agent execution, context compaction, programmatic tool calling, skills/plugins | Codex has underlying machinery; API integration and parity tests missing |
 | Environments | None, service-hosted, self-hosted executor; connection actions and lifecycle | None or read-only local workspace |
 | Files/artifacts | Documented upload, publication, retrieval and cleanup behavior | No public implementation |
-| Webhooks, credentials, usage | Documented webhook, vault and observability operations | Vaults and credentials with encrypted secrets authenticate HTTP MCP; webhook endpoints with signed, retried, restart-safe session event delivery; OTLP session trace export (G11); environment-variable credentials, OAuth refresh, and operational metrics missing |
+| Webhooks, credentials, usage | Documented webhook, vault and observability operations | Vaults and credentials with encrypted secrets authenticate HTTP MCP; webhook endpoints with signed, retried, restart-safe session event delivery; OTLP session trace export; correlated logs, request IDs, and OTLP metrics (G11); environment-variable credentials and OAuth refresh missing |
 | Service operation | Service owns the harness and saved progress | API-owned local worker startup, initialization deadline and shutdown; optional external worker; automatic restart and crash reconciliation still missing |
 
 ## Implementation sequence

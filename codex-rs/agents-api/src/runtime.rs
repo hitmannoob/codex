@@ -157,7 +157,7 @@ impl Worker {
                 if self.child.try_wait()?.is_some() {
                     return Ok(());
                 }
-                eprintln!("agents-api: forcing worker shutdown after {result:?}");
+                tracing::warn!(?result, "forcing worker shutdown");
                 self.child
                     .kill()
                     .await
@@ -229,9 +229,9 @@ pub(crate) async fn reclaim_orphan(home: &AbsolutePathBuf) -> anyhow::Result<()>
         && probe(record.pid)
             .is_some_and(|info| !info.zombie && info.start_time == record.start_time)
     {
-        eprintln!(
-            "agents-api: reclaiming worker pid={} orphaned by a prior API crash",
-            record.pid
+        tracing::warn!(
+            pid = record.pid,
+            "reclaiming worker orphaned by a prior API crash"
         );
         terminate(record.pid);
         let deadline = Instant::now() + RECLAIM_TIMEOUT;
