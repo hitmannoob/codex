@@ -47,6 +47,11 @@ struct Args {
         hide_env_values = true
     )]
     vault_passphrase: Option<String>,
+    /// Key that self-hosted executors present to this service's environment
+    /// registry (as their CODEX_API_KEY). It grants only the registry, never
+    /// the API. Self-hosted environments are unavailable without it.
+    #[arg(long, env = "CODEX_AGENTS_API_ENVIRONMENT_KEY", hide_env_values = true)]
+    environment_key: Option<String>,
     /// OTLP/HTTP collector base URL (for example `http://localhost:4318`) that
     /// receives the API's spans and metrics. Nothing is exported without it.
     #[arg(long, env = "CODEX_AGENTS_API_OTLP_ENDPOINT")]
@@ -130,6 +135,18 @@ async fn main() -> anyhow::Result<()> {
         api.allow_webhook_hosts(args.allow_webhook_hosts);
         if let Some(passphrase) = args.vault_passphrase {
             api.configure_vault(passphrase).await?;
+        }
+        if let Some(environment_key) = args.environment_key {
+            // The worker runs beside this process, so it reaches the registry
+            // over loopback whatever address clients use.
+            let mut local = listener.local_addr()?;
+            if local.ip().is_unspecified() {
+                local.set_ip(match local.ip() {
+                    std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            api.configure_environments(environment_key, format!("http://{local}/registry"))?;
         }
         eprintln!("agents-api listening on {}", listener.local_addr()?);
         let (stop_http, stopping_http) = tokio::sync::oneshot::channel();

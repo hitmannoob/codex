@@ -79,6 +79,7 @@ impl Worker {
         for name in [
             "CODEX_AGENTS_API_TOKEN",
             "CODEX_AGENTS_API_VAULT_PASSPHRASE",
+            "CODEX_AGENTS_API_ENVIRONMENT_KEY",
         ] {
             command.env_remove(name);
         }

@@ -1990,6 +1990,7 @@ dependencies = [
  "codex-app-server-transport",
  "codex-arg0",
  "codex-config",
+ "codex-exec-server",
  "codex-feedback",
  "codex-keyring-store",
  "codex-otel",

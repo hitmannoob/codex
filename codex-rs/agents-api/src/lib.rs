@@ -4,12 +4,15 @@ mod capabilities;
 mod configuration;
 mod contract;
 mod credentials;
+mod environments;
 mod gates;
 mod input;
 mod mcp;
 mod otlp;
 mod reconcile;
 mod records;
+mod registry;
+mod rendezvous;
 mod resources;
 mod routes;
 mod secrets;
@@ -75,6 +78,8 @@ struct State {
     secrets: secrets::Secrets,
     /// Wakes the webhook dispatcher after a commit that may have queued deliveries.
     webhook_wake: tokio::sync::Notify,
+    /// The environment registry and rendezvous state for self-hosted environments.
+    registry: registry::Registry,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -200,6 +205,7 @@ impl AgentsApi {
             webhook_hosts: Mutex::default(),
             secrets: secrets::Secrets::default(),
             webhook_wake: tokio::sync::Notify::new(),
+            registry: registry::Registry::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
             // behind is closed and recovers from saved records.
@@ -302,6 +308,27 @@ impl AgentsApi {
         if removed > 0 {
             tracing::info!(removed, "removed secrets left by interrupted deletions");
         }
+        Ok(())
+    }
+
+    /// Accept self-hosted executors that authenticate with this environment
+    /// key. It grants only the registry endpoints, never the API. The worker
+    /// reaches the registry at `registry_url`, this service's own address
+    /// followed by `/registry`.
+    pub fn configure_environments(
+        &self,
+        environment_key: String,
+        registry_url: String,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            environment_key.len() >= 32,
+            "environment key must contain at least 32 bytes"
+        );
+        anyhow::ensure!(
+            environment_key != self.state.token,
+            "environment key must differ from the API token"
+        );
+        self.state.registry.configure(environment_key, registry_url);
         Ok(())
     }
 

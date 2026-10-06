@@ -53,6 +53,7 @@ pub(crate) fn router(state: Arc<State>) -> Router {
         .merge(crate::contract::router())
         .merge(crate::vaults::router())
         .merge(crate::webhooks::router())
+        .merge(crate::registry::router())
         // Route layers see the matched route template, which labels metrics.
         .route_layer(middleware::from_fn(crate::telemetry::route))
         .layer(DefaultBodyLimit::max(/*limit*/ 16 * 1024))
@@ -71,6 +72,11 @@ async fn authorize(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Executors and the worker's harness present their own credentials, which
+    // the registry checks; the API token never reaches them.
+    if request.uri().path().starts_with("/registry/") {
+        return Ok(next.run(request).await);
+    }
     // Webhook endpoint requests come from the SDK without the beta header.
     let compatible = request.uri().path().starts_with("/v1/agents/sessions")
         || request.uri().path().starts_with("/v1/webhook_")
