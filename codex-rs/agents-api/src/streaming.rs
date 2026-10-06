@@ -1,5 +1,5 @@
-//! Transient stream events: output-text and reasoning-summary deltas, the
-//! content-part events that frame them, and `error` events. None of these are
+//! Transient stream events: output-text, reasoning-summary, and command-output
+//! deltas, the content-part events that frame them, and `error` events. None of these are
 //! persisted: a finished item's saved record carries its complete text, and a
 //! failed turn's record carries its error.
 use crate::State;
@@ -13,6 +13,7 @@ use std::sync::Mutex;
 enum Kind {
     Message,
     Reasoning,
+    Command,
 }
 
 /// What deltas need about an item while it streams.
@@ -32,6 +33,8 @@ impl Stream {
             Kind::Message
         } else if item["type"] == "reasoning" {
             Kind::Reasoning
+        } else if item["type"] == "command_execution" {
+            Kind::Command
         } else {
             return None;
         };
@@ -68,6 +71,8 @@ impl Stream {
                 "reasoning_summary_part.added",
                 json!({"summary_index":index,"part":{"type":"summary_text","text":""}}),
             ),
+            // Command output has no parts.
+            Kind::Command => return None,
         })
     }
 }
@@ -93,7 +98,7 @@ impl Streams {
         // A message has one output-text part, announced with the item.
         let events = match stream.kind {
             Kind::Message => stream.part_added(/*index*/ 0).into_iter().collect(),
-            Kind::Reasoning => Vec::new(),
+            Kind::Reasoning | Kind::Command => Vec::new(),
         };
         crate::lock(&self.0).insert((thread_id.to_owned(), codex_id.to_owned()), stream);
         events
@@ -140,6 +145,8 @@ impl Streams {
                     ));
                 }
             }
+            // The saved item carries the complete output.
+            Kind::Command => {}
         }
         events
     }
@@ -166,6 +173,12 @@ impl Streams {
         let Some(stream) = streams.get_mut(&key) else {
             return Vec::new();
         };
+        if stream.kind == Kind::Command {
+            return vec![
+                json!({"type":"agent.output.command_execution_output.delta","session_id":stream.session_id,
+                "turn_id":stream.turn_id,"item_id":stream.item_id,"output_index":stream.output_index,"delta":params["delta"]}),
+            ];
+        }
         let index = params["summaryIndex"].as_i64().unwrap_or(0);
         let mut events: Vec<Value> = stream.part_added(index).into_iter().collect();
         match (method, stream.kind) {
@@ -191,7 +204,8 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> anyhow::Result<(
     let events = match raw["method"].as_str().unwrap_or_default() {
         method @ ("item/agentMessage/delta"
         | "item/reasoning/summaryTextDelta"
-        | "item/reasoning/summaryPartAdded") => state.streams.delta(method, params),
+        | "item/reasoning/summaryPartAdded"
+        | "item/commandExecution/outputDelta") => state.streams.delta(method, params),
         // Retried errors do not end the turn; a final one precedes `turn.failed`.
         "error" if params["willRetry"] == false => {
             let session: Option<String> = sqlx::query_scalar(

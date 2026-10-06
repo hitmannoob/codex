@@ -85,10 +85,12 @@ pub(crate) enum Environment {
     Local {
         cwd: AbsolutePathBuf,
     },
-    /// A caller-owned executor; `cwd` is a path on the executor's OS.
+    /// A caller-owned executor; paths are on the executor's OS.
     SelfHosted {
         id: String,
         cwd: String,
+        #[serde(default)]
+        capability_directories: Vec<String>,
     },
 }
 

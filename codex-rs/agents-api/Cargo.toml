@@ -15,6 +15,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-exec-server = { workspace = true }
+codex-http-client = { workspace = true }
 codex-keyring-store = { workspace = true }
 codex-otel = { workspace = true }
 codex-secrets = { workspace = true }
@@ -22,6 +23,7 @@ codex-state = { workspace = true }
 codex-tools = { workspace = true }
 codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 futures = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
@@ -51,7 +53,6 @@ codex-api = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-config = { workspace = true }
 codex-feedback = { workspace = true }
-codex-http-client = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rollout = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }

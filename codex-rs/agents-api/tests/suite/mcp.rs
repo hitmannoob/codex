@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 /// A minimal HTTP MCP server with an allowed `lookup` tool and a `secret` tool
 /// that no session selects. It records each tool call and its tenant header.
-async fn mcp_server() -> anyhow::Result<(
+pub(super) async fn mcp_server() -> anyhow::Result<(
     String,
     Arc<Mutex<Vec<Value>>>,
     tokio::task::JoinHandle<std::io::Result<()>>,

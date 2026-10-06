@@ -2004,6 +2004,7 @@ dependencies = [
  "codex-uds",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
+ "codex-utils-path-uri",
  "futures",
  "hmac 0.12.1",
  "http 1.4.0",

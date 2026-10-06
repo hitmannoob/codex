@@ -48,6 +48,15 @@ pub(crate) fn router() -> Router<Arc<State>> {
             "/v1/agents/environments/{id}",
             get(crate::environments::retrieve),
         )
+        .route(
+            "/v1/agents/environments/{id}/files",
+            post(crate::environment_files::create)
+                .get(crate::environment_files::list)
+                // Base64 inflates an inline file by a third.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::environment_files::MAX_INLINE_BYTES / 3 * 4 + 64 * 1024,
+                )),
+        )
         .route("/v1/agents/sessions/{id}/turns", get(crate::records::turns))
         .route("/v1/agents/sessions/{id}/traces", get(crate::traces::list))
         .route(
@@ -115,7 +124,7 @@ async fn create(
 ) -> Result<Response, ApiError> {
     // Checked here rather than by deserialization, so errors name the public
     // environment types instead of the prototype's.
-    let mut workspace = None;
+    let mut environment = Environment::None;
     match params.environment["type"].as_str() {
         Some("none")
             if params
@@ -129,7 +138,7 @@ async fn create(
             ));
         }
         Some("self_hosted") => {
-            workspace = Some(crate::environments::parse(&params.environment)?);
+            environment = crate::environments::parse(&params.environment)?;
             if state.registry.harness_url().is_none() {
                 return Err(ApiError(
                     StatusCode::NOT_IMPLEMENTED,
@@ -150,7 +159,8 @@ async fn create(
         Some(Value::Array(items)) if items.is_empty() => None,
         Some(input) => Some(crate::input::message(input)?),
     };
-    if input.is_none() && workspace.is_none() {
+    let self_hosted = matches!(environment, Environment::SelfHosted { .. });
+    if input.is_none() && !self_hosted {
         return Err(invalid("input is required when environment.type is none"));
     }
     let metadata = crate::configuration::metadata(params.metadata)?;
@@ -176,25 +186,13 @@ async fn create(
         saved.name = serde_json::from_value(name).map_err(|e| invalid(e.to_string()))?;
     }
     saved.config = configure(saved.config, patch)?;
-    crate::configuration::validate_execution(&saved.config)?;
+    crate::configuration::validate_execution(&saved.config, &environment)?;
     // Resolve worker configuration now so an unreachable MCP server or an
     // unsupported tier is rejected before a session is created.
-    crate::capabilities::overrides(
-        &state,
-        &saved.config,
-        &Environment::None,
-        &Default::default(),
-    )
-    .await?;
+    crate::capabilities::overrides(&state, &saved.config, &environment, &Default::default())
+        .await?;
     let vault_ids = crate::credentials::vaults(&state, params.vault_ids).await?;
     let credentials = crate::credentials::resolve(&state, &saved.config, &vault_ids).await?;
-    let environment = match &workspace {
-        Some(cwd) => Environment::SelfHosted {
-            id: format!("env_{}", Uuid::new_v4().simple()),
-            cwd: cwd.clone(),
-        },
-        None => Environment::None,
-    };
     let session = state
         .store
         .create_session(
@@ -206,18 +204,26 @@ async fn create(
         )
         .await?;
     let public_environment = match &environment {
-        Environment::SelfHosted { id, cwd } => {
+        Environment::SelfHosted {
+            id,
+            cwd,
+            capability_directories,
+        } => {
             let remote_url = crate::registry::remote_url(&headers);
-            crate::environments::create(&state, &session.id, id, cwd, remote_url).await?
+            crate::environments::create(
+                &state,
+                &session.id,
+                id,
+                cwd,
+                capability_directories,
+                remote_url,
+            )
+            .await?
         }
         Environment::None | Environment::Local { .. } => json!({"type":"none"}),
     };
     // Input to a self-hosted session sets the status once it is submitted.
-    let status = if workspace.is_some() {
-        "idle"
-    } else {
-        "in_progress"
-    };
+    let status = if self_hosted { "idle" } else { "in_progress" };
     let public = json!({"id":session.id,"object":"agent.session","agent":agent(&session.agent),
         "created_at":now(),"last_active_at":now(),"environment":public_environment,"metadata":metadata,
         "vault_ids":vault_ids,"required_actions":[],"status":status,"error":null,"usage":null});

@@ -4,6 +4,7 @@ mod capabilities;
 mod configuration;
 mod contract;
 mod credentials;
+mod environment_files;
 mod environments;
 mod gates;
 mod input;
@@ -84,6 +85,9 @@ struct State {
     registry: registry::Registry,
     /// Input waiting for a self-hosted executor to connect.
     waits: environments::Waits,
+    /// This service's own connections to self-hosted executors, for
+    /// environment files.
+    executors: codex_exec_server::EnvironmentManager,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -218,6 +222,11 @@ impl AgentsApi {
             webhook_wake: tokio::sync::Notify::new(),
             registry: registry::Registry::default(),
             waits: environments::Waits::default(),
+            executors: codex_exec_server::EnvironmentManager::without_environments(
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            ),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
             // behind is closed and recovers from saved records.

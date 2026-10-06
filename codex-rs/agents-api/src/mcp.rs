@@ -1,11 +1,12 @@
 //! Public MCP servers: which configurations can run, where a session may
 //! connect, and the session-scoped Codex configuration for each server.
 //!
-//! Only HTTP servers reached from the service are executable. Stdio servers and
-//! environment-origin connections run inside an execution environment (G09), and
-//! credentials come from vaults (G11). The worker host makes each connection, so
-//! a server URL must use https and resolve only to public addresses unless the
-//! operator allows its host.
+//! Service-origin HTTP servers are reached from the worker host, so their URL
+//! must use https and resolve only to public addresses unless the operator
+//! allows the host. Stdio servers and environment-origin HTTP connections run on
+//! a self-hosted session's executor, on the caller's compute and network, so
+//! the service's egress policy does not apply to them. Credentials come from
+//! vaults (G11).
 use crate::ApiError;
 use crate::State;
 use crate::agent_tools::CapabilityTool;
@@ -24,11 +25,31 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::net::IpAddr;
 
+/// Where an executable MCP server runs.
+enum Endpoint<'a> {
+    /// HTTP from the worker host, within the service's egress policy.
+    Service {
+        url: &'a str,
+        headers: &'a BTreeMap<String, String>,
+    },
+    /// HTTP from the session's executor.
+    Environment {
+        url: &'a str,
+        headers: &'a BTreeMap<String, String>,
+    },
+    /// A process on the session's executor.
+    Stdio {
+        command: &'a str,
+        args: &'a [String],
+        cwd: &'a str,
+        env_vars: &'a [String],
+    },
+}
+
 /// An executable public MCP server.
 struct Server<'a> {
     label: &'a str,
-    url: &'a str,
-    headers: &'a BTreeMap<String, String>,
+    endpoint: Endpoint<'a>,
     allowed_tools: Option<&'a Vec<String>>,
     required: bool,
 }
@@ -37,23 +58,70 @@ fn servers(config: &AgentConfig) -> impl Iterator<Item = Server<'_>> {
     config.tools.iter().filter_map(|tool| match tool {
         Tool::Capability(CapabilityTool::Mcp {
             server_label,
-            transport:
-                McpTransport::Http {
-                    server_url,
-                    headers,
-                },
+            transport,
+            connection_origin,
             allowed_tools,
             required,
             ..
         }) => Some(Server {
             label: server_label,
-            url: server_url,
-            headers,
+            endpoint: match (transport, connection_origin) {
+                (
+                    McpTransport::Http {
+                        server_url,
+                        headers,
+                    },
+                    ConnectionOrigin::Service,
+                ) => Endpoint::Service {
+                    url: server_url,
+                    headers,
+                },
+                (
+                    McpTransport::Http {
+                        server_url,
+                        headers,
+                    },
+                    ConnectionOrigin::Environment,
+                ) => Endpoint::Environment {
+                    url: server_url,
+                    headers,
+                },
+                // A stdio server is a process on the executor whatever its origin.
+                (
+                    McpTransport::Stdio {
+                        command,
+                        cwd,
+                        args,
+                        env_vars,
+                    },
+                    ConnectionOrigin::Service | ConnectionOrigin::Environment,
+                ) => Endpoint::Stdio {
+                    command,
+                    args,
+                    cwd,
+                    env_vars,
+                },
+            },
             allowed_tools: allowed_tools.as_ref(),
             required: *required,
         }),
         Tool::Capability(_) | Tool::Function(_) => None,
     })
+}
+
+/// Whether an MCP tool runs on the session's executor, which needs a
+/// self-hosted environment.
+pub(crate) fn needs_environment(tool: &CapabilityTool) -> bool {
+    matches!(
+        tool,
+        CapabilityTool::Mcp {
+            transport: McpTransport::Stdio { .. },
+            ..
+        } | CapabilityTool::Mcp {
+            connection_origin: ConnectionOrigin::Environment,
+            ..
+        }
+    )
 }
 
 /// Executable servers that may use a vault credential: (label, URL, explicit
@@ -103,12 +171,33 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
                 "allowed_tools must list at most 128 unique tool names",
             ));
         }
-        let McpTransport::Http {
-            server_url,
-            headers,
-        } = transport
-        else {
-            continue;
+        let (server_url, headers) = match transport {
+            McpTransport::Http {
+                server_url,
+                headers,
+            } => (server_url, headers),
+            McpTransport::Stdio {
+                command,
+                cwd,
+                args,
+                env_vars,
+            } => {
+                if command.is_empty()
+                    || command.len() > 4096
+                    || args.len() > 64
+                    || args.iter().any(|arg| arg.len() > 4096)
+                    || env_vars.len() > 64
+                    || !env_vars.iter().all(|name| variable_name(name))
+                {
+                    return Err(invalid(
+                        "stdio MCP servers take a command, at most 64 arguments, and at most 64 environment variable names",
+                    ));
+                }
+                if !crate::environments::absolute(cwd) {
+                    return Err(invalid("stdio MCP cwd must be an absolute path"));
+                }
+                continue;
+            }
         };
         let uri: Uri = server_url
             .parse()
@@ -138,26 +227,23 @@ pub(crate) fn validate(config: &AgentConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Whether `name` is a portable environment variable name.
+pub(crate) fn variable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Why a saved MCP configuration cannot run yet, if it cannot.
 pub(crate) fn unsupported(tool: &CapabilityTool) -> Option<&'static str> {
     let CapabilityTool::Mcp {
-        transport,
-        connection_origin,
-        request_metadata,
-        ..
+        request_metadata, ..
     } = tool
     else {
         return None;
     };
-    if matches!(transport, McpTransport::Stdio { .. }) {
-        Some("stdio MCP server")
-    } else if *connection_origin == ConnectionOrigin::Environment {
-        Some("environment-origin MCP connection")
-    } else if !request_metadata.is_empty() {
-        Some("MCP request metadata")
-    } else {
-        None
-    }
+    (!request_metadata.is_empty()).then_some("MCP request metadata")
 }
 
 /// Check where each server would connect, and that no label shadows a server
@@ -175,8 +261,11 @@ pub(crate) async fn check(
                 server.label
             )));
         }
-        let uri: Uri = server
-            .url
+        // Executor connections use the caller's network, not the service's.
+        let Endpoint::Service { url, .. } = server.endpoint else {
+            continue;
+        };
+        let uri: Uri = url
             .parse()
             .map_err(|_| invalid("MCP server_url must be an absolute http(s) URL"))?;
         let host = uri
@@ -246,26 +335,52 @@ pub(crate) fn public(address: &IpAddr) -> bool {
 /// as header helper commands. Public tool calls need no interactive approval:
 /// the caller's `allowed_tools` selection is the approval. `tokens` holds the
 /// session's credential snapshots by server label; they travel only in this
-/// in-memory thread configuration.
+/// in-memory thread configuration. Servers that run on the executor name the
+/// session's `environment_id`; without one they are left out rather than run
+/// on the worker host.
 pub(crate) fn overrides(
     config: &AgentConfig,
     tokens: &BTreeMap<String, String>,
+    environment_id: Option<&str>,
 ) -> Map<String, Value> {
     servers(config)
-        .map(|server| {
-            let mut entry = json!({"url": server.url, "enabled": true, "required": server.required,
+        .filter_map(|server| {
+            let mut entry = json!({"enabled": true, "required": server.required,
                 "default_tools_approval_mode": "approve"});
-            let mut headers = server.headers.clone();
-            if let Some(token) = tokens.get(server.label) {
-                headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
+            match server.endpoint {
+                Endpoint::Service { url, headers } | Endpoint::Environment { url, headers } => {
+                    entry["url"] = json!(url);
+                    let mut headers = headers.clone();
+                    if let Some(token) = tokens.get(server.label) {
+                        headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
+                    }
+                    if !headers.is_empty() {
+                        entry["http_headers"] = json!(headers);
+                    }
+                }
+                Endpoint::Stdio {
+                    command,
+                    args,
+                    cwd,
+                    env_vars,
+                } => {
+                    entry["command"] = json!(command);
+                    entry["args"] = json!(args);
+                    entry["cwd"] = json!(cwd);
+                    // Values come from the executor's environment.
+                    entry["env_vars"] = env_vars
+                        .iter()
+                        .map(|name| json!({"name": name, "source": "remote"}))
+                        .collect();
+                }
             }
-            if !headers.is_empty() {
-                entry["http_headers"] = json!(headers);
+            if !matches!(server.endpoint, Endpoint::Service { .. }) {
+                entry["environment_id"] = json!(environment_id?);
             }
             if let Some(tools) = server.allowed_tools {
                 entry["enabled_tools"] = json!(tools);
             }
-            (server.label.to_owned(), entry)
+            Some((server.label.to_owned(), entry))
         })
         .collect()
 }

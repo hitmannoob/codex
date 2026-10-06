@@ -161,7 +161,11 @@ pub(crate) async fn overrides(
             server["enabled_tools"] = json!(selection.allowed_tools);
         }
     }
-    servers.extend(crate::mcp::overrides(config, mcp_tokens));
+    let environment_id = match environment {
+        Environment::SelfHosted { id, .. } => Some(id.as_str()),
+        Environment::None | Environment::Local { .. } => None,
+    };
+    servers.extend(crate::mcp::overrides(config, mcp_tokens, environment_id));
     // Codex's V2 multi-agent runtime counts the root thread toward its cap, so
     // it gets one more thread than the public subagent limit.
     let multi_agent = match &config.multi_agent {

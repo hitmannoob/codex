@@ -339,7 +339,7 @@ pub(crate) async fn start_turn(
     // execution that follows; other sessions are admitted concurrently.
     let _admission = state.input_gates.lock(id).await;
     let Json(session) = read_session(Extract(Arc::clone(state)), Path(id.to_owned())).await?;
-    crate::configuration::validate_execution(&session.agent.config)?;
+    crate::configuration::validate_execution(&session.agent.config, &session.environment)?;
     let tokens = crate::credentials::load(state, id).await?;
     let config =
         crate::capabilities::overrides(state, &session.agent.config, &session.environment, &tokens)
@@ -348,6 +348,13 @@ pub(crate) async fn start_turn(
     if let Environment::SelfHosted { id, .. } = &session.environment {
         crate::environments::attach(state, id).await?;
     }
+    // The caller's own compute is the boundary for a self-hosted environment,
+    // which runs commands unsandboxed. Resuming does not keep the thread's
+    // sandbox, so both start and resume name it.
+    let sandbox = match &session.environment {
+        Environment::None | Environment::Local { .. } => "read-only",
+        Environment::SelfHosted { .. } => "danger-full-access",
+    };
     let thread = async {
         Ok::<_, ApiError>(if let Some(thread_id) = session.thread_id {
         // Resume once per connection. Per-turn settings travel with
@@ -358,6 +365,7 @@ pub(crate) async fn start_turn(
                 .rpc(
                     "thread/resume",
                     json!({"threadId": thread_id, "excludeTurns": true, "config": config,
+                        "approvalPolicy": "never", "sandbox": sandbox,
                         "serviceTier": null,
                         "model": session.agent.config.model, "developerInstructions": session.agent.config.instructions.as_deref().unwrap_or_default()}),
                 )
@@ -366,12 +374,19 @@ pub(crate) async fn start_turn(
         }
         thread_id
     } else {
-        // The caller's own compute is the boundary for a self-hosted
-        // environment, which runs commands unsandboxed.
-        let (environments, sandbox) = match &session.environment {
-            Environment::None => (json!([]), "read-only"),
-            Environment::Local { cwd } => (json!([{"environmentId": "local", "cwd": cwd}]), "read-only"),
-            Environment::SelfHosted { id, cwd } => (json!([{"environmentId": id, "cwd": cwd}]), "danger-full-access"),
+        let environments = match &session.environment {
+            Environment::None => json!([]),
+            Environment::Local { cwd } => json!([{"environmentId": "local", "cwd": cwd}]),
+            Environment::SelfHosted { id, cwd, .. } => json!([{"environmentId": id, "cwd": cwd}]),
+        };
+        // Skills in the caller's capability directories, found on the executor.
+        // Codex keeps the selection when the thread resumes.
+        let capability_roots = match &session.environment {
+            Environment::SelfHosted { id, capability_directories, .. } => capability_directories.iter().enumerate()
+                .map(|(index, path)| json!({"id": format!("capability-{index}"),
+                    "location": {"type": "environment", "environmentId": id, "path": path}}))
+                .collect(),
+            Environment::None | Environment::Local { .. } => Vec::new(),
         };
         let response = state
             .rpc(
@@ -381,6 +396,7 @@ pub(crate) async fn start_turn(
                     "developerInstructions": session.agent.config.instructions.as_deref().unwrap_or_default(),
                     "serviceTier": null,
                     "environments": environments,
+                    "selectedCapabilityRoots": capability_roots,
                     "config": config,
                     "dynamicTools": session.agent.config.tools.iter().filter_map(crate::agent_tools::Tool::function).map(|tool| json!({
                         "type": "function", "name": tool.name, "description": tool.description, "inputSchema": tool.parameters
@@ -434,6 +450,12 @@ pub(crate) async fn start_turn(
             .rpc(
                 "turn/start",
                 json!({"threadId": thread_id, "input": items,
+                    // `thread/resume` does not restore a thread's environment
+                    // selection, so a self-hosted session names it every turn.
+                    "environments": match &session.environment {
+                        Environment::SelfHosted { id, cwd, .. } => Some(json!([{"environmentId": id, "cwd": cwd}])),
+                        Environment::None | Environment::Local { .. } => None,
+                    },
                     // A complete settings value clears inherited effort; effort:null alone is a no-op.
                     "collaborationMode":{"mode":"default","settings":{
                         "model":session.agent.config.model,

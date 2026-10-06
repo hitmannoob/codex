@@ -325,6 +325,10 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                     };
                     public
                 }
+                Some("commandExecution") => {
+                    json!({"type":"command_execution","command":item["command"],"cwd":item["cwd"],"duration_ms":item["durationMs"],
+                        "exit_code":item["exitCode"],"output":item["aggregatedOutput"]})
+                }
                 Some("mcpToolCall") => {
                     json!({"type":"mcp_call","server_label":item["server"],"name":item["tool"],"arguments":item["arguments"],
                         "output":item["result"]["content"],"error":item["error"]["message"]})
@@ -352,6 +356,15 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
                 && item["status"] == "failed"
             {
                 public["status"] = json!("failed");
+            }
+            // A command that could not run, or was declined, failed; one still
+            // running when its item closed did not finish.
+            if done && item["type"] == "commandExecution" {
+                public["status"] = json!(match item["status"].as_str() {
+                    Some("completed") => "completed",
+                    Some("inProgress") => "incomplete",
+                    _ => "failed",
+                });
             }
             // The item and, for a resolved tool call, its output record share one
             // transaction so `output_index` counts them consistently.

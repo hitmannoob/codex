@@ -177,6 +177,11 @@ impl Registry {
         crate::lock(&self.slots).get_mut(environment_id).map(f)
     }
 
+    /// An environment's executor state, if the registry knows the environment.
+    pub(crate) fn state(&self, environment_id: &str) -> Option<ExecutorState> {
+        self.with_slot(environment_id, |slot| *slot.state.borrow())
+    }
+
     /// Watch an existing environment's executor state.
     pub(crate) fn watch(&self, environment_id: &str) -> watch::Receiver<ExecutorState> {
         self.with_new_slot(environment_id, |slot| slot.state.subscribe())

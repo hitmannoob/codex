@@ -209,8 +209,8 @@ async fn public_sessions_save_normalized_history_and_validate_inputs() -> anyhow
                 "self-hosted environments are disabled; the operator must configure an environment key"),
             (json!({"type":"self_hosted","workspace_directory":"tmp"}), bad, "workspace_directory must be an absolute path of at most 4096 bytes"),
             (json!({"type":"self_hosted"}), bad, "workspace_directory is required for self_hosted environments"),
-            (json!({"type":"self_hosted","workspace_directory":"C:\\work","capability_directories":["/skills"]}), bad,
-                "capability_directories is not supported by this service yet"),
+            (json!({"type":"self_hosted","workspace_directory":"C:\\work","capability_directories":["skills"]}), bad,
+                "capability_directories must list at most 32 distinct absolute paths"),
             (json!({"type":"local","cwd":"/tmp"}), bad, "environment.type must be none, openai_hosted, or self_hosted"),
             (json!({"type":"none","cwd":"/tmp"}), bad, "environment none takes no other fields"),
         ] {

@@ -11,6 +11,7 @@ use crate::ApiError;
 use crate::State;
 use crate::contract::invalid;
 use crate::registry::ExecutorState;
+use crate::resources::Environment;
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::State as Extract;
@@ -18,15 +19,18 @@ use axum::http::StatusCode;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// How long input waits for a disconnected executor.
 const CONNECTION_WAIT: Duration = Duration::from_secs(5 * 60);
 const MAX_PATH_BYTES: usize = 4096;
+const MAX_CAPABILITY_DIRECTORIES: usize = 32;
 const TIMED_OUT: &str =
     "the environment did not connect within five minutes; the input waiting for it was dropped";
 const RESTARTED: &str =
@@ -42,8 +46,8 @@ struct Wait {
     generation: u64,
 }
 
-/// The workspace directory of a `self_hosted` environment parameter.
-pub(crate) fn parse(params: &Value) -> Result<String, ApiError> {
+/// A new environment from a `self_hosted` environment parameter.
+pub(crate) fn parse(params: &Value) -> Result<Environment, ApiError> {
     let fields = params
         .as_object()
         .ok_or_else(|| invalid("environment must be an object"))?;
@@ -57,33 +61,48 @@ pub(crate) fn parse(params: &Value) -> Result<String, ApiError> {
             "unknown field in self_hosted environment: {unknown}"
         )));
     }
-    match &params["capability_directories"] {
-        Value::Null => {}
-        Value::Array(directories) if directories.is_empty() => {}
-        _ => {
-            return Err(invalid(
-                "capability_directories is not supported by this service yet",
-            ));
-        }
+    let capability_directories: Vec<String> = match &params["capability_directories"] {
+        Value::Null => Vec::new(),
+        directories => serde_json::from_value(directories.clone())
+            .map_err(|_| invalid("capability_directories must be a list of paths"))?,
+    };
+    if capability_directories.len() > MAX_CAPABILITY_DIRECTORIES
+        || capability_directories
+            .iter()
+            .any(|directory| !absolute(directory) || directory.len() > MAX_PATH_BYTES)
+        || capability_directories.iter().collect::<HashSet<_>>().len()
+            != capability_directories.len()
+    {
+        return Err(invalid(format!(
+            "capability_directories must list at most {MAX_CAPABILITY_DIRECTORIES} distinct absolute paths"
+        )));
     }
     let directory = params["workspace_directory"]
         .as_str()
         .ok_or_else(|| invalid("workspace_directory is required for self_hosted environments"))?;
-    // The executor may run another OS, so accept either absolute form and
-    // leave resolution to it.
-    let bytes = directory.as_bytes();
-    let absolute = directory.starts_with('/')
-        || directory.starts_with("\\\\")
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'\\' | b'/'));
-    if !absolute || directory.len() > MAX_PATH_BYTES || directory.contains('\0') {
+    if !absolute(directory) || directory.len() > MAX_PATH_BYTES {
         return Err(invalid(format!(
             "workspace_directory must be an absolute path of at most {MAX_PATH_BYTES} bytes"
         )));
     }
-    Ok(directory.to_owned())
+    Ok(Environment::SelfHosted {
+        id: format!("env_{}", Uuid::new_v4().simple()),
+        cwd: directory.to_owned(),
+        capability_directories,
+    })
+}
+
+/// Whether `path` is absolute on the executor. It may run another OS, so either
+/// form is accepted and resolution is left to it.
+pub(crate) fn absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !path.contains('\0')
+        && (path.starts_with('/')
+            || path.starts_with("\\\\")
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')))
 }
 
 /// Record a session's environment and return its public object.
@@ -92,10 +111,11 @@ pub(crate) async fn create(
     session_id: &str,
     environment_id: &str,
     workspace_directory: &str,
+    capability_directories: &[String],
     remote_url: String,
 ) -> anyhow::Result<Value> {
-    let public = json!({"id": environment_id, "type": "self_hosted",
-        "workspace_directory": workspace_directory, "capability_directories": [], "remote_url": remote_url});
+    let public = json!({"id": environment_id, "type": "self_hosted", "workspace_directory": workspace_directory,
+        "capability_directories": capability_directories, "remote_url": remote_url});
     sqlx::query("INSERT INTO environments (id, session_id, data) VALUES (?, ?, ?)")
         .bind(environment_id)
         .bind(session_id)
@@ -402,6 +422,7 @@ pub(crate) async fn cancel(state: &State, session_id: &str) -> Result<bool, ApiE
 /// worker stops using it. The caller's compute keeps running.
 pub(crate) async fn forget(state: &State, environment_id: &str) {
     state.registry.remove(environment_id);
+    let _ = state.executors.remove_environment(environment_id);
     let attached = match state.attached_environments() {
         Ok(attached) => attached,
         Err(_) => return,

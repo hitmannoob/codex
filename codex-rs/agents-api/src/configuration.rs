@@ -179,7 +179,10 @@ pub(crate) fn configure(mut config: AgentConfig, patch: Value) -> Result<AgentCo
 }
 
 /// Keep stored configuration separate from capabilities not yet implemented by this service.
-pub(crate) fn validate_execution(config: &AgentConfig) -> Result<(), ApiError> {
+pub(crate) fn validate_execution(
+    config: &AgentConfig,
+    environment: &crate::resources::Environment,
+) -> Result<(), ApiError> {
     use crate::agent_tools::CapabilityTool;
     use crate::agent_tools::SearchMode;
     for tool in &config.tools {
@@ -194,6 +197,17 @@ pub(crate) fn validate_execution(config: &AgentConfig) -> Result<(), ApiError> {
             Tool::Capability(CapabilityTool::ToolSearch) => Some("tool search"),
             Tool::Capability(CapabilityTool::ProgrammaticToolCalling { enabled: true }) => {
                 Some("programmatic tool calling")
+            }
+            Tool::Capability(tool @ CapabilityTool::Mcp { .. })
+                if crate::mcp::needs_environment(tool)
+                    && !matches!(
+                        environment,
+                        crate::resources::Environment::SelfHosted { .. }
+                    ) =>
+            {
+                return Err(invalid(
+                    "stdio and environment-origin MCP servers need a self_hosted environment",
+                ));
             }
             Tool::Capability(tool @ CapabilityTool::Mcp { .. }) => crate::mcp::unsupported(tool),
             Tool::Capability(CapabilityTool::WebSearch { .. }) => Some("web search"),
