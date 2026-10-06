@@ -116,10 +116,15 @@ async fn create(
                 .as_object()
                 .is_some_and(|fields| fields.len() == 1) => {}
         Some("none") => return Err(invalid("environment none takes no other fields")),
-        Some(kind @ ("openai_hosted" | "self_hosted")) => {
-            return Err(invalid(format!(
-                "environment type {kind} is not implemented; use none"
-            )));
+        Some("openai_hosted") => {
+            return Err(invalid(
+                "environment type openai_hosted is not supported by this service; use none",
+            ));
+        }
+        Some("self_hosted") => {
+            return Err(invalid(
+                "environment type self_hosted is not implemented yet; use none",
+            ));
         }
         _ => {
             return Err(invalid(

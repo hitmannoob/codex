@@ -115,7 +115,7 @@ remain available without that header. New session routes are:
 | --- | --- | --- |
 | POST / GET | `/v1/agents` | Create saved agents / list in creation order |
 | GET / POST / DELETE | `/v1/agents/{id}` | Retrieve, update, or delete a saved agent |
-| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, environment `none` (`openai_hosted` and `self_hosted` return 400 as not implemented), required initial input (the pinned SDK requires it for environment `none`), optional SSE |
+| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, environment `none` (`self_hosted` returns 400 until G09 lands; `openai_hosted` is not supported), required initial input (the pinned SDK requires it for environment `none`), optional SSE |
 | GET | `/v1/agents/sessions` | List in creation order, optionally filtered by `agent_id` |
 | GET | `/v1/agents/sessions/{id}` | Configuration snapshot, status, metadata and current `required_actions` |
 | POST | `/v1/agents/sessions/{id}` | Replace metadata; change model, reasoning effort, or service tier for later turns |

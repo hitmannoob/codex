@@ -880,7 +880,7 @@ Remaining:
   `resume_subagent_call`, `agent_message`, or `closed` status.
 - Subagent task text and settings are unavailable.
 
-## G09 — Environments and executor lifecycle
+## G09 — Environments and executor lifecycle (self-hosted only)
 
 **Outcome:** environment ownership and lifecycle are explicit and independent of
 worker process ownership.
@@ -898,23 +898,17 @@ Implement self-hosted attachment first:
   outcomes and allow reconnection only as specified; never blindly replay a
   potentially side-effecting command.
 
-Then implement service-managed environments:
-
-- [ ] Select the compute provider and isolation model using explicit requirements:
-  supported OS, lifecycle, files, network policy, credentials, quotas, and cost.
-  Provider choice is an open design decision, not a prerequisite for local API work.
-- [ ] Add a provider adapter for allocation, readiness, setup, executor connection,
-  stop, and cleanup. Introduce only the operations needed by the selected provider.
-- [ ] Persist allocation ownership before progressing lifecycle transitions so API
-  restart can reconcile partially created or partially deleted resources.
-- [ ] Implement supported setup, expiry, network, and resource settings. Tie cleanup
-  to ownership and make retries safe without assuming provider calls are atomic.
+Service-managed environments are out of scope (decision, 2026-10-06). The
+service supports self-hosted environments only:
+- `openai_hosted` returns 400 "not supported by this service".
+- Environment templates (TPL-001..005) and hosted configuration (BEH-011)
+  remain inventoried but leave the parity target, as a recorded amendment.
+- Provider selection, allocation, setup, expiry, and managed cleanup are not
+  planned.
 
 Acceptance: attach an actual executor, execute in the expected filesystem, verify
 remote path handling, lose/reconnect the executor during a command, and delete a
-session without stopping caller-owned compute. For managed compute, additionally
-verify setup failure, API crash during allocation, expiry, and leaked-resource
-cleanup. Deployment/billing changes need separate concrete authorization.
+session without stopping caller-owned compute.
 
 Inventory (2026-09-29). The pinned SDK's `self_hosted` environment takes
 `workspace_directory` and `capability_directories`. Environment states are

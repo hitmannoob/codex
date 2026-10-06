@@ -203,8 +203,8 @@ async fn public_sessions_save_normalized_history_and_validate_inputs() -> anyhow
         }
         // Unsupported environments name the public types, never the prototype's.
         for (environment, message) in [
-            (json!({"type":"openai_hosted"}), "environment type openai_hosted is not implemented; use none"),
-            (json!({"type":"self_hosted","workspace_directory":"/tmp"}), "environment type self_hosted is not implemented; use none"),
+            (json!({"type":"openai_hosted"}), "environment type openai_hosted is not supported by this service; use none"),
+            (json!({"type":"self_hosted","workspace_directory":"/tmp"}), "environment type self_hosted is not implemented yet; use none"),
             (json!({"type":"local","cwd":"/tmp"}), "environment.type must be none, openai_hosted, or self_hosted"),
             (json!({"type":"none","cwd":"/tmp"}), "environment none takes no other fields"),
         ] {

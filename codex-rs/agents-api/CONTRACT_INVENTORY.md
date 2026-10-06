@@ -117,3 +117,9 @@ Amendments under the same `openai==3.17.0` pin:
   dependencies that the G00 review missed. The change is additive: no existing
   entry changed meaning. `tests/sdk_inventory.py` checks the new resources, and
   `tests/sdk_webhooks.py` validates their responses.
+- 2026-10-06: by project decision, service-managed (`openai_hosted`)
+  environments are not supported. TPL-001..005 (environment templates) and
+  BEH-011 (hosted configuration) leave the parity target. They stay in the
+  inventory with status `missing`, so the SDK diff still covers them, and the
+  API rejects `openai_hosted` as not supported. The parity target is now the
+  rest of the inventory.
