@@ -196,3 +196,37 @@ async fn keyed_batches_run_once_and_interrupted_keys_report_unknown() -> anyhow:
         Ok::<_, anyhow::Error>(())
     }).await?
 }
+
+#[tokio::test]
+async fn cancel_right_after_creation_stops_the_first_turn() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 45), async {
+        let home = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let provider = create_mock_responses_server_repeating_assistant("finished").await;
+        // The first turn's model response takes a minute.
+        Mock::given(body_string_contains("cancel-me-at-once"))
+            .respond_with(ResponseTemplate::new(/*s*/ 200).set_delay(Duration::from_secs(/*secs*/ 60)))
+            .with_priority(/*p*/ 1)
+            .mount(&provider)
+            .await;
+        MockResponsesConfig::new(&provider.uri()).with_root_config("features.plugins = false").write(home.path())?;
+        let api = AgentsApi::new(backend(home.path()).await?, AbsolutePathBuf::from_absolute_path(data.path())?, TOKEN.into()).await?;
+        let (base, _server) = capabilities::serve(&api).await?;
+        let client = reqwest::Client::new();
+        // The session reports in_progress before Codex's turn is recorded; a
+        // cancel then must still stop that turn.
+        let session = request(&client, reqwest::Method::POST, &format!("{base}/agents/sessions"),
+            json!({"agent":{"model":"mock-model"},"environment":{"type":"none"},"input":"cancel-me-at-once"})).await?;
+        assert_eq!(session["status"], "in_progress");
+        let url = format!("{base}/agents/sessions/{}", session["id"].as_str().context("session id")?);
+        let response = client.post(format!("{url}/events")).bearer_auth(TOKEN)
+            .json(&json!({"events":[{"type":"agent.session.input.cancel"}]})).send().await?;
+        let status = response.status();
+        assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{}", response.text().await?);
+        idle(&client, &url, /*expected_turns*/ 1).await?;
+        let turns = request(&client, reqwest::Method::GET, &format!("{url}/turns"), Value::Null).await?;
+        assert_eq!(turns["data"][0]["status"], "cancelled");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}

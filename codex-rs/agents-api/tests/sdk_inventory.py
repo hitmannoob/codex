@@ -3,7 +3,9 @@
 import importlib
 import inspect
 import json
+import re
 import sys
+from pathlib import Path
 
 from openai.types.beta.agent import Agent
 from openai.types.beta.agent_session import AgentSession
@@ -25,6 +27,38 @@ def resource(value):
 
 def normalize(value):
     return "".join(value.split())
+
+
+TEST_ATTRIBUTE = re.compile(
+    r"#\[(?:tokio::)?test\b[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+(\w+)"
+)
+
+
+def check_tests(inventory, crate):
+    """Every implemented row names tests, and each `module::name` is a test
+    function in that module's file."""
+    modules = {}
+    for path in [
+        *crate.glob("src/*.rs"),
+        *crate.glob("tests/*.rs"),
+        *crate.glob("tests/suite/*.rs"),
+    ]:
+        modules.setdefault(path.stem, set()).update(
+            TEST_ATTRIBUTE.findall(path.read_text(encoding="utf-8"))
+        )
+    rows = inventory["operations"] + inventory["behaviors"]
+    for row in rows:
+        if row["status"] == "missing":
+            continue
+        tests = [test for test in re.split(r";\s*", row.get("tests") or "") if test]
+        assert tests, f"{row['id']} names no tests"
+        for test in tests:
+            module, _, name = test.rpartition("::")
+            module = module.split("::")[0]
+            assert name in modules.get(module, set()) or name == "tests", (
+                f"{row['id']}: {test}"
+            )
+    return sum(row["status"] != "missing" for row in rows)
 
 
 def main():
@@ -67,6 +101,8 @@ def main():
         }
         assert actual == expected, (resource_name, sorted(expected), sorted(actual))
 
+    covered = check_tests(inventory, Path(sys.argv[1]).resolve().parent)
+
     Agent.model_validate(fixture("agent_response"))
     AgentSession.model_validate(fixture("session_response"))
     print(
@@ -76,6 +112,7 @@ def main():
                 "sdk_operations": sum(
                     len(value) for value in expected_by_resource.values()
                 ),
+                "rows_with_tests": covered,
             }
         )
     )

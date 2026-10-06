@@ -1402,22 +1402,126 @@ and traceable failures across API, worker, provider, and environment boundaries.
 
 **Outcome:** parity claims are backed by repeatable tests and a closed inventory.
 
-- [ ] Map every G00 inventory entry to a behavior test and evidence. Verify schema
+- [x] Map every G00 inventory entry to a behavior test and evidence. Verify schema
   variants, exact errors, pagination, timestamps, transitions, and size boundaries.
 - [ ] Expand official SDK scenarios to every implemented resource/capability.
   Include raw HTTP fixtures where SDK parsing hides a wire-contract discrepancy.
-- [ ] Run a controlled real-provider suite with explicitly configured credentials
+- [x] Run a controlled real-provider suite with explicitly configured credentials
   and budget. Separate provider-dependent failures from service contract failures.
 - [ ] Run actual supported-platform worker/executor scenarios, including Windows
   shutdown and cross-OS execution. Do not count a macOS pass as Windows evidence.
-- [ ] Exercise concurrent sessions, slow subscribers, process crashes, network
+- [x] Exercise concurrent sessions, slow subscribers, process crashes, network
   interruptions, expired credentials, partial persistence, and resource cleanup.
 - [x] Verify upgrade compatibility for saved configuration/history and any retained
   prototype routes; declare intentional breaking changes explicitly.
-- [ ] Define operational deployment requirements separately: authentication scope,
+- [x] Define operational deployment requirements separately: authentication scope,
   network exposure, secret storage, backup/restore, admission limits, resource
   quotas, health checks, and graceful deployment. Add distributed worker routing
   only if deployment requirements call for it; it is not proof of public parity.
+
+Evidence (2026-10-06, real providers, faults, and operations):
+- **Real-provider suite:** `tests/real_provider.py` runs against a live
+  service.
+  - Provider credentials stay with the worker. The suite takes the service
+    token, a model, a token budget (no scenario starts once sessions' usage
+    reaches it), and optionally a `codex` binary and environment key.
+  - Each scenario is PASS, FAIL (service contract), MODEL (the model did not
+    follow the prompt), or SKIP.
+  - Its first run found two problems. One was in the suite: it sent the
+    Responses API's `name`/`strict` in `text.format`, which the Agents API's
+    format does not have. The other was a real cancel gap (below).
+  - After the fix, `openai/gpt-5-mini` via OpenRouter passed all seven
+    scenarios for 39,594 tokens: plain answer with usage, streamed deltas
+    matching saved text, function tool, structured output, cancel, trace
+    export, and a self-hosted run with the stock `codex exec-server`.
+  - The peer suite in the user's test directory (25 checks on
+    `openai/gpt-5-nano`) passed everything except two checks with stale
+    expectations: they expect `self_hosted` to be rejected and the old
+    `openai_hosted` wording. The subagent case is its known XFAIL.
+- **Lost steering input (fixed):**
+  `concurrency::concurrent_sessions_stay_apart_while_a_subscriber_stalls`
+  (eight sessions × three turns, with a stalled subscriber, then concurrent
+  deletion) failed under load.
+  - Part of it was a test-helper race: `idle()` read status and turns
+    separately, so it now requires every turn finished.
+  - The rest was real. Codex records input that steers a turn after its last
+    model request without answering it (deliberate upstream: a later request
+    retries it). The service accepted such input with 202, and it was never
+    answered.
+  - A root turn that completes on unanswered user input now gets a follow-up
+    turn instead of going idle (`records::unanswered_input`).
+  - `concurrency::input_steered_as_a_turn_ends_is_always_answered` steers
+    eight sessions the moment each answer finishes. It failed 3 of 3 runs
+    without the fix and passes with it.
+- **Early cancel (fixed):** a session created with input reports
+  `in_progress` before Codex reports the turn. A cancel then found no running
+  turn and did nothing.
+  - Codex's turn list cannot help yet, because the rollout is still empty.
+  - The service now remembers each `turn/start` response's turn ID. If Codex
+    refuses the interrupt because the turn is not active yet, the cancel waits
+    until the turn's start is recorded.
+  - `input::cancel_right_after_creation_stops_the_first_turn` failed (the
+    turn ran its full minute) before the fix.
+- **Faults covered elsewhere:**
+  - slow subscribers: `contract_tests::lagged_stream_…`;
+  - process crashes: `runtime_cli::…` and `worker_loss::…`;
+  - network interruptions: `reconnect::…` and
+    `environments::executor_and_worker_loss_…`;
+  - expired credentials: `turns_tests::provider_rejections_…` maps 401/403 to
+    `authentication_error`;
+  - partial persistence: the secret and file startup sweeps, and
+    `upload_tests::…`;
+  - cleanup: `leftover_rows` after deletions.
+- **Operations:** the README's "Operating the service" section covers
+  authentication scope, network exposure, secrets, state and backup,
+  admission limits, resource growth, and deployment.
+  - `GET /healthz` (no token) reports the worker connection.
+  - `worker_loss::store_reads_survive_worker_loss_and_reconnect_restores_service`
+    checks 200 → 503 → 200 across a worker kill and reconnect.
+  - Distributed routing is not provided and is not needed for parity.
+- **Still open:** Windows and cross-OS worker/executor runs. This machine is
+  macOS, and a macOS pass is not Windows evidence.
+
+Evidence (2026-10-06, inventory sweep):
+- **Every implemented row cites tests:** all 67 operation and behavior rows that
+  are not `missing` name tests. `tests/sdk_inventory.py` (run by
+  `contract::pinned_sdk_matches_operation_inventory`) checks that each cited
+  `module::name` is a test function in that module's file. The 16 behavior rows
+  had cited none before this sweep. The 16 missing rows are the excluded
+  hosted-environment templates and the Skills API (hosted `skill_reference`
+  inputs).
+- **Exact errors:**
+  `errors::every_inventoried_operation_answers_with_the_public_error_shape`
+  walks the inventory over raw HTTP.
+  - Every implemented operation answers a missing token with 401.
+  - With the token, placeholder IDs get 404 and empty create bodies get 400;
+    top-level lists succeed.
+  - Every error uses the public `{error:{message,type,param,code}}` shape, and
+    no success does.
+  - Five POSTs validate their body before looking up the resource, and the
+    test names them.
+- **Pagination:** `errors::every_list_bounds_its_pagination` sends every
+  implemented list `limit` 0 and 101, an unknown order, and an unknown cursor,
+  using real parents (an idle self-hosted session and a vault). It confirmed
+  each list follows its documented rule:
+  - Vault, credential, and webhook endpoint lists clamp `limit` ("Values are
+    clamped between 1 and 100").
+  - File lists allow up to 10,000.
+  - Webhook event types take no parameters.
+  - Every other list rejects all four cases.
+- **Size boundaries:**
+  `errors::metadata_limits_hold_on_every_resource_that_takes_metadata` checks
+  16 pairs and 64/512-character keys and values, using multi-byte text, plus
+  one past each limit, on agent, session, and vault creates and updates.
+  Other limits have their own tests:
+  - function results (`functions::…`);
+  - uploads and inline files (`upload_tests::…`,
+    `environments::environment_files_…`);
+  - input batches (`input::…`).
+- **Schema variants and timestamps:** the pinned SDK tests use strict
+  response validation. Every response type, union member, and integer
+  timestamp they touch must parse exactly. Lifecycle transitions have
+  per-feature tests (sessions, streaming, environments, workers).
 
 Evidence (2026-09-29, inventory audit, cleanup, and upgrade baseline):
 

@@ -103,6 +103,16 @@ async fn store_reads_survive_worker_loss_and_reconnect_restores_service() -> any
             session["id"].as_str().context("session id")?
         );
         let saved = completed_turns(&client, &url, /*count*/ 1).await?;
+        // Health needs no credentials and follows the worker connection.
+        let healthz = format!("{}/healthz", base.trim_end_matches("/v1"));
+        let health = |client: &reqwest::Client| {
+            let request = client.get(&healthz).send();
+            async move {
+                let response = request.await?;
+                anyhow::Ok((response.status().as_u16(), response.json::<Value>().await?))
+            }
+        };
+        assert_eq!(health(&client).await?, (200, json!({"status":"ok","worker":"connected"})));
         // Kill the worker out from under the API.
         // SAFETY: this PID belongs to the live worker spawned above.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
@@ -134,11 +144,13 @@ async fn store_reads_survive_worker_loss_and_reconnect_restores_service() -> any
         .await?;
         assert_eq!(after_loss, saved);
         request(&client, reqwest::Method::GET, &url, Value::Null).await?;
+        assert_eq!(health(&client).await?, (503, json!({"status":"degraded","worker":"disconnected"})));
         // Attach a replacement worker; the saved session continues with context.
         first.shutdown().await?;
         let second = worker(home.path()).await?;
         let client2 = runtime::connect(second.socket().clone(), DEADLINE).await?;
         api.reconnect(AppServerClient::Remote(client2)).await?;
+        assert_eq!(health(&client).await?, (200, json!({"status":"ok","worker":"connected"})));
         message(&client, &url, "What code did I ask you to remember?").await?;
         completed_turns(&client, &url, /*count*/ 2).await?;
         let requests = model.received_requests().await.context("model requests")?;

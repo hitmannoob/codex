@@ -169,7 +169,7 @@ pub(crate) async fn resolve_call(
 }
 
 pub(crate) async fn register(
-    state: &State,
+    state: &Arc<State>,
     request_id: &RequestId,
     params: DynamicToolCallParams,
 ) -> anyhow::Result<()> {

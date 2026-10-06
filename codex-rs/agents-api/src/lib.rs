@@ -89,6 +89,12 @@ struct State {
     registry: registry::Registry,
     /// Input waiting for a self-hosted executor to connect.
     waits: environments::Waits,
+    /// Each session's most recently started turn, as (thread ID, turn ID),
+    /// for a cancel that arrives before Codex reports the turn.
+    started_turns: Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Turns cancelled before Codex made them active; interrupted when their
+    /// start is recorded.
+    pending_cancels: Mutex<HashSet<String>>,
     /// Uploaded file contents.
     files: files::Files,
     /// This service's own connections to self-hosted executors, for
@@ -228,6 +234,8 @@ impl AgentsApi {
             webhook_wake: tokio::sync::Notify::new(),
             registry: registry::Registry::default(),
             waits: environments::Waits::default(),
+            started_turns: Mutex::default(),
+            pending_cancels: Mutex::default(),
             files: files::Files(directory.join("files").to_path_buf()),
             executors: codex_exec_server::EnvironmentManager::without_environments(
                 codex_http_client::HttpClientFactory::new(

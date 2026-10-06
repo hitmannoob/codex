@@ -179,7 +179,7 @@ pub(crate) async fn running_turns(
         .bind(id).fetch_all(&state.store.0).await.map_err(anyhow::Error::from).map_err(Into::into)
 }
 
-pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiError> {
+pub(crate) async fn notification(state: &Arc<State>, raw: &Value) -> Result<(), ApiError> {
     let params = &raw["params"];
     let Some(thread_id) = params["threadId"].as_str() else {
         return Ok(());
@@ -213,6 +213,8 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
     let subagent = owner.subagent_id.as_deref();
     // Related records commit together; events are broadcast only afterwards.
     let mut events = Vec::new();
+    let mut follow_up = None;
+    let mut cancelled = None;
     match method {
         "turn/started" | "turn/completed" => {
             let source = &params["turn"];
@@ -259,12 +261,19 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
             if method == "turn/started" {
                 if root {
                     events.extend(transition(&mut tx, &id, "in_progress", /*error*/ None).await?);
+                    if crate::lock(&state.pending_cancels).remove(turn_id) {
+                        cancelled = Some(turn_id.to_owned());
+                    }
                 }
                 events.push(json!({"type":"agent.session.turn.created","session_id":id,"turn_id":turn_id,"turn":turn}));
             }
             events.push(json!({"type":format!("agent.session.turn.{status}"),"session_id":id,"turn_id":turn_id,"turn":turn}));
             if status != "in_progress" && root {
-                events.extend(transition(&mut tx, &id, "idle", /*error*/ None).await?);
+                if status == "completed" && unanswered_input(&mut tx, &id, turn_id).await? {
+                    follow_up = Some(id.clone());
+                } else {
+                    events.extend(transition(&mut tx, &id, "idle", /*error*/ None).await?);
+                }
             }
         }
         "thread/tokenUsage/updated" => {
@@ -418,7 +427,41 @@ pub(crate) async fn notification(state: &State, raw: &Value) -> Result<(), ApiEr
     for event in events {
         emit(state, event);
     }
+    if let Some(turn_id) = cancelled {
+        let state = Arc::clone(state);
+        let interrupt = json!({"threadId": thread_id, "turnId": turn_id});
+        tokio::spawn(async move {
+            if let Err(error) = state.rpc("turn/interrupt", interrupt).await {
+                tracing::warn!(error = error.1, "cancel of a just-started turn failed");
+            }
+        });
+    }
+    if let Some(id) = follow_up {
+        // Not from this task: starting a turn waits on the worker, whose
+        // notifications this task delivers.
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            if let Err(error) = crate::environments::submit(&state, &id, Vec::new()).await {
+                let _ = session_status(&state, &id, "failed", Some(&error.1)).await;
+            }
+        });
+    }
     Ok(())
+}
+
+/// Whether a finished turn ended on user input that came after its model
+/// output. Input that steers a turn after its last model request is recorded
+/// but never answered: Codex leaves it for a later request, so the session
+/// answers it with a follow-up turn instead of going idle.
+async fn unanswered_input(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    turn_id: &str,
+) -> anyhow::Result<bool> {
+    let roles: Vec<Option<String>> = sqlx::query_scalar("SELECT json_extract(data, '$.role') FROM public_records WHERE session_id = ? AND kind = 'item' AND turn_id = ? AND subagent_id IS NULL ORDER BY seq")
+        .bind(session_id).bind(turn_id).fetch_all(&mut **tx).await?;
+    let user = |role: &Option<String>| role.as_deref() == Some("user");
+    Ok(roles.last().is_some_and(user) && roles.iter().any(|role| !user(role)))
 }
 
 /// Lifecycle events for one persisted item, broadcast only after commit.

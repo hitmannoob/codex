@@ -105,6 +105,55 @@ cannot be combined with managed executable/home flags.
 The API listens on `127.0.0.1:4501`. Every request requires
 `Authorization: Bearer $CODEX_AGENTS_API_TOKEN`.
 
+## Operating the service
+
+- **Authentication:** one operator bearer token (at least 32 bytes) grants
+  the whole API; there is no project or user scoping. The environment key
+  grants only the `/registry/` routes executors use, and the worker's harness
+  token never leaves the process. Pass secrets through
+  `CODEX_AGENTS_API_TOKEN`, `CODEX_AGENTS_API_VAULT_PASSPHRASE`, and
+  `CODEX_AGENTS_API_ENVIRONMENT_KEY`. They are hidden from `--help` output
+  and never forwarded to the worker.
+- **Network exposure:** the service listens on `127.0.0.1:4501` by default.
+  To serve other hosts, put it behind a TLS-terminating proxy that sets
+  `x-forwarded-proto: https`; `remote_url` and the registry's websocket URLs
+  follow it. Executors must reach `/registry/`. Service-origin MCP and
+  webhook connections go only to public addresses unless the operator allows
+  a host. Executor-origin traffic uses the caller's network.
+- **Health:** `GET /healthz` needs no token. It answers 200
+  `{"status":"ok","worker":"connected"}`, or 503 with `"degraded"` while the
+  worker is reconnecting; saved records stay readable meanwhile.
+- **State and backup:** everything durable lives in the data directory:
+  - `agents-api.sqlite` (with its WAL) for public records, queues, and
+    metadata;
+  - `secrets/` for age-encrypted credential, webhook, and env values;
+  - `files/` for uploads;
+  - `codex-home/` for the worker's rollouts, which sessions need to resume.
+  Back them up together while the service is stopped. A restore needs the
+  same vault passphrase. One process owns a data directory at a time
+  (`agents-api.lock`).
+- **Admission limits:**
+  - JSON bodies 16 KiB; environment files 5 MiB decoded; uploads 50 MiB,
+    streamed;
+  - 1–32 events per input batch; 10,000-byte function results;
+  - 16 tools and 16 MCP servers per agent; metadata of 16 pairs;
+  - lists of 1–100 (files 1–10,000);
+  - 256 harness sockets per environment and 256 KiB relay frames.
+  Input to one session is serialized. There is no global rate limit or
+  per-tenant quota, so add one at the proxy if you need it.
+- **Resource growth:** uploads stay until deleted or expired, and rollouts
+  and records stay until their session is deleted. Watch the data
+  directory's disk use. One worker serves every session, and there is no
+  distributed routing.
+- **Deployment:** SIGTERM stops accepting requests, then stops the worker
+  after a grace period, interrupting running turns rather than finishing
+  them. On restart:
+  - completed sessions resume;
+  - webhook deliveries are retried;
+  - executors re-register on their own;
+  - input that was waiting for an executor fails its session rather than
+    being replayed.
+
 ## Official-style session path
 
 The SDK sends `OpenAI-Beta: agents=v1`. This selects flattened, tagged-function
@@ -209,6 +258,11 @@ The key deduplicates HTTP requests; it does not make execution exactly-once.
 Input admission is serialized per session: simultaneous inputs to one session
 are applied one at a time, starting or steering its turn, while other sessions
 proceed concurrently. Each Codex thread is resumed once per backend connection.
+Input that steers a turn just as it ends is answered by a follow-up turn:
+Codex records input that arrives after a turn's last model request without
+answering it, so the session starts another turn instead of going idle. A
+cancel sent before Codex has reported the turn it just started (for example,
+right after creating a session with input) still stops that turn.
 
 Deferred functions, tool search, enabled web search, and enabled programmatic
 calling can be saved/retrieved but their execution is rejected. Deferred functions and web search depend on model and

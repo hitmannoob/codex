@@ -232,9 +232,18 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
                 if crate::environments::cancel(state, id).await? {
                     continue;
                 }
-                for (thread_id, turn_id, subagent) in
-                    crate::records::running_turns(state, id).await?
-                {
+                let running = crate::records::running_turns(state, id).await?;
+                // A turn Codex started may not be recorded yet, for example
+                // just after the session was created with input. Stop the
+                // session's last started turn then; Codex refuses if it has
+                // already ended.
+                if running.is_empty() {
+                    let started = crate::lock(&state.started_turns).get(id).cloned();
+                    if let Some((thread_id, turn_id)) = started {
+                        cancel_started_turn(state, id, thread_id, turn_id).await?;
+                    }
+                }
+                for (thread_id, turn_id, subagent) in running {
                     match state
                         .rpc(
                             "turn/interrupt",
@@ -255,6 +264,32 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
                 crate::actions::resolve_call(state, id.to_owned(), turn_id, result).await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Stop a turn Codex started but has not reported. Codex refuses to interrupt
+/// a turn it has not yet made active, so the cancel is then kept until the
+/// turn's start is recorded, which interrupts it.
+async fn cancel_started_turn(
+    state: &State,
+    id: &str,
+    thread_id: String,
+    turn_id: String,
+) -> Result<(), ApiError> {
+    let interrupt = json!({"threadId": thread_id, "turnId": turn_id});
+    if state.rpc("turn/interrupt", interrupt.clone()).await.is_ok() {
+        return Ok(());
+    }
+    crate::lock(&state.pending_cancels).insert(turn_id.clone());
+    // The start may have been recorded meanwhile, or the turn may have ended.
+    let recorded: Option<String> = sqlx::query_scalar("SELECT json_extract(data, '$.status') FROM public_records WHERE session_id = ? AND kind = 'turn' AND id = ?")
+        .bind(id).bind(&turn_id).fetch_optional(&state.store.0).await.map_err(anyhow::Error::from)?;
+    if let Some(status) = recorded
+        && crate::lock(&state.pending_cancels).remove(&turn_id)
+        && status == "in_progress"
+    {
+        state.rpc("turn/interrupt", interrupt).await?;
     }
     Ok(())
 }

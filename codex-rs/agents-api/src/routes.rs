@@ -35,6 +35,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 pub(crate) fn router(state: Arc<State>) -> Router {
     Router::new()
+        .route("/healthz", get(health))
         .route("/v1/agents", post(create_agent).get(list_agents))
         .route(
             "/v1/agents/{id}",
@@ -68,6 +69,18 @@ pub(crate) fn router(state: Arc<State>) -> Router {
         .with_state(state)
 }
 
+/// Liveness and readiness for load balancers, without credentials: 200 while
+/// the worker is connected, 503 while it is not. Saved records stay readable
+/// either way.
+async fn health(Extract(state): Extract<Arc<State>>) -> Response {
+    let (status, worker) = if state.connected() {
+        (StatusCode::OK, "connected")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "disconnected")
+    };
+    (status, Json(json!({"status": if status == StatusCode::OK { "ok" } else { "degraded" }, "worker": worker}))).into_response()
+}
+
 async fn authorize(
     Extract(state): Extract<Arc<State>>,
     request: Request,
@@ -75,7 +88,7 @@ async fn authorize(
 ) -> Result<Response, ApiError> {
     // Executors and the worker's harness present their own credentials, which
     // the registry checks; the API token never reaches them.
-    if request.uri().path().starts_with("/registry/") {
+    if request.uri().path().starts_with("/registry/") || request.uri().path() == "/healthz" {
         return Ok(next.run(request).await);
     }
     // Webhook endpoint requests come from the SDK without the beta header.
@@ -487,7 +500,7 @@ pub(crate) async fn start_turn(
         }
         Err(error) => return Err(error),
     };
-    state
+    let started = state
             .rpc(
                 "turn/start",
                 json!({"threadId": thread_id, "input": items,
@@ -516,7 +529,12 @@ pub(crate) async fn start_turn(
                     },
                 }),
             )
-            .await
+            .await?;
+    // A cancel can arrive before Codex reports this turn started.
+    if let Some(turn_id) = started.pointer("/turn/id").and_then(Value::as_str) {
+        crate::lock(&state.started_turns).insert(id.to_owned(), (thread_id, turn_id.to_owned()));
+    }
+    Ok(started)
 }
 
 async fn turns(

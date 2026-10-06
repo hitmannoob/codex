@@ -151,7 +151,9 @@ async fn until_event(stream: &mut reqwest::Response, kind: &str) -> anyhow::Resu
     }
 }
 
-/// Poll a public session until it is idle with at least `expected_turns` turns.
+/// Poll a public session until it is idle with at least `expected_turns`
+/// turns, all finished. The session and its turns are read separately, so a
+/// turn that started between the reads must not count as done.
 async fn idle(client: &reqwest::Client, url: &str, expected_turns: usize) -> anyhow::Result<Value> {
     loop {
         let session = request(client, reqwest::Method::GET, url, Value::Null).await?;
@@ -164,10 +166,15 @@ async fn idle(client: &reqwest::Client, url: &str, expected_turns: usize) -> any
                     Value::Null,
                 )
                 .await?;
-                if turns["data"]
-                    .as_array()
-                    .is_some_and(|turns| turns.len() >= expected_turns)
-                {
+                if turns["data"].as_array().is_some_and(|turns| {
+                    turns.len() >= expected_turns
+                        && turns.iter().all(|turn| {
+                            matches!(
+                                turn["status"].as_str(),
+                                Some("completed" | "failed" | "cancelled")
+                            )
+                        })
+                }) {
                     return Ok(session);
                 }
                 tokio::time::sleep(Duration::from_millis(/*millis*/ 20)).await;
@@ -472,3 +479,9 @@ mod environments;
 
 #[path = "suite/files.rs"]
 mod files;
+
+#[path = "suite/errors.rs"]
+mod errors;
+
+#[path = "suite/concurrency.rs"]
+mod concurrency;
