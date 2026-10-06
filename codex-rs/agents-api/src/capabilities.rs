@@ -79,6 +79,7 @@ pub(crate) async fn overrides(
     config: &AgentConfig,
     environment: &Environment,
     mcp_tokens: &std::collections::BTreeMap<String, String>,
+    stdio_env: &crate::stdio_env::Values,
 ) -> Result<Value, ApiError> {
     if matches!(config.service_tier.as_deref(), Some("priority" | "fast")) {
         let mut cursor = Value::Null;
@@ -165,7 +166,12 @@ pub(crate) async fn overrides(
         Environment::SelfHosted { id, .. } => Some(id.as_str()),
         Environment::None | Environment::Local { .. } => None,
     };
-    servers.extend(crate::mcp::overrides(config, mcp_tokens, environment_id));
+    servers.extend(crate::mcp::overrides(
+        config,
+        mcp_tokens,
+        stdio_env,
+        environment_id,
+    ));
     // Codex's V2 multi-agent runtime counts the root thread toward its cap, so
     // it gets one more thread than the public subagent limit.
     let multi_agent = match &config.multi_agent {
@@ -191,6 +197,26 @@ pub(crate) async fn overrides(
     });
     if let Some(effort) = config.reasoning.as_ref().and_then(|r| r.effort.as_ref()) {
         overrides["model_reasoning_effort"] = json!(effort);
+    }
+    // Plugins in the caller's capability directories need Codex plugins on.
+    // Plugins the worker's own configuration installs stay off, like its other
+    // MCP sources, and so do remote plugins.
+    if let Environment::SelfHosted {
+        capability_directories,
+        ..
+    } = environment
+        && !capability_directories.is_empty()
+    {
+        overrides["features.plugins"] = json!(true);
+        overrides["features.remote_plugin"] = json!(false);
+        overrides["plugins"] = effective
+            .pointer("/config/plugins")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(id, _)| (id.clone(), json!({"enabled": false})))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
     }
     Ok(overrides)
 }

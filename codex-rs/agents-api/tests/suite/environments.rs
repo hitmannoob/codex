@@ -127,8 +127,16 @@ async fn self_hosted_input_waits_for_the_executor_and_runs_in_its_workspace() ->
         std::fs::write(capabilities_path.join("workspace-demo/SKILL.md"),
             "---\nname: workspace-demo\ndescription: Demonstrates capability directories\n---\nUse it.\n")?;
         let capability_directory = capabilities_path.to_str().context("capabilities path")?;
+        // So does a plugin's skill, from a plugin root.
+        let plugin_path = workspace_path.join("plugin-demo");
+        std::fs::create_dir_all(plugin_path.join(".codex-plugin"))?;
+        std::fs::create_dir_all(plugin_path.join("skills/plugin-skill"))?;
+        std::fs::write(plugin_path.join(".codex-plugin/plugin.json"), r#"{"name":"plugin-demo","interface":{"displayName":"Plugin Demo"}}"#)?;
+        std::fs::write(plugin_path.join("skills/plugin-skill/SKILL.md"),
+            "---\nname: plugin-only-skill\ndescription: Comes from a plugin root\n---\nUse it.\n")?;
+        let plugin_directory = plugin_path.to_str().context("plugin path")?;
         let create = json!({"agent":{"model":"mock-model"},
-            "environment":{"type":"self_hosted","workspace_directory":workspace_directory,"capability_directories":[capability_directory]}});
+            "environment":{"type":"self_hosted","workspace_directory":workspace_directory,"capability_directories":[capability_directory, plugin_directory]}});
 
         // Self-hosted environments need the operator's environment key.
         let disabled = client.post(&sessions).bearer_auth(TOKEN).json(&create).send().await?;
@@ -139,12 +147,13 @@ async fn self_hosted_input_waits_for_the_executor_and_runs_in_its_workspace() ->
         let session = request(&client, reqwest::Method::POST, &sessions, create).await?;
         let environment_id = session["environment"]["id"].as_str().context("environment id")?.to_owned();
         let environment = json!({"id":environment_id,"type":"self_hosted","workspace_directory":workspace_directory,
-            "capability_directories":[capability_directory],"remote_url":format!("{origin}/registry")});
+            "capability_directories":[capability_directory, plugin_directory],"remote_url":format!("{origin}/registry")});
         assert_eq!((&session["status"], &session["environment"]), (&json!("idle"), &environment));
-        assert_eq!(
-            request(&client, reqwest::Method::GET, &format!("{base}/agents/environments/{environment_id}"), Value::Null).await?,
-            environment
-        );
+        let info = |status: &str| json!({"id":environment_id,"object":"agent.environment","type":"self_hosted",
+            "status":status,"files":[],"plugins":[],"skills":[]});
+        let environment_url = format!("{base}/agents/environments/{environment_id}");
+        let retrieve = || request(&client, reqwest::Method::GET, &environment_url, Value::Null);
+        assert_eq!(retrieve().await?, info("pending"));
 
         // Input waits behind an environment_connection action until the
         // executor connects, then runs its command in the workspace.
@@ -163,9 +172,11 @@ async fn self_hosted_input_waits_for_the_executor_and_runs_in_its_workspace() ->
         ]);
         let reported = std::fs::read_to_string(workspace_path.join("where.txt"))?;
         assert_eq!(std::fs::canonicalize(reported.trim())?, workspace_path);
+        assert_eq!(retrieve().await?, info("connected"));
         let first = provider.received_requests().await.context("requests")?.into_iter().next().context("model request")?;
         let offered = String::from_utf8_lossy(&first.body).into_owned();
         assert!(offered.contains("workspace-demo"), "the skill was not offered");
+        assert!(offered.contains("plugin-only-skill"), "the plugin's skill was not offered");
         let command = command_item(&client, &url, "where-call").await?;
         assert_eq!(
             (&command["status"], &command["exit_code"], &command["cwd"], command["output"].as_str().map(str::trim)),
@@ -176,6 +187,7 @@ async fn self_hosted_input_waits_for_the_executor_and_runs_in_its_workspace() ->
         // cancelled without starting a turn.
         running.abort();
         until_event(&mut stream, "agent.session.environment.disconnected").await?;
+        assert_eq!(retrieve().await?, info("disconnected"));
         assert_eq!(send(&client, &url, message("still there?")).await?, reqwest::StatusCode::ACCEPTED);
         assert_eq!(send(&client, &url, json!({"type":"agent.session.input.cancel"})).await?, reqwest::StatusCode::ACCEPTED);
         let cancelled = idle(&client, &url, /*expected_turns*/ 1).await?;
@@ -386,13 +398,13 @@ async fn environment_files_are_written_and_listed_inside_the_workspace() -> anyh
 }
 
 /// A minimal stdio MCP server: answers initialize, lists one tool, and reports
-/// its working directory when called.
+/// its working directory and `FIXTURE_SECRET` when called.
 const STDIO_MCP: &str = r#"while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"stdio-fixture","version":"1"}}}\n' "$id" ;;
     *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"where","description":"Report the directory","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" ;;
-    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"stdio-in-%s"}]}}\n' "$id" "$(pwd)" ;;
+    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"stdio-in-%s-with-%s"}]}}\n' "$id" "$(pwd)" "$FIXTURE_SECRET" ;;
   esac
 done
 "#;
@@ -428,9 +440,23 @@ async fn mcp_servers_run_on_the_executor() -> anyhow::Result<()> {
             "allowed_tools":["lookup"],"transport":{"type":"http","server_url":mcp_url,"headers":{"x-tenant":"acme"}}})];
         if stdio {
             tools.push(json!({"type":"mcp","server_label":"local","allowed_tools":["where"],
-                "transport":{"type":"stdio","command":"/bin/sh","args":["server.sh"],"cwd":workspace_directory}}));
+                "transport":{"type":"stdio","command":"/bin/sh","args":["server.sh"],"cwd":workspace_directory,
+                    "env":{"FIXTURE_SECRET":"s3cret-value"}}}));
         }
         let agent = json!({"model":"mock-model","tools":tools});
+        let agents = format!("{base}/agents");
+        let beta = |builder: reqwest::RequestBuilder| builder.bearer_auth(TOKEN).header("OpenAI-Beta", "agents=v1");
+
+        // Literal env values are secrets: they need the vault store, are
+        // never returned, and travel only to the executor.
+        if stdio {
+            let disabled = beta(client.post(&agents)).json(&agent).send().await?;
+            assert_eq!(disabled.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+            api.configure_vault("test-vault-passphrase-for-stdio-env-values".into()).await?;
+        }
+        let saved: Value = beta(client.post(&agents)).json(&agent).send().await?.error_for_status()?.json().await?;
+        let read: Value = beta(client.get(format!("{agents}/{}", saved["id"].as_str().context("agent id")?))).send().await?.error_for_status()?.json().await?;
+        assert!(!read.to_string().contains("s3cret-value") && !saved.to_string().contains("s3cret-value"), "{read}");
 
         // Executor-run servers need a self-hosted environment.
         let refused = client.post(&sessions).bearer_auth(TOKEN).header("OpenAI-Beta", "agents=v1")
@@ -438,8 +464,9 @@ async fn mcp_servers_run_on_the_executor() -> anyhow::Result<()> {
         assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
         assert_eq!(refused.json::<Value>().await?["error"]["message"], "stdio and environment-origin MCP servers need a self_hosted environment");
 
-        let session = request(&client, reqwest::Method::POST, &sessions, json!({"agent":agent,
+        let session = request(&client, reqwest::Method::POST, &sessions, json!({"agent_id":saved["id"],
             "environment":{"type":"self_hosted","workspace_directory":workspace_directory}})).await?;
+        assert!(!session.to_string().contains("s3cret-value"), "{session}");
         let environment_id = session["environment"]["id"].as_str().context("environment id")?.to_owned();
         let url = format!("{sessions}/{}", session["id"].as_str().context("session id")?);
         let mut stream = client.get(format!("{url}/events")).bearer_auth(TOKEN).send().await?.error_for_status()?;
@@ -458,8 +485,121 @@ async fn mcp_servers_run_on_the_executor() -> anyhow::Result<()> {
         let output = |call: &str| outputs.iter().find(|(id, _)| id == call).map(|(_, output)| output.clone()).unwrap_or_default();
         assert!(output("http-call").contains("mcp-result-731"), "{outputs:?}");
         if stdio {
-            assert!(output("stdio-call").contains(&format!("stdio-in-{workspace_directory}")), "{outputs:?}");
+            assert!(output("stdio-call").contains(&format!("stdio-in-{workspace_directory}-with-s3cret-value")), "{outputs:?}");
         }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+/// The operator's connection wait (one second here, five minutes by default)
+/// bounds how long input waits for an executor.
+#[tokio::test]
+async fn input_waiting_past_the_connection_wait_fails_the_session() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 60), async {
+        let home = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let workspace_directory = workspace.path().to_str().context("workspace path")?.to_owned();
+        let provider = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+        MockResponsesConfig::new(&provider.uri()).with_root_config("features.plugins = false").write(home.path())?;
+        let api = AgentsApi::new(backend(home.path()).await?, AbsolutePathBuf::from_absolute_path(data.path())?, TOKEN.into()).await?;
+        let (base, _server) = capabilities::serve(&api).await?;
+        api.configure_environments(ENVIRONMENT_KEY.into(), format!("{}/registry", base.trim_end_matches("/v1")))?;
+        api.set_environment_connection_wait(Duration::from_secs(/*secs*/ 1));
+        let client = reqwest::Client::new();
+        let session = request(&client, reqwest::Method::POST, &format!("{base}/agents/sessions"), json!({"agent":{"model":"mock-model"},
+            "environment":{"type":"self_hosted","workspace_directory":workspace_directory}})).await?;
+        let environment_id = session["environment"]["id"].clone();
+        let url = format!("{base}/agents/sessions/{}", session["id"].as_str().context("session id")?);
+        let mut stream = client.get(format!("{url}/events")).bearer_auth(TOKEN).send().await?.error_for_status()?;
+        let started = std::time::Instant::now();
+        assert_eq!(send(&client, &url, message("anyone there?")).await?, reqwest::StatusCode::ACCEPTED);
+        let events = until_event(&mut stream, "agent.session.environment.failed").await?;
+        assert!(started.elapsed() >= Duration::from_secs(/*secs*/ 1), "{:?}", started.elapsed());
+        let timed_out = "the environment did not connect in time; the input waiting for it was dropped";
+        assert_eq!(lifecycle(&events), vec!["agent.session.requires_action", "agent.session.environment.failed"]);
+        assert_eq!(events.last().map(|event| &event["environment"]), Some(&json!({"id":environment_id,"type":"self_hosted",
+            "status":"failed","error":{"type":"environment_error","code":"environment_connection_timeout","message":timed_out}})));
+        let failed = request(&client, reqwest::Method::GET, &url, Value::Null).await?;
+        assert_eq!((&failed["status"], &failed["error"], &failed["required_actions"]), (&json!("failed"), &json!(timed_out), &json!([])));
+        let turns = request(&client, reqwest::Method::GET, &format!("{url}/turns"), Value::Null).await?;
+        assert_eq!(turns["data"], json!([]));
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires CODEX_AGENTS_API_SDK_PYTHON pointing to a Python with openai==3.17.0"]
+async fn official_sdk_self_hosted_environment() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 120), async {
+        let python = std::env::var("CODEX_AGENTS_API_SDK_PYTHON")?;
+        let script = codex_utils_cargo_bin::find_resource!("tests/sdk_environments.py")?;
+        let home = tempfile::tempdir()?;
+        let data = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let workspace_path = workspace.path().canonicalize()?;
+        let workspace_directory = workspace_path.to_str().context("workspace path")?;
+        let provider = create_mock_responses_server_sequence_unchecked(vec![
+            create_command_execution_sse_response(
+                shell("echo sdk"),
+                /*workdir*/ None,
+                Some(/*timeout_ms*/ 10_000),
+                "sdk-command",
+            )?,
+            create_final_assistant_message_sse_response("done")?,
+        ])
+        .await;
+        MockResponsesConfig::new(&provider.uri())
+            .with_root_config("features.plugins = false")
+            .write(home.path())?;
+        let api = AgentsApi::new(
+            backend(home.path()).await?,
+            AbsolutePathBuf::from_absolute_path(data.path())?,
+            TOKEN.into(),
+        )
+        .await?;
+        let (base, _server) = capabilities::serve(&api).await?;
+        let origin = base.trim_end_matches("/v1").to_owned();
+        api.configure_environments(ENVIRONMENT_KEY.into(), format!("{origin}/registry"))?;
+        api.set_environment_connection_wait(Duration::from_secs(/*secs*/ 60));
+        let client = reqwest::Client::new();
+        let session = request(
+            &client,
+            reqwest::Method::POST,
+            &format!("{base}/agents/sessions"),
+            json!({"agent":{"model":"mock-model"},
+            "environment":{"type":"self_hosted","workspace_directory":workspace_directory}}),
+        )
+        .await?;
+        let session_id = session["id"].as_str().context("session id")?.to_owned();
+        let environment_id = session["environment"]["id"]
+            .as_str()
+            .context("environment id")?
+            .to_owned();
+        let mut stream = client
+            .get(format!("{base}/agents/sessions/{session_id}/events"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await?
+            .error_for_status()?;
+        let _running = executor(&format!("{origin}/registry"), &environment_id)?;
+        until_event(&mut stream, "agent.session.environment.connected").await?;
+        let output = tokio::process::Command::new(&python)
+            .arg(&script)
+            .arg(&base)
+            .arg(&session_id)
+            .arg(workspace_directory)
+            .kill_on_drop(/*kill_on_drop*/ true)
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok::<_, anyhow::Error>(())
     })
     .await?

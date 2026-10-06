@@ -892,9 +892,9 @@ Implement self-hosted attachment first:
 - [x] Persist session-to-environment bindings. Route execution to the attached
   executor; do not assume the HTTP host, app-server, and executor share an OS or
   filesystem.
-- [ ] Authenticate attachment and enforce workspace/path boundaries using the
+- [x] Authenticate attachment and enforce workspace/path boundaries using the
   appropriate URI/path types for remote execution.
-- [ ] Handle executor loss independently from model/worker loss. Report command
+- [x] Handle executor loss independently from model/worker loss. Report command
   outcomes and allow reconnection only as specified; never blindly replay a
   potentially side-effecting command.
 
@@ -963,11 +963,67 @@ environments only, in stages:
    `environment_connection`, a command writes `pwd` into the workspace, loss is
    reported and later input waits again, cancel drops it, and deletion leaves no
    rows. The pinned SDK models accept the session, action, and event shapes.
-4. Remaining: executor loss during a running command, re-attachment after a
-   worker restart, path boundaries, a timeout test (the five-minute wait is a
-   constant).
-5. Remaining: environment files (ENV-002/003), stdio and environment-origin
-   MCP, and `capability_directories`.
+4. Executor and worker loss.
+   `environments::executor_and_worker_loss_never_replay_commands_and_recover`:
+   - The executor dies mid-command. Codex tries for 25 seconds to resume the
+     exec session, then gives the model `exec_command failed: … recovery timed
+     out`. The `command_execution` item is `failed`, and the command never
+     runs again (its marker file has one line).
+   - A new executor and a replaced worker then continue in the same workspace.
+     This needed two fixes:
+     - `thread/resume` keeps neither the environment selection nor the
+       sandbox, so every self-hosted `turn/start` names the environment.
+     - Resume passes the same sandbox and approval policy as `thread/start`
+       (this also corrects `none` sessions, which fell back to the worker's
+       default sandbox after a resume).
+   - A service restart fails input that was waiting, and the restored watcher
+     reports the next connection.
+   Commands are published as `command_execution` items (with output deltas
+   when Codex emits them) and export as `execute_tool` spans. Path boundaries:
+   - Commands run unsandboxed. The caller's compute is the boundary, matching
+     the guide's note that agent code can read the environment key.
+   - The API enforces the workspace boundary for environment files, using
+     `PathUri` so POSIX and Windows executors parse on any service host.
+   - The five-minute wait has no test; it is a fixed constant.
+5. Environment files, MCP on the executor, and capability directories.
+   - The service attaches its own exec-server client through the registry
+     (`src/environment_files.rs`), so files never pass through the worker.
+     `fs/*` in app-server reaches only the worker's host.
+   - Stdio MCP servers and environment-origin HTTP servers are configured
+     with Codex's `mcp_servers.<label>.environment_id`.
+   - `capability_directories` become `thread/start.selectedCapabilityRoots`.
+   - Tests:
+     - `environments::environment_files_are_written_and_listed_inside_the_workspace`
+     - `environments::mcp_servers_run_on_the_executor`, which runs a POSIX `sh`
+       stdio server (skipped on Windows) plus a loopback HTTP server the
+       operator never allowed;
+     - the first test, which checks that a skill from a capability directory
+       reaches the model (and fails without the roots).
+   - Follow-ups (2026-10-06):
+     - A minimal Files API (`src/files.rs`, `files::files_upload_list_download_and_delete`)
+       backs `file_id` environment files, including a 6 MiB copy across the
+       relay.
+     - Literal stdio `env` values are taken out of agent configuration and kept
+       encrypted in the vault store (`src/stdio_env.rs`). Sessions copy them at
+       creation, and they are never returned.
+     - Plugins in capability directories load with `features.plugins` on for
+       those sessions only. Plugins configured in the worker's home are
+       switched off, and remote plugins too. That rule has no test, because it
+       would need a plugin installed in the worker's home.
+     - The connection wait is an operator setting
+       (`--environment-connection-wait-secs`, default 300), so
+       `environments::input_waiting_past_the_connection_wait_fails_the_session`
+       runs it at one second. Tokio's paused clock cannot be used, because it
+       also advances SQLite's pool timeouts.
+     - `environments::official_sdk_self_hosted_environment` drives sessions,
+       environments, environment files, and the Files API through the pinned
+       SDK. It found that `environments.retrieve` returns `EnvironmentInfo`
+       (with status), not the session's environment object, and that is now
+       fixed.
+     - Real provider: `openai/gpt-5-mini` via OpenRouter with the stock
+       `codex exec-server --remote` binary. It read a CSV written through the
+       files API, ran `awk` on the executor, wrote `result.txt`, and answered
+       correctly. Stopping the executor reported `disconnected`.
 
 ## G10 — Files and artifacts
 

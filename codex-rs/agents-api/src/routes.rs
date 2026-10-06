@@ -133,6 +133,14 @@ async fn create_agent(
     } else {
         (None, Default::default())
     };
+    let stdio_env = if compatible {
+        crate::stdio_env::take(&mut value)?.unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    if !stdio_env.is_empty() && !state.secrets.configured() {
+        return Err(stdio_env_disabled());
+    }
     let config: AgentConfig = if compatible {
         crate::contract::configure(AgentConfig::default(), value)?
     } else {
@@ -149,11 +157,24 @@ async fn create_agent(
     }
     crate::capabilities::validate(&config)?;
     let agent = state.store.create_agent(config, name, metadata).await?;
+    if let Err(error) =
+        crate::stdio_env::save(&state, crate::stdio_env::agent_name(&agent.id), &stdio_env).await
+    {
+        state.store.delete_agent(&agent.id).await?;
+        return Err(error);
+    }
     Ok(if compatible {
         Json(public_agent(&agent)).into_response()
     } else {
         (StatusCode::CREATED, Json(agent)).into_response()
     })
+}
+
+fn stdio_env_disabled() -> ApiError {
+    ApiError(
+        StatusCode::NOT_IMPLEMENTED,
+        "stdio MCP env values require the operator to configure a vault passphrase; use env_vars to inherit them from the executor".into(),
+    )
 }
 
 async fn read_agent(
@@ -256,6 +277,10 @@ async fn update_agent(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "agent not found".into()))?;
     let (name, metadata) =
         take_agent_details(&mut patch, previous.name.clone(), previous.metadata.clone())?;
+    let stdio_env = crate::stdio_env::take(&mut patch)?;
+    if stdio_env.as_ref().is_some_and(|values| !values.is_empty()) && !state.secrets.configured() {
+        return Err(stdio_env_disabled());
+    }
     let config = crate::contract::configure(previous.config.clone(), patch)?;
     let mut updated = previous.clone();
     updated.config = config;
@@ -268,6 +293,10 @@ async fn update_agent(
             "agent changed during update".into(),
         ));
     }
+    // New tools replace the old ones, and their values with them.
+    if let Some(values) = stdio_env {
+        crate::stdio_env::save(&state, crate::stdio_env::agent_name(&id), &values).await?;
+    }
     Ok(Json(public_agent(&updated)))
 }
 
@@ -278,6 +307,10 @@ async fn delete_agent(
     if !state.store.delete_agent(&id).await? {
         return Err(ApiError(StatusCode::NOT_FOUND, "agent not found".into()));
     }
+    state
+        .secrets
+        .discard(vec![crate::stdio_env::agent_name(&id)])
+        .await;
     Ok(Json(
         json!({"id":id,"object":"agent.deleted","deleted":true}),
     ))
@@ -343,9 +376,15 @@ pub(crate) async fn start_turn(
     let Json(session) = read_session(Extract(Arc::clone(state)), Path(id.to_owned())).await?;
     crate::configuration::validate_execution(&session.agent.config, &session.environment)?;
     let tokens = crate::credentials::load(state, id).await?;
-    let config =
-        crate::capabilities::overrides(state, &session.agent.config, &session.environment, &tokens)
-            .await?;
+    let stdio_env = crate::stdio_env::load(state, crate::stdio_env::session_name(id)).await?;
+    let config = crate::capabilities::overrides(
+        state,
+        &session.agent.config,
+        &session.environment,
+        &tokens,
+        &stdio_env,
+    )
+    .await?;
     let loaded = state.loaded_threads()?;
     if let Environment::SelfHosted { id, .. } = &session.environment {
         crate::environments::attach(state, id).await?;

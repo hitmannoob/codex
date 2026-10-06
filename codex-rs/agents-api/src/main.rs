@@ -52,6 +52,10 @@ struct Args {
     /// the API. Self-hosted environments are unavailable without it.
     #[arg(long, env = "CODEX_AGENTS_API_ENVIRONMENT_KEY", hide_env_values = true)]
     environment_key: Option<String>,
+    /// Seconds that input waits for a disconnected self-hosted executor before
+    /// it is dropped and the session fails.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    environment_connection_wait_secs: u64,
     /// OTLP/HTTP collector base URL (for example `http://localhost:4318`) that
     /// receives the API's spans and metrics. Nothing is exported without it.
     #[arg(long, env = "CODEX_AGENTS_API_OTLP_ENDPOINT")]
@@ -147,6 +151,9 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             api.configure_environments(environment_key, format!("http://{local}/registry"))?;
+            api.set_environment_connection_wait(std::time::Duration::from_secs(
+                args.environment_connection_wait_secs,
+            ));
         }
         eprintln!("agents-api listening on {}", listener.local_addr()?);
         let (stop_http, stopping_http) = tokio::sync::oneshot::channel();

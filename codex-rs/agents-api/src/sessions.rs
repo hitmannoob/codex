@@ -260,6 +260,10 @@ pub(crate) async fn delete(
     tx.commit().await.map_err(anyhow::Error::from)?;
     drop(admission);
     crate::credentials::forget(&state, &id, credential_labels).await;
+    state
+        .secrets
+        .discard(vec![crate::stdio_env::session_name(&id)])
+        .await;
     if let Some(environment_id) = &environment_id {
         crate::environments::forget(&state, environment_id).await;
     }

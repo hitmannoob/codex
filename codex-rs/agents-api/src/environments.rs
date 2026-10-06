@@ -27,18 +27,32 @@ use std::sync::Weak;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// How long input waits for a disconnected executor.
+/// How long input waits for a disconnected executor unless the operator
+/// chooses otherwise: the contract's five minutes.
 const CONNECTION_WAIT: Duration = Duration::from_secs(5 * 60);
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_CAPABILITY_DIRECTORIES: usize = 32;
 const TIMED_OUT: &str =
-    "the environment did not connect within five minutes; the input waiting for it was dropped";
+    "the environment did not connect in time; the input waiting for it was dropped";
 const RESTARTED: &str =
     "the service restarted while input waited for the environment; that input was dropped";
 
-/// Input held while a session's executor is offline, by session ID.
-#[derive(Default)]
-pub(crate) struct Waits(Mutex<HashMap<String, Wait>>);
+/// Input held while a session's executor is offline.
+pub(crate) struct Waits {
+    /// Waiting input by session ID.
+    inputs: Mutex<HashMap<String, Wait>>,
+    /// How long input waits for the executor.
+    pub(crate) limit: Mutex<Duration>,
+}
+
+impl Default for Waits {
+    fn default() -> Self {
+        Self {
+            inputs: Mutex::default(),
+            limit: Mutex::new(CONNECTION_WAIT),
+        }
+    }
+}
 
 struct Wait {
     inputs: VecDeque<Vec<Value>>,
@@ -135,19 +149,21 @@ pub(crate) async fn exists(state: &State, environment_id: &str) -> anyhow::Resul
     )
 }
 
+/// An environment's safe metadata and connection status. Installed files,
+/// plugins, and skills describe hosted environments; a self-hosted one has none.
 pub(crate) async fn retrieve(
     Extract(state): Extract<Arc<State>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let data: Option<String> = sqlx::query_scalar("SELECT data FROM environments WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.store.0)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let data =
-        data.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "environment not found".into()))?;
+    if !exists(&state, &id).await? {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "environment not found".into(),
+        ));
+    }
     Ok(Json(
-        serde_json::from_str(&data).map_err(anyhow::Error::from)?,
+        json!({"id": id, "object": "agent.environment", "type": "self_hosted",
+            "status": state.registry.status(&id), "files": [], "plugins": [], "skills": []}),
     ))
 }
 
@@ -256,7 +272,7 @@ pub(crate) async fn submit(
     let connected = *state.registry.watch(&environment_id).borrow() == ExecutorState::Connected;
     let generation = state.registry.next_connection();
     let ready = {
-        let mut waits = crate::lock(&state.waits.0);
+        let mut waits = crate::lock(&state.waits.inputs);
         if let Some(wait) = waits.get_mut(session_id) {
             // Earlier input is still waiting or starting; keep the order.
             wait.inputs.push_back(items);
@@ -305,14 +321,16 @@ pub(crate) async fn submit(
 /// Wait for the executor, then start the held input in order, or drop it when
 /// the wait times out.
 async fn wait(state: Weak<State>, session_id: String, environment_id: String, generation: u64) {
-    let Some(mut executor) = state
-        .upgrade()
-        .map(|state| state.registry.watch(&environment_id))
-    else {
+    let Some((mut executor, limit)) = state.upgrade().map(|state| {
+        (
+            state.registry.watch(&environment_id),
+            *crate::lock(&state.waits.limit),
+        )
+    }) else {
         return;
     };
     let connected = tokio::time::timeout(
-        CONNECTION_WAIT,
+        limit,
         executor.wait_for(|executor| *executor == ExecutorState::Connected),
     )
     .await
@@ -328,7 +346,7 @@ async fn wait(state: Weak<State>, session_id: String, environment_id: String, ge
     };
     let admission = state.input_gates.lock(&session_id).await;
     {
-        let mut waits = crate::lock(&state.waits.0);
+        let mut waits = crate::lock(&state.waits.inputs);
         // A cancel already dropped this input.
         if !current(&waits) {
             return;
@@ -357,7 +375,7 @@ async fn wait(state: Weak<State>, session_id: String, environment_id: String, ge
     // Input arriving meanwhile joins the queue, so it starts after this.
     loop {
         let items = {
-            let mut waits = crate::lock(&state.waits.0);
+            let mut waits = crate::lock(&state.waits.inputs);
             if !current(&waits) {
                 return;
             }
@@ -373,7 +391,7 @@ async fn wait(state: Weak<State>, session_id: String, environment_id: String, ge
             }
         };
         if let Err(error) = crate::routes::start_turn(&state, &session_id, items).await {
-            crate::lock(&state.waits.0).remove(&session_id);
+            crate::lock(&state.waits.inputs).remove(&session_id);
             let _ =
                 crate::records::session_status(&state, &session_id, "failed", Some(&error.1)).await;
             return;
@@ -411,7 +429,9 @@ async fn settle(
 /// Returns whether any input was waiting.
 pub(crate) async fn cancel(state: &State, session_id: &str) -> Result<bool, ApiError> {
     let _admission = state.input_gates.lock(session_id).await;
-    let waiting = crate::lock(&state.waits.0).remove(session_id).is_some();
+    let waiting = crate::lock(&state.waits.inputs)
+        .remove(session_id)
+        .is_some();
     if waiting {
         settle(state, session_id, Some(("idle", /*error*/ None))).await?;
     }

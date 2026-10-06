@@ -19,6 +19,7 @@ mod resources;
 mod routes;
 mod secrets;
 mod sessions;
+mod stdio_env;
 mod store;
 mod streaming;
 mod subagents;
@@ -358,6 +359,12 @@ impl AgentsApi {
         );
         self.state.registry.configure(environment_key, registry_url);
         Ok(())
+    }
+
+    /// How long input waits for a self-hosted executor to connect before it is
+    /// dropped. The contract's five minutes is the default.
+    pub fn set_environment_connection_wait(&self, wait: std::time::Duration) {
+        *lock(&self.state.waits.limit) = wait;
     }
 
     /// Allow public MCP servers on these hosts even when they resolve to

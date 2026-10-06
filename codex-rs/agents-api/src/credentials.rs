@@ -185,6 +185,18 @@ pub(crate) async fn sweep(state: &State, stored: Vec<String>) -> anyhow::Result<
     {
         referenced.insert(snapshot_name(&session_id, &label));
     }
+    for id in sqlx::query_scalar::<_, String>("SELECT id FROM agents")
+        .fetch_all(pool)
+        .await?
+    {
+        referenced.insert(crate::stdio_env::agent_name(&id));
+    }
+    for id in sqlx::query_scalar::<_, String>("SELECT id FROM sessions")
+        .fetch_all(pool)
+        .await?
+    {
+        referenced.insert(crate::stdio_env::session_name(&id));
+    }
     for id in sqlx::query_scalar::<_, String>("SELECT id FROM webhook_endpoints")
         .fetch_all(pool)
         .await?

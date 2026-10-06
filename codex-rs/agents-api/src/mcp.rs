@@ -341,6 +341,7 @@ pub(crate) fn public(address: &IpAddr) -> bool {
 pub(crate) fn overrides(
     config: &AgentConfig,
     tokens: &BTreeMap<String, String>,
+    stdio_env: &crate::stdio_env::Values,
     environment_id: Option<&str>,
 ) -> Map<String, Value> {
     servers(config)
@@ -372,6 +373,9 @@ pub(crate) fn overrides(
                         .iter()
                         .map(|name| json!({"name": name, "source": "remote"}))
                         .collect();
+                    if let Some(values) = stdio_env.get(server.label) {
+                        entry["env"] = json!(values);
+                    }
                 }
             }
             if !matches!(server.endpoint, Endpoint::Service { .. }) {

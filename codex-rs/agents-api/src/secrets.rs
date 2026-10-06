@@ -94,7 +94,8 @@ impl Secrets {
     /// Remove the secrets of records already deleted. If that fails, for
     /// example without a passphrase, the startup sweep removes them later.
     pub(crate) async fn discard(&self, names: Vec<String>) {
-        if names.is_empty() {
+        // Nothing was stored without a passphrase.
+        if names.is_empty() || !self.configured() {
             return;
         }
         if let Err(error) = self.delete(names).await {
@@ -120,6 +121,11 @@ impl Secrets {
                 .await
                 .map_err(anyhow::Error::from)??,
         )
+    }
+
+    /// Whether the operator supplied a passphrase.
+    pub(crate) fn configured(&self) -> bool {
+        self.0.get().is_some()
     }
 
     pub(crate) async fn set(&self, name: String, value: Value) -> Result<(), ApiError> {

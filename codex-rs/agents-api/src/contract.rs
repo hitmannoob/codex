@@ -164,6 +164,7 @@ async fn create(
         return Err(invalid("input is required when environment.type is none"));
     }
     let metadata = crate::configuration::metadata(params.metadata)?;
+    let saved_agent = params.agent_id.clone();
     let mut saved = match params.agent_id {
         Some(id) => state
             .store
@@ -185,12 +186,39 @@ async fn create(
     {
         saved.name = serde_json::from_value(name).map_err(|e| invalid(e.to_string()))?;
     }
+    // Supplied tools replace the saved agent's, and their env values with them.
+    let mut stdio_env = match (crate::stdio_env::take(&mut patch)?, &saved_agent) {
+        (Some(values), _) => values,
+        (None, Some(agent_id)) => {
+            crate::stdio_env::load(&state, crate::stdio_env::agent_name(agent_id)).await?
+        }
+        (None, None) => Default::default(),
+    };
     saved.config = configure(saved.config, patch)?;
+    stdio_env.retain(|label, _| {
+        saved.config.tools.iter().any(|tool| {
+            matches!(tool, crate::agent_tools::Tool::Capability(crate::agent_tools::CapabilityTool::Mcp {
+                server_label, transport: crate::agent_tools::McpTransport::Stdio { .. }, ..
+            }) if server_label == label)
+        })
+    });
+    if !stdio_env.is_empty() && !state.secrets.configured() {
+        return Err(ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "stdio MCP env values require the operator to configure a vault passphrase; use env_vars to inherit them from the executor".into(),
+        ));
+    }
     crate::configuration::validate_execution(&saved.config, &environment)?;
     // Resolve worker configuration now so an unreachable MCP server or an
     // unsupported tier is rejected before a session is created.
-    crate::capabilities::overrides(&state, &saved.config, &environment, &Default::default())
-        .await?;
+    crate::capabilities::overrides(
+        &state,
+        &saved.config,
+        &environment,
+        &Default::default(),
+        &stdio_env,
+    )
+    .await?;
     let vault_ids = crate::credentials::vaults(&state, params.vault_ids).await?;
     let credentials = crate::credentials::resolve(&state, &saved.config, &vault_ids).await?;
     let session = state
@@ -228,7 +256,12 @@ async fn create(
         "created_at":now(),"last_active_at":now(),"environment":public_environment,"metadata":metadata,
         "vault_ids":vault_ids,"required_actions":[],"status":status,"error":null,"usage":null});
     crate::records::create_session(&state.store.0, &public).await?;
-    if let Err(error) = crate::credentials::snapshot(&state, &session.id, credentials).await {
+    let snapshot = async {
+        crate::credentials::snapshot(&state, &session.id, credentials).await?;
+        let name = crate::stdio_env::session_name(&session.id);
+        crate::stdio_env::save(&state, name, &stdio_env).await
+    };
+    if let Err(error) = snapshot.await {
         crate::records::session_status(&state, &session.id, "failed", Some(&error.1)).await?;
         return Err(error);
     }

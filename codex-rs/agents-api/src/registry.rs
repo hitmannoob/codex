@@ -83,6 +83,9 @@ pub(crate) struct Slot {
     pub(crate) streams: HashMap<String, u64>,
     authorizations: HashMap<String, Authorization>,
     state: watch::Sender<ExecutorState>,
+    /// Whether an executor has connected since this process started, which
+    /// tells a disconnected environment from one still pending.
+    connected_once: bool,
 }
 
 impl Slot {
@@ -94,10 +97,12 @@ impl Slot {
             streams: HashMap::new(),
             authorizations: HashMap::new(),
             state: watch::channel(ExecutorState::Unregistered).0,
+            connected_once: false,
         }
     }
 
-    pub(crate) fn set_state(&self, state: ExecutorState) {
+    pub(crate) fn set_state(&mut self, state: ExecutorState) {
+        self.connected_once |= state == ExecutorState::Connected;
         self.state.send_if_modified(|current| {
             let changed = *current != state;
             *current = state;
@@ -175,6 +180,17 @@ impl Registry {
         f: impl FnOnce(&mut Slot) -> T,
     ) -> Option<T> {
         crate::lock(&self.slots).get_mut(environment_id).map(f)
+    }
+
+    /// An environment's public connection status.
+    pub(crate) fn status(&self, environment_id: &str) -> &'static str {
+        match self.with_slot(environment_id, |slot| {
+            (*slot.state.borrow(), slot.connected_once)
+        }) {
+            Some((ExecutorState::Connected, _)) => "connected",
+            Some((_, true)) => "disconnected",
+            Some((_, false)) | None => "pending",
+        }
     }
 
     /// An environment's executor state, if the registry knows the environment.

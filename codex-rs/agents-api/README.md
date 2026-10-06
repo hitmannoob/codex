@@ -125,7 +125,10 @@ remain available without that header. New session routes are:
 | GET | `/v1/agents/sessions/{id}/items` | Saved messages, reasoning and function records |
 | GET | `/v1/agents/sessions/{id}/turns` | Saved outcomes |
 | GET | `/v1/agents/sessions/{id}/turns/{turn_id}` | One saved outcome |
-| GET | `/v1/agents/environments/{id}` | A self-hosted session's environment |
+| GET | `/v1/agents/environments/{id}` | A self-hosted environment's status (`pending`, `connected`, `disconnected`) |
+| POST / GET | `/v1/agents/environments/{id}/files` | Write an inline or `file_id` file into, or list files in, a connected environment's workspace |
+| POST / GET | `/v1/files` | Upload (multipart, at most 50 MiB, optional `expires_after`) or list files |
+| GET / DELETE | `/v1/files/{id}` | Retrieve or delete an uploaded file; `/content` downloads it |
 
 Lists accept `after`, `order=asc|desc`, and `limit=1..100`; item lists also accept
 `turn_id`. Records persist before their events are emitted. Disconnecting an HTTP
@@ -283,8 +286,11 @@ least 32 bytes, different from the API token, with `--environment-key` (or
 grants only the registry endpoints under `/registry/`, never the API.
 - **Creating:** `environment: {"type":"self_hosted","workspace_directory":"/abs/path"}`.
   The workspace path belongs to the executor's OS, so POSIX and Windows absolute
-  forms are both accepted. `capability_directories` must be empty for now. The
-  response's `environment` carries its `id` and `remote_url`, this service's
+  forms are both accepted. Skills in `capability_directories` (up to 32
+  absolute paths on the executor) are offered to the agent, and so are plugins
+  found there. Plugins installed in the worker's own Codex home stay off, as
+  do remote plugins. The response's
+  `environment` carries its `id` and `remote_url`, this service's
   `/registry` on the host and scheme the request used (`x-forwarded-proto`
   selects https).
 - **Connecting:** on the caller's compute, run
@@ -299,13 +305,31 @@ grants only the registry endpoints under `/registry/`, never the API.
   when waiting input times out.
 - **Waiting input:** input sent while the executor is offline sets the session
   to `requires_action` with an `environment_connection` action. It waits up to
-  five minutes, then starts in order. Input that times out is dropped and the
+  five minutes (`--environment-connection-wait-secs` changes this), then
+  starts in order. Input that times out is dropped and the
   session fails; a later connection does not replay it. Cancelling drops waiting
   input and returns the session to idle, and a service restart drops it and
   fails the session.
 - **Execution:** commands run unsandboxed in the workspace directory; the
   caller's compute is the isolation boundary, and code there can read the
-  environment key.
+  environment key. Each command is a `command_execution` item with its exit
+  code and output. If the executor goes away mid-command, Codex tries for 25
+  seconds to resume, then reports the command failed to the model; it is never
+  re-run. A new executor, or a replaced worker, continues the session in the
+  same workspace.
+- **Files:** `POST /v1/agents/environments/{id}/files` writes
+  `{"type":"inline","path":…,"data":<base64>}` (at most 5 MiB) on the executor.
+  The path must lie inside the workspace once `.` and `..` are resolved;
+  parents are created and links are not followed. `GET` lists files under the
+  workspace or `path`, ordered by path components (`order`, `limit` 1..100,
+  opaque `page` token). The executor must be connected (409 otherwise).
+  `{"type":"file_id",…}` copies a `/v1/files` upload instead.
+- **MCP:** stdio MCP servers run on the executor with the given `cwd`, and
+  `env_vars` are read from the executor's environment. Literal `env` values
+  are secrets: they need the vault passphrase, are stored encrypted, are never
+  returned, and a session copies its agent's values when it is created. HTTP servers with `connection_origin: "environment"` connect
+  from the executor, so the service's egress policy does not apply to them.
+  Both need a self-hosted session.
 - **Deletion:** removes the environment from the registry and the worker. The
   caller's executor keeps running (its registration attempts get 404), and
   stopping it is the caller's job.
