@@ -17,14 +17,37 @@ impl EnvironmentRequestProcessor {
         &self,
         params: EnvironmentAddParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.environment_manager
-            .upsert_environment(
+        let added = match (params.exec_server_url, params.noise_registry) {
+            (Some(exec_server_url), None) => self.environment_manager.upsert_environment(
                 params.environment_id,
-                params.exec_server_url,
+                exec_server_url,
                 params.connect_timeout_ms.map(Duration::from_millis),
-            )
-            .map_err(|err| invalid_request(err.to_string()))?;
+            ),
+            (None, Some(registry)) => self.environment_manager.upsert_noise_environment(
+                params.environment_id,
+                registry.url,
+                registry.environment_id,
+                registry.auth_token,
+            ),
+            _ => {
+                return Err(invalid_request(
+                    "exactly one of execServerUrl and noiseRegistry is required",
+                ));
+            }
+        };
+        added.map_err(|err| invalid_request(err.to_string()))?;
         Ok(Some(EnvironmentAddResponse {}.into()))
+    }
+
+    pub(crate) async fn environment_remove(
+        &self,
+        params: EnvironmentRemoveParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let removed = self
+            .environment_manager
+            .remove_environment(&params.environment_id)
+            .map_err(|err| invalid_request(err.to_string()))?;
+        Ok(Some(EnvironmentRemoveResponse { removed }.into()))
     }
 
     pub(crate) async fn environment_info(

@@ -61,6 +61,11 @@ Options:
           Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote
           registration
 
+      --trusted-registry-host <HOST>
+          Registry host that may receive CODEX_API_KEY over HTTPS, in addition
+          to openai.com, openai.org, and loopback hosts. Repeat for each host;
+          name only registries you trust with the key
+
       --aws-sigv4
           Sign Direct registration and WebSocket handshake requests with AWS
           SigV4

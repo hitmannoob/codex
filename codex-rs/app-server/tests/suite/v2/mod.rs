@@ -41,6 +41,7 @@ mod daybreak_access;
 mod dynamic_tools;
 mod environment_add;
 mod environment_info;
+mod environment_noise;
 mod environment_status;
 mod exec_server_test_support;
 #[cfg(not(target_os = "windows"))]

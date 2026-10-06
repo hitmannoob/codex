@@ -2809,7 +2809,32 @@ mod tests {
             "https://openai.org/api",
             "https://service.openai.org/api",
         ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
+            assert!(validate_api_key_remote_host(base_url, &[]).is_ok());
+        }
+    }
+
+    #[test]
+    fn exec_server_remote_api_key_auth_accepts_only_named_https_registry_hosts() {
+        let trusted = vec!["agents.example.com".to_string(), "10.0.0.5".to_string()];
+        for base_url in [
+            "https://agents.example.com/api",
+            "https://AGENTS.example.com/api",
+            "https://10.0.0.5:8443/api",
+        ] {
+            assert!(
+                validate_api_key_remote_host(base_url, &trusted).is_ok(),
+                "{base_url}"
+            );
+        }
+        for base_url in [
+            "http://agents.example.com/api",
+            "https://other.example.com/api",
+            "https://evil.agents.example.com/api",
+        ] {
+            assert!(
+                validate_api_key_remote_host(base_url, &trusted).is_err(),
+                "{base_url}"
+            );
         }
     }
 
@@ -2820,7 +2845,7 @@ mod tests {
             "http://127.0.0.1:8098/api",
             "http://[::1]:8098/api",
         ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
+            assert!(validate_api_key_remote_host(base_url, &[]).is_ok());
         }
     }
 
@@ -2830,24 +2855,25 @@ mod tests {
             "http://service.openai.com/api",
             "http://service.openai.org/api",
         ] {
-            let error = validate_api_key_remote_host(base_url)
+            let error = validate_api_key_remote_host(base_url, &[])
                 .expect_err("reject plaintext OpenAI destination");
 
             assert_eq!(
                 error.to_string(),
-                "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
+                "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains, loopback hosts, or HTTPS hosts passed with --trusted-registry-host"
             );
         }
     }
 
     #[test]
     fn exec_server_remote_api_key_auth_rejects_suffix_spoof() {
-        let error = validate_api_key_remote_host("https://service.openai.org.evil.example/api")
-            .expect_err("reject suffix spoof");
+        let error =
+            validate_api_key_remote_host("https://service.openai.org.evil.example/api", &[])
+                .expect_err("reject suffix spoof");
 
         assert_eq!(
             error.to_string(),
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
+            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains, loopback hosts, or HTTPS hosts passed with --trusted-registry-host"
         );
     }
 

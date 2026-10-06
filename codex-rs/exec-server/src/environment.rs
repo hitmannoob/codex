@@ -500,6 +500,55 @@ impl EnvironmentManager {
         self.insert_environment(environment_id, environment)
     }
 
+    /// Adds or replaces a named environment reached through a Noise environment
+    /// registry, without changing the default environment selection. Every
+    /// connection asks `registry_url` for fresh rendezvous credentials for the
+    /// executor registered as `registry_environment_id`, authenticating with
+    /// `bearer_token`.
+    pub fn upsert_noise_environment(
+        &self,
+        environment_id: String,
+        registry_url: String,
+        registry_environment_id: String,
+        bearer_token: String,
+    ) -> Result<(), ExecServerError> {
+        validate_environment_id(&environment_id)?;
+        let provider = NoiseRendezvousEnvironmentConfig::new(
+            registry_url,
+            registry_environment_id,
+            bearer_token,
+            /*chatgpt_account_id*/ None,
+        )?
+        .into_connect_provider(self.http_client_factory.clone())?;
+        let environment = Arc::new(Environment::remote_with_transport(
+            ExecServerTransportParams::NoiseRendezvous {
+                provider,
+                identity: noise_channel_identity()?,
+            },
+            self.local_runtime_paths.clone(),
+            self.http_client_factory.clone(),
+        ));
+        self.insert_environment(environment_id, environment)
+    }
+
+    /// Removes a named remote environment and reports whether it existed.
+    /// Threads that already selected it keep their handle until they select
+    /// environments again. The default environment cannot be removed.
+    pub fn remove_environment(&self, environment_id: &str) -> Result<bool, ExecServerError> {
+        validate_environment_id(environment_id)?;
+        if self.default_environment.as_deref() == Some(environment_id) {
+            return Err(ExecServerError::Protocol(format!(
+                "environment id `{environment_id}` is the default environment"
+            )));
+        }
+        let removed = self
+            .environments
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(environment_id);
+        Ok(removed.is_some())
+    }
+
     /// Returns the stable environment for an ID, creating it as pending when absent.
     pub fn materialize_pending_noise_environment(
         &self,

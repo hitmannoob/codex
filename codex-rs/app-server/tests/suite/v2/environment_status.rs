@@ -165,7 +165,8 @@ async fn add_environment(
 ) -> Result<()> {
     let params = EnvironmentAddParams {
         environment_id: environment_id.to_string(),
-        exec_server_url: exec_server_url.to_string(),
+        exec_server_url: Some(exec_server_url.to_string()),
+        noise_registry: None,
         connect_timeout_ms: None,
     };
     let add_request_id = app_server

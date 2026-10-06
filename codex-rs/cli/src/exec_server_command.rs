@@ -96,6 +96,17 @@ pub(super) struct ExecServerCommand {
     )]
     pub(super) use_agent_identity_auth: bool,
 
+    /// Registry host that may receive CODEX_API_KEY over HTTPS, in addition to
+    /// openai.com, openai.org, and loopback hosts. Repeat for each host; name
+    /// only registries you trust with the key.
+    #[arg(
+        long = "trusted-registry-host",
+        value_name = "HOST",
+        requires = "exec_server_remote",
+        global = true
+    )]
+    pub(super) trusted_registry_hosts: Vec<String>,
+
     /// Sign Direct registration and WebSocket handshake requests with AWS SigV4.
     #[arg(long = "aws-sigv4", requires = "exec_server_remote", global = true)]
     pub(super) aws_sigv4: bool,
@@ -179,6 +190,7 @@ impl ExecServerCommand {
                     &config,
                     &base_url,
                     self.use_agent_identity_auth,
+                    &self.trusted_registry_hosts,
                 )
                 .await?
             };
@@ -328,6 +340,7 @@ async fn load_exec_server_remote_auth_provider(
     config: &codex_core::config::Config,
     base_url: &str,
     use_agent_identity_auth: bool,
+    trusted_registry_hosts: &[String],
 ) -> anyhow::Result<codex_api::SharedAuthProvider> {
     if use_agent_identity_auth {
         read_codex_access_token_from_env().ok_or_else(|| {
@@ -359,7 +372,7 @@ async fn load_exec_server_remote_auth_provider(
     }
 
     if auth.is_api_key_auth() {
-        validate_api_key_remote_host(base_url)?;
+        validate_api_key_remote_host(base_url, trusted_registry_hosts)?;
     }
 
     if auth_manager.is_workload_identity_selected() {
@@ -376,7 +389,10 @@ pub(super) fn is_supported_exec_server_remote_auth(auth: &CodexAuth) -> bool {
     auth.is_chatgpt_auth() || auth.is_api_key_auth()
 }
 
-pub(super) fn validate_api_key_remote_host(base_url: &str) -> anyhow::Result<()> {
+pub(super) fn validate_api_key_remote_host(
+    base_url: &str,
+    trusted_registry_hosts: &[String],
+) -> anyhow::Result<()> {
     let url = url::Url::parse(base_url)
         .map_err(|err| anyhow::anyhow!("invalid remote exec-server registration URL: {err}"))?;
     let host = url.host().ok_or_else(|| {
@@ -395,15 +411,24 @@ pub(super) fn validate_api_key_remote_host(base_url: &str) -> anyhow::Result<()>
         }),
         _ => false,
     };
+    // A host the operator named explicitly is trusted over HTTPS only.
+    let is_trusted_host = match &host {
+        url::Host::Domain(host) => trusted_registry_hosts
+            .iter()
+            .any(|trusted| host.eq_ignore_ascii_case(trusted)),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => trusted_registry_hosts.iter().any(|trusted| {
+            trusted.trim_matches(['[', ']']) == host.to_string().trim_matches(['[', ']'])
+        }),
+    };
     let is_allowed = match url.scheme() {
-        "https" => is_loopback || is_openai_host,
+        "https" => is_loopback || is_openai_host || is_trusted_host,
         "http" => is_loopback,
         _ => false,
     };
 
     if !is_allowed {
         anyhow::bail!(
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
+            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains, loopback hosts, or HTTPS hosts passed with --trusted-registry-host"
         );
     }
 

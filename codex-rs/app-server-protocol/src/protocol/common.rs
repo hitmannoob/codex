@@ -1203,6 +1203,13 @@ client_request_definitions! {
         serialization: global("environment"),
         response: v2::EnvironmentAddResponse,
     },
+    #[experimental("environment/remove")]
+    /// Removes a remote environment by id.
+    EnvironmentRemove => "environment/remove" {
+        params: v2::EnvironmentRemoveParams,
+        serialization: global("environment"),
+        response: v2::EnvironmentRemoveResponse,
+    },
     #[experimental("environment/info")]
     /// Reads information from a configured execution environment.
     EnvironmentInfo => "environment/info" {
@@ -2567,7 +2574,8 @@ mod tests {
             request_id: request_id(),
             params: v2::EnvironmentAddParams {
                 environment_id: "remote-a".to_string(),
-                exec_server_url: "ws://127.0.0.1:8765".to_string(),
+                exec_server_url: Some("ws://127.0.0.1:8765".to_string()),
+                noise_registry: None,
                 connect_timeout_ms: None,
             },
         };
@@ -3820,7 +3828,8 @@ mod tests {
             request_id: RequestId::Integer(9),
             params: v2::EnvironmentAddParams {
                 environment_id: "remote-a".to_string(),
-                exec_server_url: "ws://127.0.0.1:8765".to_string(),
+                exec_server_url: Some("ws://127.0.0.1:8765".to_string()),
+                noise_registry: None,
                 connect_timeout_ms: Some(300_000),
             },
         };
@@ -3831,6 +3840,7 @@ mod tests {
                 "params": {
                     "environmentId": "remote-a",
                     "execServerUrl": "ws://127.0.0.1:8765",
+                    "noiseRegistry": null,
                     "connectTimeoutMs": 300000
                 }
             }),
@@ -4354,7 +4364,8 @@ mod tests {
             request_id: RequestId::Integer(1),
             params: v2::EnvironmentAddParams {
                 environment_id: "remote-a".to_string(),
-                exec_server_url: "ws://127.0.0.1:8765".to_string(),
+                exec_server_url: Some("ws://127.0.0.1:8765".to_string()),
+                noise_registry: None,
                 connect_timeout_ms: None,
             },
         };

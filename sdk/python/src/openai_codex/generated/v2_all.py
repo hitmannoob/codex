@@ -1291,6 +1291,26 @@ class EnvironmentConnectionNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class EnvironmentNoiseRegistry(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    auth_token: Annotated[
+        str,
+        Field(alias="authToken", description="Bearer token for the registry's harness requests."),
+    ]
+    environment_id: Annotated[
+        str,
+        Field(alias="environmentId", description="Environment id the executor registered with."),
+    ]
+    url: Annotated[
+        str,
+        Field(
+            description="Registry base URL; `/cloud/environment/{environmentId}/connect` is appended."
+        ),
+    ]
+
+
 class ExperimentalFeatureEnablementSetParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,

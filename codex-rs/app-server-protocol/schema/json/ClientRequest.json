@@ -867,6 +867,29 @@
         }
       ]
     },
+    "EnvironmentNoiseRegistry": {
+      "description": "A Noise environment registry reached for one registered executor.",
+      "properties": {
+        "authToken": {
+          "description": "Bearer token for the registry's harness requests.",
+          "type": "string"
+        },
+        "environmentId": {
+          "description": "Environment id the executor registered with.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Registry base URL; `/cloud/environment/{environmentId}/connect` is appended.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authToken",
+        "environmentId",
+        "url"
+      ],
+      "type": "object"
+    },
     "ExperimentalFeatureEnablementSetParams": {
       "properties": {
         "enablement": {

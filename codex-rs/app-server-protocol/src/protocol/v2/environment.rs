@@ -36,11 +36,49 @@ impl From<&TurnEnvironmentSelection> for ThreadEnvironment {
 #[ts(export_to = "v2/")]
 pub struct EnvironmentAddParams {
     pub environment_id: String,
-    pub exec_server_url: String,
+    /// WebSocket URL of an exec-server. Exactly one of `execServerUrl` and
+    /// `noiseRegistry` must be set.
+    #[ts(optional = nullable)]
+    pub exec_server_url: Option<String>,
+    /// Environment registry that an exec-server started with `--remote` has
+    /// registered with. The connection is Noise-encrypted end to end, and
+    /// every connection obtains fresh rendezvous credentials from the registry.
+    #[ts(optional = nullable)]
+    pub noise_registry: Option<EnvironmentNoiseRegistry>,
     /// Optional WebSocket connection timeout. The server default applies when omitted.
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub connect_timeout_ms: Option<u64>,
+}
+
+/// A Noise environment registry reached for one registered executor.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct EnvironmentNoiseRegistry {
+    /// Registry base URL; `/cloud/environment/{environmentId}/connect` is appended.
+    pub url: String,
+    /// Environment id the executor registered with.
+    pub environment_id: String,
+    /// Bearer token for the registry's harness requests.
+    pub auth_token: String,
+}
+
+/// Removes a configured environment by id. Threads that already selected it
+/// keep their connection until they select environments again.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct EnvironmentRemoveParams {
+    pub environment_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct EnvironmentRemoveResponse {
+    /// Whether the environment existed.
+    pub removed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

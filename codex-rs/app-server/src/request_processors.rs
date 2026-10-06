@@ -67,6 +67,8 @@ use codex_app_server_protocol::EnvironmentAddParams;
 use codex_app_server_protocol::EnvironmentAddResponse;
 use codex_app_server_protocol::EnvironmentInfoParams;
 use codex_app_server_protocol::EnvironmentInfoResponse;
+use codex_app_server_protocol::EnvironmentRemoveParams;
+use codex_app_server_protocol::EnvironmentRemoveResponse;
 use codex_app_server_protocol::EnvironmentShellInfo;
 use codex_app_server_protocol::EnvironmentStatusKind;
 use codex_app_server_protocol::EnvironmentStatusParams;
