@@ -344,7 +344,7 @@ async fn environment_files_are_written_and_listed_inside_the_workspace() -> anyh
             (inline("relative.txt", "x"), "path must be an absolute path inside the workspace directory"),
             (inline(workspace_directory, "x"), "path must be an absolute path inside the workspace directory"),
             (json!({"type":"inline","path":inside("bad.txt"),"data":"not base64!"}), "data must be standard base64"),
-            (json!({"type":"file_id","path":inside("f.txt"),"file_id":"file_1"}), "file_id sources need the Files API"),
+            (json!({"type":"file_id","path":inside("f.txt"),"file_id":"file-missing"}), "file file-missing not found"),
         ] {
             let response = client.post(&files).bearer_auth(TOKEN).header("OpenAI-Beta", "agents=v1").json(&body).send().await?;
             let code = response.status();
@@ -355,6 +355,13 @@ async fn environment_files_are_written_and_listed_inside_the_workspace() -> anyh
         }
         assert!(!workspace_path.parent().context("parent")?.join("escape.txt").exists());
 
+        // A Files API upload, larger than one relay frame, arrives whole.
+        let large: Vec<u8> = (0..6 * 1024 * 1024).map(|index| (index % 251) as u8).collect();
+        let uploaded = files::upload(&client, &base, &[("purpose", "user_data")], "large.bin", &large).await?.error_for_status()?.json::<Value>().await?;
+        let copied = request(&client, reqwest::Method::POST, &files, json!({"type":"file_id","path":inside("large.bin"),"file_id":uploaded["id"]})).await?;
+        assert_eq!(copied["size_bytes"], json!(large.len()));
+        assert!(std::fs::read(workspace_path.join("large.bin"))? == large, "large file contents differ");
+        std::fs::remove_file(workspace_path.join("large.bin"))?;
 
         // Listing orders by path components and pages with an opaque token.
         request(&client, reqwest::Method::POST, &files, inline(&inside("c.txt"), "ccc")).await?;

@@ -469,3 +469,6 @@ mod telemetry;
 
 #[path = "suite/environments.rs"]
 mod environments;
+
+#[path = "suite/files.rs"]
+mod files;

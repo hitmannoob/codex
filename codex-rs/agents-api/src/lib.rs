@@ -6,6 +6,7 @@ mod contract;
 mod credentials;
 mod environment_files;
 mod environments;
+mod files;
 mod gates;
 mod input;
 mod mcp;
@@ -85,6 +86,8 @@ struct State {
     registry: registry::Registry,
     /// Input waiting for a self-hosted executor to connect.
     waits: environments::Waits,
+    /// Uploaded file contents.
+    files: files::Files,
     /// This service's own connections to self-hosted executors, for
     /// environment files.
     executors: codex_exec_server::EnvironmentManager,
@@ -222,6 +225,7 @@ impl AgentsApi {
             webhook_wake: tokio::sync::Notify::new(),
             registry: registry::Registry::default(),
             waits: environments::Waits::default(),
+            files: files::Files(directory.join("files").to_path_buf()),
             executors: codex_exec_server::EnvironmentManager::without_environments(
                 codex_http_client::HttpClientFactory::new(
                     codex_http_client::OutboundProxyPolicy::ReqwestDefault,
@@ -234,6 +238,7 @@ impl AgentsApi {
             token,
         });
         environments::recover(&state).await?;
+        files::sweep(&state).await?;
         let router = routes::router(Arc::clone(&state));
         let stop = watch::channel(/*stopping*/ false).0;
         let dispatcher = tokio::spawn(webhook_outbox::dispatch(

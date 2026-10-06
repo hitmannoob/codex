@@ -132,12 +132,8 @@ fn file(environment_id: &str, path: &PathUri, size_bytes: u64) -> Value {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Create {
-    Inline {
-        path: String,
-        data: String,
-    },
-    /// Rejected: the service has no Files API to resolve the ID against.
-    FileId(serde::de::IgnoredAny),
+    Inline { path: String, data: String },
+    FileId { path: String, file_id: String },
 }
 
 pub(crate) async fn create(
@@ -145,22 +141,27 @@ pub(crate) async fn create(
     Path(environment_id): Path<String>,
     Json(params): Json<Create>,
 ) -> Result<Json<Value>, ApiError> {
-    let (path, data) = match params {
-        Create::Inline { path, data } => (path, data),
-        Create::FileId(_) => {
-            return Err(invalid(
-                "file_id sources need the Files API, which this service does not provide; send the contents inline",
-            ));
+    let (path, contents) = match params {
+        Create::Inline { path, data } => {
+            let contents = base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|_| invalid("data must be standard base64"))?;
+            if contents.len() > MAX_INLINE_BYTES {
+                return Err(invalid(format!(
+                    "inline files are limited to {MAX_INLINE_BYTES} bytes"
+                )));
+            }
+            (path, contents)
         }
+        // Uploads are already bounded by the Files API limit.
+        Create::FileId { path, file_id } => match crate::files::read(&state, &file_id).await {
+            Ok(contents) => (path, contents),
+            Err(error) if error.0 == StatusCode::NOT_FOUND => {
+                return Err(invalid(format!("file {file_id} not found")));
+            }
+            Err(error) => return Err(error),
+        },
     };
-    let contents = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
-        .map_err(|_| invalid("data must be standard base64"))?;
-    if contents.len() > MAX_INLINE_BYTES {
-        return Err(invalid(format!(
-            "inline files are limited to {MAX_INLINE_BYTES} bytes"
-        )));
-    }
     let workspace = Workspace::open(&state, &environment_id).await?;
     let path = workspace.path(&path, /*allow_root*/ false)?;
     if let Some(parent) = path.parent() {
