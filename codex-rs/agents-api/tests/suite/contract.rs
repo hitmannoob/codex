@@ -202,16 +202,22 @@ async fn public_sessions_save_normalized_history_and_validate_inputs() -> anyhow
             assert_eq!(client.get(format!("{url}/{suffix}")).bearer_auth(TOKEN).send().await?.status(),reqwest::StatusCode::BAD_REQUEST);
         }
         // Unsupported environments name the public types, never the prototype's.
-        for (environment, message) in [
-            (json!({"type":"openai_hosted"}), "environment type openai_hosted is not supported by this service; use none"),
-            (json!({"type":"self_hosted","workspace_directory":"/tmp"}), "environment type self_hosted is not implemented yet; use none"),
-            (json!({"type":"local","cwd":"/tmp"}), "environment.type must be none, openai_hosted, or self_hosted"),
-            (json!({"type":"none","cwd":"/tmp"}), "environment none takes no other fields"),
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        for (environment, status, message) in [
+            (json!({"type":"openai_hosted"}), bad, "environment type openai_hosted is not supported by this service; use none"),
+            (json!({"type":"self_hosted","workspace_directory":"/tmp"}), reqwest::StatusCode::NOT_IMPLEMENTED,
+                "self-hosted environments are disabled; the operator must configure an environment key"),
+            (json!({"type":"self_hosted","workspace_directory":"tmp"}), bad, "workspace_directory must be an absolute path of at most 4096 bytes"),
+            (json!({"type":"self_hosted"}), bad, "workspace_directory is required for self_hosted environments"),
+            (json!({"type":"self_hosted","workspace_directory":"C:\\work","capability_directories":["/skills"]}), bad,
+                "capability_directories is not supported by this service yet"),
+            (json!({"type":"local","cwd":"/tmp"}), bad, "environment.type must be none, openai_hosted, or self_hosted"),
+            (json!({"type":"none","cwd":"/tmp"}), bad, "environment none takes no other fields"),
         ] {
             let response = client.post(format!("{base}/agents/sessions")).bearer_auth(TOKEN)
                 .json(&json!({"agent":{"model":"mock-model"},"environment":environment,"input":"x"})).send().await?;
             assert_eq!((response.status(), response.json::<Value>().await?["error"]["message"].clone()),
-                (reqwest::StatusCode::BAD_REQUEST, json!(message)), "{environment}");
+                (status, json!(message)), "{environment}");
         }
         let response = client.post(format!("{url}/events")).bearer_auth(TOKEN).json(&json!({"events":[{"type":"agent.session.input.message","input":[{"role":"user","content":[{"type":"input_text","text":"Follow up"}]}]}]})).send().await?;
         assert_eq!(response.status(),reqwest::StatusCode::ACCEPTED);

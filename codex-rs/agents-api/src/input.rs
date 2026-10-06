@@ -220,13 +220,17 @@ async fn execute(state: &Arc<State>, id: &str, events: Vec<Event>) -> Result<(),
     for event in events {
         match event {
             Event::Message(items) => {
-                crate::routes::start_turn(state, id, items).await?;
+                crate::environments::submit(state, id, items).await?;
             }
             // Cancelling stops all of the session's running work: its own turn
             // and any turn a subagent is running.
             Event::Cancel => {
                 if let Some((receiver, calls)) = sent.take() {
                     settle(state, id, receiver, calls).await?;
+                }
+                // Input still waiting for its executor never started a turn.
+                if crate::environments::cancel(state, id).await? {
+                    continue;
                 }
                 for (thread_id, turn_id, subagent) in
                     crate::records::running_turns(state, id).await?

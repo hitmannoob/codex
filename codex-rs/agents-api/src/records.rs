@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub(crate) async fn disconnected(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    let failed: Vec<String> = sqlx::query_scalar("UPDATE public_sessions SET data = json_set(data, '$.status', 'failed', '$.error', 'backend connection lost') WHERE json_extract(data, '$.status') IN ('in_progress', 'requires_action') RETURNING id").fetch_all(&mut *tx).await?;
+    let failed: Vec<String> = sqlx::query_scalar("UPDATE public_sessions SET data = json_set(data, '$.status', 'failed', '$.error', 'backend connection lost') WHERE json_extract(data, '$.status') IN ('in_progress', 'requires_action') AND id NOT IN (SELECT session_id FROM environments WHERE waiting) RETURNING id").fetch_all(&mut *tx).await?;
     for id in failed {
         crate::webhook_outbox::session_status(&mut tx, &id, "failed").await?;
     }
@@ -67,11 +67,15 @@ pub(crate) async fn decorate<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>
     id: &str,
     mut data: Value,
 ) -> anyhow::Result<Value> {
-    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM tool_calls WHERE session_id = ? AND status = 'pending' ORDER BY turn_id, call_id")
+    // Pending function calls, then an environment the session's input waits for.
+    let actions: Vec<(String, Option<String>)> = sqlx::query_as("SELECT action, environment_id FROM (SELECT 0 AS rank, turn_id, call_id, action, NULL AS environment_id FROM tool_calls WHERE session_id = ?1 AND status = 'pending' UNION ALL SELECT 1, '', '', '', id FROM environments WHERE session_id = ?1 AND waiting) ORDER BY rank, turn_id, call_id")
         .bind(id).fetch_all(executor).await?;
     data["required_actions"] = actions
         .iter()
-        .map(|action| {
+        .map(|(action, environment_id)| {
+            if let Some(environment_id) = environment_id {
+                return Ok(json!({"type":"environment_connection","environment_id":environment_id}));
+            }
             let action: RequiredAction = serde_json::from_str(action)?;
             Ok(json!({"type":"function_call","turn_id":action.turn_id,"call_id":action.call_id,"name":action.name,"arguments":action.arguments}))
         })

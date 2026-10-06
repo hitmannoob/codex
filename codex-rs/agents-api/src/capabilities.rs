@@ -113,7 +113,8 @@ pub(crate) async fn overrides(
         }
     }
     let cwd = match environment {
-        Environment::None => None,
+        // A self-hosted workspace is not on this host.
+        Environment::None | Environment::SelfHosted { .. } => None,
         Environment::Local { cwd } => Some(cwd),
     };
     let effective = state.rpc("config/read", json!({"cwd": cwd})).await?;

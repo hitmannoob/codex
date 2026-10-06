@@ -115,7 +115,7 @@ remain available without that header. New session routes are:
 | --- | --- | --- |
 | POST / GET | `/v1/agents` | Create saved agents / list in creation order |
 | GET / POST / DELETE | `/v1/agents/{id}` | Retrieve, update, or delete a saved agent |
-| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, environment `none` (`self_hosted` returns 400 until G09 lands; `openai_hosted` is not supported), required initial input (the pinned SDK requires it for environment `none`), optional SSE |
+| POST | `/v1/agents/sessions` | Inline agent or saved `agent_id` plus overrides, environment `none` or `self_hosted` (`openai_hosted` is not supported), initial input (required for `none`, optional for `self_hosted`), optional SSE |
 | GET | `/v1/agents/sessions` | List in creation order, optionally filtered by `agent_id` |
 | GET | `/v1/agents/sessions/{id}` | Configuration snapshot, status, metadata and current `required_actions` |
 | POST | `/v1/agents/sessions/{id}` | Replace metadata; change model, reasoning effort, or service tier for later turns |
@@ -125,6 +125,7 @@ remain available without that header. New session routes are:
 | GET | `/v1/agents/sessions/{id}/items` | Saved messages, reasoning and function records |
 | GET | `/v1/agents/sessions/{id}/turns` | Saved outcomes |
 | GET | `/v1/agents/sessions/{id}/turns/{turn_id}` | One saved outcome |
+| GET | `/v1/agents/environments/{id}` | A self-hosted session's environment |
 
 Lists accept `after`, `order=asc|desc`, and `limit=1..100`; item lists also accept
 `turn_id`. Records persist before their events are emitted. Disconnecting an HTTP
@@ -149,8 +150,8 @@ are included in input, and reasoning tokens in output.
 Backend notification loss fails the connection rather than serving incomplete
 history as healthy. Backend loss marks active public turns failed, without replay.
 
-This stage accepts only `environment: {"type":"none"}` and one user message per
-message event. Saved agents support names,
+Sessions accept environment `none` or `self_hosted` (see below) and one user
+message per message event. Saved agents support names,
 metadata, model/instructions, reasoning effort/summary, text format/verbosity,
 service tier, multi-agent configuration, and the pinned SDK tool variants.
 Omitted fields preserve saved values; supplied objects replace them; null resets
@@ -274,6 +275,40 @@ URL, non-secret `headers`, `allowed_tools` (all tools when omitted), and
   `rate_limit_exceeded`), and 5xx is `server_error`. The request itself
   succeeds. The failed turn gets a service-assigned ID, because Codex never
   starts it.
+
+Self-hosted environments run a session's commands on compute the caller owns.
+They are available only when the operator supplies an environment key of at
+least 32 bytes, different from the API token, with `--environment-key` (or
+`CODEX_AGENTS_API_ENVIRONMENT_KEY`); otherwise such sessions return 501. The key
+grants only the registry endpoints under `/registry/`, never the API.
+- **Creating:** `environment: {"type":"self_hosted","workspace_directory":"/abs/path"}`.
+  The workspace path belongs to the executor's OS, so POSIX and Windows absolute
+  forms are both accepted. `capability_directories` must be empty for now. The
+  response's `environment` carries its `id` and `remote_url`, this service's
+  `/registry` on the host and scheme the request used (`x-forwarded-proto`
+  selects https).
+- **Connecting:** on the caller's compute, run
+  `CODEX_API_KEY=<environment key> codex exec-server --remote <remote_url> --environment-id <id>`.
+  The stock CLI sends that key only to OpenAI hosts or loopback; add
+  `--trusted-registry-host <host>` for this service's https host. The executor
+  registers a Noise key and dials out to a rendezvous websocket. The worker
+  reaches it through the same relay over loopback, and traffic is encrypted end
+  to end: the relay sees only stream IDs.
+- **Events:** `agent.session.environment.pending` at creation, then `connected`
+  and `disconnected` as the executor's socket opens and closes, and `failed`
+  when waiting input times out.
+- **Waiting input:** input sent while the executor is offline sets the session
+  to `requires_action` with an `environment_connection` action. It waits up to
+  five minutes, then starts in order. Input that times out is dropped and the
+  session fails; a later connection does not replay it. Cancelling drops waiting
+  input and returns the session to idle, and a service restart drops it and
+  fails the session.
+- **Execution:** commands run unsandboxed in the workspace directory; the
+  caller's compute is the isolation boundary, and code there can read the
+  environment key.
+- **Deletion:** removes the environment from the registry and the worker. The
+  caller's executor keeps running (its registration attempts get 404), and
+  stopping it is the caller's job.
 
 Vaults hold MCP credentials. They are available only when the operator
 supplies a passphrase of at least 32 bytes with `--vault-passphrase` (or

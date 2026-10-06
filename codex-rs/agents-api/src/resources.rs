@@ -82,7 +82,14 @@ pub(crate) struct Agent {
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) enum Environment {
     None,
-    Local { cwd: AbsolutePathBuf },
+    Local {
+        cwd: AbsolutePathBuf,
+    },
+    /// A caller-owned executor; `cwd` is a path on the executor's OS.
+    SelfHosted {
+        id: String,
+        cwd: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

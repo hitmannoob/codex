@@ -127,6 +127,11 @@ fn sse(events: &[Value]) -> String {
 
 /// Read public SSE events until the session goes idle.
 async fn until_idle(stream: &mut reqwest::Response) -> anyhow::Result<Vec<Value>> {
+    until_event(stream, "agent.session.idle").await
+}
+
+/// Read public SSE events through the first event of type `kind`.
+async fn until_event(stream: &mut reqwest::Response, kind: &str) -> anyhow::Result<Vec<Value>> {
     let mut buffer = String::new();
     let mut events = Vec::new();
     loop {
@@ -134,9 +139,9 @@ async fn until_idle(stream: &mut reqwest::Response) -> anyhow::Result<Vec<Value>
             let block: String = buffer.drain(..end + 2).collect();
             if let Some(data) = block.lines().find_map(|line| line.strip_prefix("data: ")) {
                 let event: Value = serde_json::from_str(data)?;
-                let idle = event["type"] == "agent.session.idle";
+                let done = event["type"] == kind;
                 events.push(event);
-                if idle {
+                if done {
                     return Ok(events);
                 }
             }
@@ -461,3 +466,6 @@ mod traces;
 
 #[path = "suite/telemetry.rs"]
 mod telemetry;
+
+#[path = "suite/environments.rs"]
+mod environments;

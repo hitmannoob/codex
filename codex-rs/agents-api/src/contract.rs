@@ -9,6 +9,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::Path;
 use axum::extract::State as Extract;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -43,6 +44,10 @@ pub(crate) fn router() -> Router<Arc<State>> {
             get(stream).post(crate::input::create),
         )
         .route("/v1/agents/sessions/{id}/items", get(crate::records::items))
+        .route(
+            "/v1/agents/environments/{id}",
+            get(crate::environments::retrieve),
+        )
         .route("/v1/agents/sessions/{id}/turns", get(crate::records::turns))
         .route("/v1/agents/sessions/{id}/traces", get(crate::traces::list))
         .route(
@@ -105,10 +110,12 @@ struct Create {
 
 async fn create(
     Extract(state): Extract<Arc<State>>,
+    headers: HeaderMap,
     Json(params): Json<Create>,
 ) -> Result<Response, ApiError> {
     // Checked here rather than by deserialization, so errors name the public
     // environment types instead of the prototype's.
+    let mut workspace = None;
     match params.environment["type"].as_str() {
         Some("none")
             if params
@@ -122,9 +129,13 @@ async fn create(
             ));
         }
         Some("self_hosted") => {
-            return Err(invalid(
-                "environment type self_hosted is not implemented yet; use none",
-            ));
+            workspace = Some(crate::environments::parse(&params.environment)?);
+            if state.registry.harness_url().is_none() {
+                return Err(ApiError(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "self-hosted environments are disabled; the operator must configure an environment key".into(),
+                ));
+            }
         }
         _ => {
             return Err(invalid(
@@ -132,13 +143,16 @@ async fn create(
             ));
         }
     }
-    // The pinned SDK requires initial input for environment `none`.
+    // The pinned SDK requires initial input for environment `none`; a
+    // self-hosted session may start idle.
     let input = match params.input {
         None | Some(Value::Null) => None,
         Some(Value::Array(items)) if items.is_empty() => None,
         Some(input) => Some(crate::input::message(input)?),
+    };
+    if input.is_none() && workspace.is_none() {
+        return Err(invalid("input is required when environment.type is none"));
     }
-    .ok_or_else(|| invalid("input is required when environment.type is none"))?;
     let metadata = crate::configuration::metadata(params.metadata)?;
     let mut saved = match params.agent_id {
         Some(id) => state
@@ -174,19 +188,39 @@ async fn create(
     .await?;
     let vault_ids = crate::credentials::vaults(&state, params.vault_ids).await?;
     let credentials = crate::credentials::resolve(&state, &saved.config, &vault_ids).await?;
+    let environment = match &workspace {
+        Some(cwd) => Environment::SelfHosted {
+            id: format!("env_{}", Uuid::new_v4().simple()),
+            cwd: cwd.clone(),
+        },
+        None => Environment::None,
+    };
     let session = state
         .store
         .create_session(
             saved,
             SessionCreateParams {
                 agent_id: String::new(),
-                environment: Environment::None,
+                environment: environment.clone(),
             },
         )
         .await?;
+    let public_environment = match &environment {
+        Environment::SelfHosted { id, cwd } => {
+            let remote_url = crate::registry::remote_url(&headers);
+            crate::environments::create(&state, &session.id, id, cwd, remote_url).await?
+        }
+        Environment::None | Environment::Local { .. } => json!({"type":"none"}),
+    };
+    // Input to a self-hosted session sets the status once it is submitted.
+    let status = if workspace.is_some() {
+        "idle"
+    } else {
+        "in_progress"
+    };
     let public = json!({"id":session.id,"object":"agent.session","agent":agent(&session.agent),
-        "created_at":now(),"last_active_at":now(),"environment":{"type":"none"},"metadata":metadata,
-        "vault_ids":vault_ids,"required_actions":[],"status":"in_progress","error":null,"usage":null});
+        "created_at":now(),"last_active_at":now(),"environment":public_environment,"metadata":metadata,
+        "vault_ids":vault_ids,"required_actions":[],"status":status,"error":null,"usage":null});
     crate::records::create_session(&state.store.0, &public).await?;
     if let Err(error) = crate::credentials::snapshot(&state, &session.id, credentials).await {
         crate::records::session_status(&state, &session.id, "failed", Some(&error.1)).await?;
@@ -197,7 +231,13 @@ async fn create(
         &state,
         json!({"type":"agent.session.created","session":public}),
     );
-    if let Err(error) = crate::routes::start_turn(&state, &session.id, input).await {
+    if let Environment::SelfHosted { id, .. } = &environment {
+        crate::environments::emit(&state, &session.id, id, "pending", /*error*/ None);
+        crate::environments::watch(&state, session.id.clone(), id.clone());
+    }
+    if let Some(input) = input
+        && let Err(error) = crate::environments::submit(&state, &session.id, input).await
+    {
         crate::records::session_status(&state, &session.id, "failed", Some(&error.1)).await?;
         return Err(error);
     }

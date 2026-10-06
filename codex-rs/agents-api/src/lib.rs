@@ -63,6 +63,8 @@ struct Backend {
     /// Threads started or resumed on this connection. A replacement connection
     /// starts empty, so each thread is resumed once per connection.
     loaded: Arc<Mutex<HashSet<String>>>,
+    /// Self-hosted environments added to this connection's worker.
+    environments: Arc<Mutex<HashSet<String>>>,
 }
 
 struct State {
@@ -80,6 +82,8 @@ struct State {
     webhook_wake: tokio::sync::Notify,
     /// The environment registry and rendezvous state for self-hosted environments.
     registry: registry::Registry,
+    /// Input waiting for a self-hosted executor to connect.
+    waits: environments::Waits,
     events: broadcast::Sender<Value>,
     public_events: broadcast::Sender<Value>,
     token: String,
@@ -119,6 +123,13 @@ impl State {
         lock(&self.backend)
             .as_ref()
             .map(|backend| Arc::clone(&backend.loaded))
+            .ok_or_else(disconnected_error)
+    }
+
+    fn attached_environments(&self) -> Result<Arc<Mutex<HashSet<String>>>, ApiError> {
+        lock(&self.backend)
+            .as_ref()
+            .map(|backend| Arc::clone(&backend.environments))
             .ok_or_else(disconnected_error)
     }
 
@@ -206,12 +217,14 @@ impl AgentsApi {
             secrets: secrets::Secrets::default(),
             webhook_wake: tokio::sync::Notify::new(),
             registry: registry::Registry::default(),
+            waits: environments::Waits::default(),
             events: broadcast::channel(/*capacity*/ 128).0,
             // Text deltas arrive at token rate; a consumer that falls this far
             // behind is closed and recovers from saved records.
             public_events: broadcast::channel(/*capacity*/ 1024).0,
             token,
         });
+        environments::recover(&state).await?;
         let router = routes::router(Arc::clone(&state));
         let stop = watch::channel(/*stopping*/ false).0;
         let dispatcher = tokio::spawn(webhook_outbox::dispatch(
@@ -262,6 +275,7 @@ impl AgentsApi {
             submissions,
             cancel,
             loaded: Arc::default(),
+            environments: Arc::default(),
         });
         let task = tokio::spawn(pump(
             Arc::clone(&self.state),

@@ -889,7 +889,7 @@ Implement self-hosted attachment first:
 
 - [x] Inventory connection actions, credentials, statuses, expiry, and reconnection
   behavior. Map them to existing app-server/exec-server protocol capabilities.
-- [ ] Persist session-to-environment bindings. Route execution to the attached
+- [x] Persist session-to-environment bindings. Route execution to the attached
   executor; do not assume the HTTP host, app-server, and executor share an OS or
   filesystem.
 - [ ] Authenticate attachment and enforce workspace/path boundaries using the
@@ -946,10 +946,28 @@ Full compatibility would mean implementing, in this service:
 Tests would run the exec-server library in-process, because the `codex` CLI
 needs a V8 build unavailable here.
 
-Deferred by decision (2026-09-29): implementation is paused in favour of work
-in G10–G12 that does not need environments. Sessions accept only environment
-`none` meanwhile. Stdio and environment-origin MCP, skills and plugins from
-`capability_directories`, and environment files stay blocked on this goal.
+Deferred by decision (2026-09-29), resumed 2026-10-06 for self-hosted
+environments only, in stages:
+1. Codex: `environment/add` accepts `noiseRegistry {url, environmentId,
+   authToken}` so each session's environment attaches to the shared worker, and
+   `environment/remove` detaches it. The CLI gains
+   `--trusted-registry-host` so the environment key can go to this service.
+2. Registry and rendezvous relay in this service (`src/registry.rs`,
+   `src/rendezvous.rs`). Executors authenticate with the operator's environment
+   key; the worker's harness with a per-process token. Registry slots exist only
+   for stored environments, so unauthenticated sockets cannot create state.
+3. Self-hosted sessions (`src/environments.rs`), described in the README.
+   Evidence:
+   `environments::self_hosted_input_waits_for_the_executor_and_runs_in_its_workspace`
+   runs an in-process exec-server against the registry. Input waits behind
+   `environment_connection`, a command writes `pwd` into the workspace, loss is
+   reported and later input waits again, cancel drops it, and deletion leaves no
+   rows. The pinned SDK models accept the session, action, and event shapes.
+4. Remaining: executor loss during a running command, re-attachment after a
+   worker restart, path boundaries, a timeout test (the five-minute wait is a
+   constant).
+5. Remaining: environment files (ENV-002/003), stdio and environment-origin
+   MCP, and `capability_directories`.
 
 ## G10 — Files and artifacts
 

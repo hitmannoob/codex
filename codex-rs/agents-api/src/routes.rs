@@ -345,6 +345,9 @@ pub(crate) async fn start_turn(
         crate::capabilities::overrides(state, &session.agent.config, &session.environment, &tokens)
             .await?;
     let loaded = state.loaded_threads()?;
+    if let Environment::SelfHosted { id, .. } = &session.environment {
+        crate::environments::attach(state, id).await?;
+    }
     let thread = async {
         Ok::<_, ApiError>(if let Some(thread_id) = session.thread_id {
         // Resume once per connection. Per-turn settings travel with
@@ -363,9 +366,12 @@ pub(crate) async fn start_turn(
         }
         thread_id
     } else {
-        let environments = match &session.environment {
-            Environment::None => json!([]),
-            Environment::Local { cwd } => json!([{"environmentId": "local", "cwd": cwd}]),
+        // The caller's own compute is the boundary for a self-hosted
+        // environment, which runs commands unsandboxed.
+        let (environments, sandbox) = match &session.environment {
+            Environment::None => (json!([]), "read-only"),
+            Environment::Local { cwd } => (json!([{"environmentId": "local", "cwd": cwd}]), "read-only"),
+            Environment::SelfHosted { id, cwd } => (json!([{"environmentId": id, "cwd": cwd}]), "danger-full-access"),
         };
         let response = state
             .rpc(
@@ -379,7 +385,7 @@ pub(crate) async fn start_turn(
                     "dynamicTools": session.agent.config.tools.iter().filter_map(crate::agent_tools::Tool::function).map(|tool| json!({
                         "type": "function", "name": tool.name, "description": tool.description, "inputSchema": tool.parameters
                     })).collect::<Vec<_>>(),
-                    "approvalPolicy": "never", "sandbox": "read-only", "ephemeral": false,
+                    "approvalPolicy": "never", "sandbox": sandbox, "ephemeral": false,
                 }),
             )
             .await?;
