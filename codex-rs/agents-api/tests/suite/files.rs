@@ -84,6 +84,25 @@ async fn files_upload_list_download_and_delete() -> anyhow::Result<()> {
         let user_data = request(&client, reqwest::Method::GET, &format!("{base}/files?purpose=user_data"), Value::Null).await?;
         assert_eq!(ids(&user_data), vec![json!(id)]);
 
+        // An interrupted upload leaves neither a file nor partial contents.
+        let mut truncated = upload_body(&[("purpose", "user_data")], "cut.bin", &[1; 4096]);
+        truncated.truncate(truncated.len() - 32);
+        let cut = client.post(format!("{base}/files")).bearer_auth(TOKEN)
+            .header("Content-Type", format!("multipart/form-data; boundary={BOUNDARY}")).body(truncated).send().await?;
+        assert_eq!(cut.status(), reqwest::StatusCode::BAD_REQUEST);
+        let stored: Vec<String> = std::fs::read_dir(data.path().join("files"))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(stored.len(), 2, "{stored:?}");
+        assert_eq!(ids(&request(&client, reqwest::Method::GET, &format!("{base}/files"), Value::Null).await?).len(), 2);
+
+        // Contents changed on disk fail their integrity check rather than
+        // being served.
+        let expiring_id = expiring["id"].as_str().context("id")?;
+        std::fs::write(data.path().join("files").join(expiring_id), [9, 9, 9, 9])?;
+        let corrupted = client.get(format!("{base}/files/{expiring_id}/content")).bearer_auth(TOKEN).send().await?;
+        assert_eq!(corrupted.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
         assert_eq!(request(&client, reqwest::Method::DELETE, &format!("{base}/files/{id}"), Value::Null).await?,
             json!({"id":id,"object":"file","deleted":true}));
         for suffix in ["", "/content"] {

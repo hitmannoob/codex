@@ -1030,20 +1030,57 @@ environments only, in stages:
 **Outcome:** clients can move and retrieve documented file/artifact content with
 correct ownership, integrity, and lifecycle behavior.
 
-- [ ] Inventory upload/download/publication operations, content types, size limits,
+- [x] Inventory upload/download/publication operations, content types, size limits,
   identifier formats, access semantics, and retention rules.
-- [ ] Add durable metadata and an appropriate storage implementation. Separate
+- [x] Add durable metadata and an appropriate storage implementation. Separate
   public IDs from internal paths and bind access to the required resource scope.
-- [ ] Implement bounded streaming upload/download with integrity checks and
+- [x] Implement bounded streaming upload/download with integrity checks and
   cleanup of incomplete transfers; avoid buffering entire large files in memory.
-- [ ] Connect transfer into/out of environments through the executor/provider
+- [x] Connect transfer into/out of environments through the executor/provider
   boundary from G09, including foreign-OS paths.
-- [ ] Implement publication and deletion only with the documented visibility and
+- [x] Implement publication and deletion only with the documented visibility and
   retention semantics. Do not expose arbitrary host paths or credentials.
 
 Acceptance: upload/use/retrieve a file in an actual environment; verify content
 integrity, interrupted transfer recovery, limits, missing/deleted files, traversal
 attempts, scope isolation, and artifact behavior after environment termination.
+
+Evidence (2026-10-06, self-hosted scope):
+- **Inventory:** the guide gives the limits:
+  - 5 MiB per inline file and 10 MiB per creation request;
+  - 50 MiB per Files API file;
+  - 200 MiB per artifact and 500 MiB of outputs per turn.
+  Artifacts are the `/workspace/outputs` files of OpenAI-hosted environments,
+  and the guide states that "Files from self-hosted environments are not
+  published through the Artifacts API". Creation-time `files` and skill
+  references are hosted-environment parameters too.
+- **Artifacts** (`src/artifacts.rs`): the four routes check the session and
+  parameters. They return an empty list and 404 for any artifact, since this
+  service publishes none. The Rust and pinned-SDK tests cover them.
+- **Files API** (`src/files.rs`, `src/upload.rs`):
+  - Public IDs are `file-…`, and contents live under `DATA_DIRECTORY/files`
+    keyed by ID.
+  - Uploads stream through an incremental multipart reader to a temporary
+    file, hashed as they arrive, and are capped at 50 MiB without buffering.
+    Unit tests feed bodies one byte at a time and include near-miss
+    delimiters.
+  - An interrupted upload leaves no record, and its temporary file is removed
+    at once, or by the startup sweep after a crash.
+  - Downloads check the stored SHA-256, then stream from disk. Contents
+    changed on disk return 500 rather than being served.
+- **Into environments:**
+  - Inline and `file_id` sources are written on the executor inside
+    `workspace_directory`, with POSIX and Windows paths parsed as `PathUri`.
+    Traversal is rejected, and links are not followed.
+  - A `file_id` copy holds the file in memory (at most 50 MiB), because the
+    exec-server filesystem API writes whole contents.
+  - Reading files back out goes through the caller's own compute, as the guide
+    directs for self-hosted environments.
+- **Scope:** the service has a single operator-token tenant, so there is no
+  cross-tenant isolation to test.
+- **Out of scope** with hosted environments: creation-time files, published
+  artifacts, and the Skills API (SKL/SKV), which only feeds hosted
+  `skill_reference` inputs.
 
 ## G11 — Credentials, webhooks, and observability (complete locally except environment-dependent parts)
 

@@ -1,5 +1,6 @@
 mod actions;
 mod agent_tools;
+mod artifacts;
 mod capabilities;
 mod configuration;
 mod contract;
@@ -26,6 +27,7 @@ mod subagents;
 mod telemetry;
 mod traces;
 mod turns;
+mod upload;
 mod usage;
 mod vaults;
 mod webhook_delivery;

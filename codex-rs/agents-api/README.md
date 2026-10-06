@@ -128,7 +128,8 @@ remain available without that header. New session routes are:
 | GET | `/v1/agents/environments/{id}` | A self-hosted environment's status (`pending`, `connected`, `disconnected`) |
 | POST / GET | `/v1/agents/environments/{id}/files` | Write an inline or `file_id` file into, or list files in, a connected environment's workspace |
 | POST / GET | `/v1/files` | Upload (multipart, at most 50 MiB, optional `expires_after`) or list files |
-| GET / DELETE | `/v1/files/{id}` | Retrieve or delete an uploaded file; `/content` downloads it |
+| GET / DELETE | `/v1/files/{id}` | Retrieve or delete an uploaded file; `/content` streams it after checking its SHA-256 |
+| GET | `/v1/agents/sessions/{id}/artifacts` | Always empty: self-hosted files are not published as artifacts (retrieve, content, and delete return 404) |
 
 Lists accept `after`, `order=asc|desc`, and `limit=1..100`; item lists also accept
 `turn_id`. Records persist before their events are emitted. Disconnecting an HTTP

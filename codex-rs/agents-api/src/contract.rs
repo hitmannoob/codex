@@ -45,6 +45,18 @@ pub(crate) fn router() -> Router<Arc<State>> {
         )
         .route("/v1/agents/sessions/{id}/items", get(crate::records::items))
         .route(
+            "/v1/agents/sessions/{id}/artifacts",
+            get(crate::artifacts::list),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/artifacts/{artifact_id}",
+            get(crate::artifacts::missing).delete(crate::artifacts::missing),
+        )
+        .route(
+            "/v1/agents/sessions/{id}/artifacts/{artifact_id}/content",
+            get(crate::artifacts::missing),
+        )
+        .route(
             "/v1/agents/environments/{id}",
             get(crate::environments::retrieve),
         )

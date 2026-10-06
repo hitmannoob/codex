@@ -81,6 +81,20 @@ assert [(item.status, item.exit_code) for item in commands] == [("completed", 0)
     commands
 )
 
+# Self-hosted files are never published as artifacts.
+artifacts = sessions.artifacts
+assert list(artifacts.list(session_id)) == []
+assert (
+    list(
+        artifacts.list(session_id, environment_id=environment.id, order="asc", limit=5)
+    )
+    == []
+)
+rejected(openai.BadRequestError, artifacts.list, session_id, after="artifact_1")
+for operation in [artifacts.retrieve, artifacts.content, artifacts.delete]:
+    rejected(openai.NotFoundError, operation, "artifact_1", session_id=session_id)
+rejected(openai.NotFoundError, artifacts.list, "missing-session")
+
 # Without an executor, input waits behind an environment_connection action.
 waiting = sessions.create(
     agent={"model": "mock-model"},

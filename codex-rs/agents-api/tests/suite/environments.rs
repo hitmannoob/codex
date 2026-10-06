@@ -195,6 +195,14 @@ async fn self_hosted_input_waits_for_the_executor_and_runs_in_its_workspace() ->
         let turns = request(&client, reqwest::Method::GET, &format!("{url}/turns"), Value::Null).await?;
         assert_eq!(turns["data"].as_array().map(Vec::len), Some(1));
 
+        // Self-hosted files are never published as artifacts.
+        assert_eq!(
+            request(&client, reqwest::Method::GET, &format!("{url}/artifacts"), Value::Null).await?,
+            json!({"object":"list","first_id":null,"last_id":null,"data":[],"has_more":false})
+        );
+        let artifact = client.get(format!("{url}/artifacts/artifact_1")).bearer_auth(TOKEN).send().await?;
+        assert_eq!(artifact.status(), reqwest::StatusCode::NOT_FOUND);
+
         // Deleting the session forgets the environment; the caller's compute is
         // the caller's to stop.
         let session_id = session["id"].as_str().context("session id")?;

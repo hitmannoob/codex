@@ -1,14 +1,14 @@
 //! A minimal Files API (`/v1/files`) for uploads that environment files name
 //! by `file_id`. Contents live under `DATA_DIRECTORY/files`, metadata in the
 //! database. A file expires only when its upload asks for it; an expired file
-//! reads as deleted and is removed on the next upload or start.
+//! reads as deleted and is removed on the next upload or start. Uploads stream
+//! to disk with a SHA-256 digest that is checked before contents are served.
 use crate::ApiError;
 use crate::State;
 use crate::contract::invalid;
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::DefaultBodyLimit;
+use axum::body::Body;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State as Extract;
@@ -22,8 +22,11 @@ use axum::routing::post;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 /// The largest upload, and so the largest `file_id` environment file.
@@ -42,12 +45,7 @@ pub(crate) struct Files(pub(crate) PathBuf);
 
 pub(crate) fn router() -> Router<Arc<State>> {
     Router::new()
-        .route(
-            "/v1/files",
-            post(create)
-                .get(list)
-                .layer(DefaultBodyLimit::max(MAX_FILE_BYTES + 1024 * 1024)),
-        )
+        .route("/v1/files", post(create).get(list))
         .route("/v1/files/{id}", get(retrieve).delete(delete))
         .route("/v1/files/{id}/content", get(content))
 }
@@ -78,12 +76,56 @@ async fn row(state: &State, id: &str) -> Result<Row, ApiError> {
     row.ok_or_else(not_found)
 }
 
-/// A live file's contents, for an environment file's `file_id` source.
+/// A live file's stored digest, if it has one (uploads before digests did not).
+async fn digest(state: &State, id: &str) -> Result<Option<String>, ApiError> {
+    let digest: Option<Option<String>> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT sha256 FROM files WHERE id = ? AND {LIVE}"
+    )))
+    .bind(id)
+    .bind(crate::contract::now() as i64)
+    .fetch_optional(&state.store.0)
+    .await
+    .map_err(anyhow::Error::from)?;
+    digest.ok_or_else(not_found)
+}
+
+fn corrupted() -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "file contents failed their integrity check".into(),
+    )
+}
+
+/// A live file's contents, checked against its digest, for an environment
+/// file's `file_id` source. Uploads are bounded, so this holds at most
+/// [`MAX_FILE_BYTES`].
 pub(crate) async fn read(state: &State, id: &str) -> Result<Vec<u8>, ApiError> {
-    row(state, id).await?;
-    tokio::fs::read(state.files.0.join(id))
+    let expected = digest(state, id).await?;
+    let contents = tokio::fs::read(state.files.0.join(id))
         .await
-        .map_err(|_| not_found())
+        .map_err(|_| not_found())?;
+    if expected.is_some_and(|expected| format!("{:x}", Sha256::digest(&contents)) != expected) {
+        return Err(corrupted());
+    }
+    Ok(contents)
+}
+
+/// Check a stored file against its digest without holding it in memory.
+async fn verify(path: &std::path::Path, expected: &str) -> Result<(), ApiError> {
+    let mut file = tokio::fs::File::open(path).await.map_err(|_| not_found())?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0; 64 * 1024];
+    loop {
+        let read = file.read(&mut chunk).await.map_err(anyhow::Error::from)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    if format!("{:x}", hasher.finalize()) != expected {
+        return Err(corrupted());
+    }
+    Ok(())
 }
 
 /// Remove expired files.
@@ -120,144 +162,86 @@ pub(crate) async fn sweep(state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One `multipart/form-data` part.
-struct Part<'a> {
-    name: String,
-    filename: Option<String>,
-    data: &'a [u8],
-}
-
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    haystack
-        .get(from..)?
-        .windows(needle.len())
-        .position(|window| window == needle)
-        .map(|position| position + from)
-}
-
-/// The parts of a `multipart/form-data` body, or `None` when it is malformed.
-fn parts<'a>(content_type: &str, body: &'a [u8]) -> Option<Vec<Part<'a>>> {
-    let boundary = content_type
-        .split(';')
-        .map(str::trim)
-        .find_map(|parameter| parameter.strip_prefix("boundary="))?
-        .trim_matches('"');
-    let delimiter = format!("--{boundary}").into_bytes();
-    let separator = format!("\r\n--{boundary}").into_bytes();
-    let mut cursor = find(body, &delimiter, 0)? + delimiter.len();
-    let mut parts = Vec::new();
-    loop {
-        if body.get(cursor..cursor + 2)? == b"--" {
-            return Some(parts);
-        }
-        cursor += 2; // The CRLF after a delimiter.
-        let headers_end = find(body, b"\r\n\r\n", cursor)?;
-        let headers = std::str::from_utf8(&body[cursor..headers_end]).ok()?;
-        let disposition = headers.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-disposition")
-                .then_some(value)
-        })?;
-        let parameter = |key: &str| {
-            disposition.split(';').map(str::trim).find_map(|parameter| {
-                parameter
-                    .strip_prefix(key)
-                    .and_then(|rest| rest.strip_prefix('='))
-                    .map(|value| value.trim_matches('"').to_owned())
-            })
-        };
-        let data_start = headers_end + 4;
-        let data_end = find(body, &separator, data_start)?;
-        parts.push(Part {
-            name: parameter("name")?,
-            filename: parameter("filename"),
-            data: &body[data_start..data_end],
-        });
-        cursor = data_end + separator.len();
-    }
-}
-
 async fn create(
     Extract(state): Extract<Arc<State>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<Value>, ApiError> {
-    let content_type = headers
+    let boundary = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| value.starts_with("multipart/form-data"))
-        .ok_or_else(|| invalid("uploads must be multipart/form-data"))?;
-    let parts = parts(content_type, &body).ok_or_else(|| invalid("malformed multipart body"))?;
-    let field = |name: &str| {
-        parts
-            .iter()
-            .find(|part| part.name == name)
-            .map(|part| String::from_utf8_lossy(part.data).into_owned())
-    };
-    let file = parts
-        .iter()
-        .find(|part| part.name == "file")
-        .ok_or_else(|| invalid("file is required"))?;
-    let purpose = field("purpose").ok_or_else(|| invalid("purpose is required"))?;
-    if !PURPOSES.contains(&purpose.as_str()) {
-        return Err(invalid(format!(
-            "purpose must be one of {}",
-            PURPOSES.join(", ")
-        )));
-    }
-    if file.data.len() > MAX_FILE_BYTES {
-        return Err(invalid(format!(
-            "files are limited to {MAX_FILE_BYTES} bytes"
-        )));
-    }
-    let filename = file
-        .filename
-        .clone()
-        .filter(|name| !name.is_empty() && name.len() <= 512)
-        .ok_or_else(|| invalid("the file part needs a filename of at most 512 bytes"))?;
-    let now = crate::contract::now() as i64;
-    let expires_at = match (
-        field("expires_after[anchor]"),
-        field("expires_after[seconds]"),
-    ) {
-        (None, None) => None,
-        (Some(anchor), Some(seconds)) if anchor == "created_at" => {
-            let seconds: i64 = seconds
-                .parse()
-                .ok()
-                .filter(|seconds| (3600..=2_592_000).contains(seconds))
-                .ok_or_else(|| invalid("expires_after.seconds must be between 3600 and 2592000"))?;
-            Some(now + seconds)
-        }
-        _ => {
-            return Err(invalid("expires_after needs anchor created_at and seconds"));
-        }
-    };
+        .and_then(crate::upload::boundary)
+        .ok_or_else(|| invalid("uploads must be multipart/form-data with a boundary"))?;
     expire(&state).await?;
     let id = format!("file-{}", Uuid::new_v4().simple());
     tokio::fs::create_dir_all(&state.files.0)
         .await
         .map_err(anyhow::Error::from)?;
-    // Write under a temporary name so a crash never leaves partial contents
-    // under a file's ID.
+    // Received under a temporary name, so an interrupted upload never leaves
+    // partial contents under a file's ID; the startup sweep removes it.
     let partial = state.files.0.join(format!("{id}.partial"));
-    tokio::fs::write(&partial, file.data)
-        .await
-        .map_err(anyhow::Error::from)?;
-    tokio::fs::rename(&partial, state.files.0.join(&id))
-        .await
-        .map_err(anyhow::Error::from)?;
+    let received = async {
+        let upload =
+            crate::upload::receive(body, &boundary, &partial, MAX_FILE_BYTES as u64).await?;
+        let purpose = upload
+            .fields
+            .get("purpose")
+            .cloned()
+            .ok_or_else(|| invalid("purpose is required"))?;
+        if !PURPOSES.contains(&purpose.as_str()) {
+            return Err(invalid(format!(
+                "purpose must be one of {}",
+                PURPOSES.join(", ")
+            )));
+        }
+        if upload.filename.is_empty() || upload.filename.len() > 512 {
+            return Err(invalid(
+                "the file part needs a filename of at most 512 bytes",
+            ));
+        }
+        let now = crate::contract::now() as i64;
+        let expires_at = match (
+            upload.fields.get("expires_after[anchor]"),
+            upload.fields.get("expires_after[seconds]"),
+        ) {
+            (None, None) => None,
+            (Some(anchor), Some(seconds)) if anchor == "created_at" => {
+                let seconds: i64 = seconds
+                    .parse()
+                    .ok()
+                    .filter(|seconds| (3600..=2_592_000).contains(seconds))
+                    .ok_or_else(|| {
+                        invalid("expires_after.seconds must be between 3600 and 2592000")
+                    })?;
+                Some(now + seconds)
+            }
+            _ => {
+                return Err(invalid("expires_after needs anchor created_at and seconds"));
+            }
+        };
+        tokio::fs::rename(&partial, state.files.0.join(&id))
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok((upload, purpose, now, expires_at))
+    }
+    .await;
+    let (upload, purpose, now, expires_at) = match received {
+        Ok(received) => received,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(error);
+        }
+    };
     let row: Row = (
         id,
-        filename,
+        upload.filename,
         purpose,
-        file.data.len() as i64,
+        upload.size as i64,
         now,
         expires_at,
     );
-    sqlx::query("INSERT INTO files (id, filename, purpose, bytes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .bind(&row.0).bind(&row.1).bind(&row.2).bind(row.3).bind(row.4).bind(row.5)
+    sqlx::query("INSERT INTO files (id, filename, purpose, bytes, created_at, expires_at, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(&row.0).bind(&row.1).bind(&row.2).bind(row.3).bind(row.4).bind(row.5).bind(&upload.sha256)
         .execute(&state.store.0).await.map_err(anyhow::Error::from)?;
     Ok(Json(public(row)))
 }
@@ -273,8 +257,23 @@ async fn content(
     Extract(state): Extract<Arc<State>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let data = read(&state, &id).await?;
-    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response())
+    let expected = digest(&state, &id).await?;
+    let path = state.files.0.join(&id);
+    if let Some(expected) = expected {
+        verify(&path, &expected).await?;
+    }
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| not_found())?;
+    let length = file.metadata().await.map_err(anyhow::Error::from)?.len();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response())
 }
 
 async fn delete(
