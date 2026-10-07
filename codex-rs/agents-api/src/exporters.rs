@@ -77,6 +77,9 @@ pub(crate) fn install(export: Export) -> anyhow::Result<Option<OtelProvider>> {
                 runtime_metrics: false,
                 span_attributes: BTreeMap::new(),
                 tracestate: BTreeMap::new(),
+                http_client_factory: codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
             })
             .map_err(|error| anyhow::anyhow!("telemetry export setup failed: {error}"))?
         }

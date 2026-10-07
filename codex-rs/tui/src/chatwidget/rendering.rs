@@ -14,6 +14,7 @@ use std::cell::Cell;
 
 struct ExternalWriterNotice {
     command_center_available: bool,
+    agents_navigation_key_available: bool,
     transcript_hint: Option<crate::key_hint::ShortcutHint>,
 }
 
@@ -98,7 +99,13 @@ impl ExternalWriterNotice {
             crate::key_hint::plain(KeyCode::Char('q')).display_label(),
         ];
         if self.command_center_available {
-            items.push((escape, "command center".to_string()));
+            let key = if self.agents_navigation_key_available {
+                let left = crate::key_hint::plain(KeyCode::Left).display_label();
+                format!("{left}/{escape}")
+            } else {
+                escape
+            };
+            items.push((key, "command center".to_string()));
         } else {
             quit_keys.insert(/*index*/ 0, escape);
         }
@@ -120,16 +127,33 @@ impl ExternalWriterNotice {
 
 impl ChatWidget {
     pub(crate) fn as_renderable(&self) -> RenderableItem<'_> {
+        let backdrop = self.as_backdrop_renderable();
+        match self.centered_dialog() {
+            Some(dialog) => RenderableItem::Owned(Box::new(crate::bottom_pane::DialogOverlay {
+                backdrop,
+                dialog,
+            })),
+            None => backdrop,
+        }
+    }
+
+    pub(crate) fn centered_dialog(&self) -> Option<crate::bottom_pane::CenteredView<'_>> {
+        self.bottom_pane.centered_dialog()
+    }
+
+    fn as_backdrop_renderable(&self) -> RenderableItem<'_> {
         if self
             .bottom_pane
             .selected_index_for_active_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
             .is_some()
+            || (self.bottom_pane.has_centered_view()
+                && self
+                    .bottom_pane
+                    .selected_index_for_present_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
+                    .is_some())
         {
-            return self.bottom_pane_renderable(
-                /*footer*/ None,
-                crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-                /*composer_gap*/ None,
-            );
+            return self
+                .bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
         }
 
         let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
@@ -190,14 +214,10 @@ impl ChatWidget {
         }
         flex.push(
             /*flex*/ 0,
-            self.bottom_pane_renderable(
-                /*footer*/ None,
-                crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-                /*composer_gap*/ None,
-            )
-            .inset(Insets::tlbr(
-                /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-            )),
+            self.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default())
+                .inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                )),
         );
         RenderableItem::Owned(Box::new(flex))
     }
@@ -208,9 +228,7 @@ impl ChatWidget {
     /// remain consistent. Owned transcripts reserve their shared hint row above the composer.
     pub(crate) fn bottom_pane_renderable<'a>(
         &'a self,
-        footer: Option<&'a crate::bottom_pane::TranscriptFooter>,
-        command_popup_placement: crate::bottom_pane::CommandPopupPlacement,
-        composer_gap: Option<&'a crate::bottom_pane::ComposerGap>,
+        mut options: crate::bottom_pane::ComposerRenderOptions<'a>,
     ) -> RenderableItem<'a> {
         if self.fork_in_progress {
             RenderableItem::Owned(Box::new(
@@ -221,6 +239,7 @@ impl ChatWidget {
         } else if self.external_writer_view && !self.bottom_pane.has_active_view() {
             RenderableItem::Owned(Box::new(ExternalWriterNotice {
                 command_center_available: self.remote_connection.is_some(),
+                agents_navigation_key_available: self.agents_navigation_key_available(),
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
             }))
         } else {
@@ -233,16 +252,11 @@ impl ChatWidget {
             } else {
                 self.ambient_pet_wrap_reserved_cols()
             };
-            self.bottom_pane
-                .as_renderable_with_options(crate::bottom_pane::ComposerRenderOptions {
-                    composer_gap,
-                    warning_count: self.warning_display_state.count,
-                    textarea_right_reserve: right_reserve,
-                    separate_status_line: command_popup_placement
-                        != crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-                    command_popup_placement,
-                    footer,
-                })
+            options.warning_count = self.warning_display_state.count;
+            options.textarea_right_reserve = right_reserve;
+            options.separate_status_line = options.command_popup_placement
+                != crate::bottom_pane::CommandPopupPlacement::AboveComposer;
+            self.bottom_pane.backdrop_with_options(options)
         }
     }
 

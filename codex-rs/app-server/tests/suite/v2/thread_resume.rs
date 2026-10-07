@@ -189,11 +189,6 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
     }))?;
     append_rollout_item_to_path(
         &path,
-        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
-    )
-    .await?;
-    append_rollout_item_to_path(
-        &path,
         &RolloutItem::Compacted(CompactedItem {
             message: "compacted history".to_string(),
             replacement_history: Some(Vec::new()),
@@ -206,7 +201,13 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
             window_id: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
+    )
+    .await?;
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
     )
     .await?;
 
@@ -3914,6 +3915,7 @@ async fn cold_paginated_resume_restores_usage_without_loading_turns() -> Result<
     append_rollout_item_to_path(
         &path,
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: canonical_turn_id.to_string(),
             root_turn_id: None,
             trace_id: None,
@@ -4026,6 +4028,7 @@ async fn cold_paginated_resume_omits_usage_when_its_turn_is_ambiguous() -> Resul
     append_rollout_item_to_path(
         &path,
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: interrupted_turn_id.to_string(),
             root_turn_id: None,
             trace_id: None,
@@ -4169,6 +4172,7 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: stale_turn_id.to_string(),
                 root_turn_id: None,
                 trace_id: None,
@@ -4258,6 +4262,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: interrupted_turn_id.to_string(),
                 root_turn_id: None,
                 trace_id: None,
@@ -4312,9 +4317,11 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: None,
                 turn_id: Some(interrupted_turn_id.to_string()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
+                error: None,
                 completed_at: None,
                 duration_ms: None,
             }))?,
@@ -4574,6 +4581,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
             "timestamp": meta_rfc3339,
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: turn_id.to_string(),
                 root_turn_id: None,
                 trace_id: None,
@@ -5146,14 +5154,22 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
                 responses::ev_completed("resp-1"),
             ]),
         }],
-        vec![StreamingSseChunk {
-            gate: Some(running_turn_gate),
-            body: responses::sse(vec![
-                responses::ev_response_created("resp-2"),
-                responses::ev_assistant_message("msg-2", "Done"),
-                responses::ev_completed("resp-2"),
-            ]),
-        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: responses::sse(vec![
+                    responses::ev_response_created("resp-2"),
+                    responses::ev_message_item_added("msg-2", ""),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(running_turn_gate),
+                body: responses::sse(vec![
+                    responses::ev_assistant_message("msg-2", "Done"),
+                    responses::ev_completed("resp-2"),
+                ]),
+            },
+        ],
     ])
     .await;
     let codex_home = TempDir::new()?;
@@ -5217,12 +5233,14 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+    // An assistant item starts after the user message has reached live history.
+    // The gated remainder of the response keeps the turn running during resume.
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             let started: ItemStartedNotification =
                 primary.read_notification("item/started").await?;
             if started.turn_id == running_turn.id
-                && matches!(started.item, ThreadItem::UserMessage { .. })
+                && matches!(started.item, ThreadItem::AgentMessage { .. })
             {
                 return Ok::<(), anyhow::Error>(());
             }

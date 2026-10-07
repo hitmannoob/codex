@@ -8,6 +8,7 @@ use crate::ToolSuggestPluginDiscoveryInput;
 use crate::installed_marketplaces::marketplace_install_root;
 use crate::loader::load_plugin_skill_inventory;
 use crate::loader::load_plugins_from_layer_stack;
+use crate::loader::plugin_capability_summary_from_root;
 use crate::loader::refresh_non_curated_plugin_cache;
 use crate::loader::refresh_non_curated_plugin_cache_force_reinstall;
 use crate::marketplace::MarketplacePluginInstallPolicy;
@@ -857,7 +858,6 @@ fn remote_installed_plugin_in_marketplace(
     marketplace_name: &str,
 ) -> RemoteInstalledPlugin {
     RemoteInstalledPlugin {
-        extensions: None,
         canonical_app_id: None,
         marketplace_name: marketplace_name.to_string(),
         id: format!("plugins~Plugin_{name}"),
@@ -981,7 +981,9 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,
@@ -1083,7 +1085,9 @@ enabled = true
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -1840,7 +1844,7 @@ enabled = true
 
     assert_eq!(
         outcome.plugins()[0].disabled_skill_paths,
-        HashSet::from([skill_path])
+        HashSet::from([PathUri::from_abs_path(&skill_path)])
     );
     assert!(!outcome.plugins()[0].has_enabled_skills);
     assert!(outcome.capability_summaries().is_empty());
@@ -1922,6 +1926,7 @@ async fn plugin_telemetry_metadata_uses_default_mcp_config_path() {
         &PluginId::parse("sample@test").expect("plugin id should parse"),
         &plugin_root.abs(),
         test_skill_root_loader().as_ref(),
+        &crate::manifest::ManifestCache::disabled(),
     )
     .await;
 
@@ -1965,6 +1970,7 @@ async fn plugin_capability_summary_uses_manifest_mcp_server_objects() {
         &PluginId::parse("counter-sample@test").expect("plugin id should parse"),
         &plugin_root.abs(),
         test_skill_root_loader().as_ref(),
+        &crate::manifest::ManifestCache::disabled(),
     )
     .await;
 
@@ -2186,7 +2192,9 @@ async fn load_plugins_uses_manifest_configured_component_paths() {
                     environment_id: "local".to_string(),
                     enabled: true,
                     required: false,
+                    startup_readiness: Default::default(),
                     supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
                     omit_tools_from: None,
                     disabled_reason: None,
                     startup_timeout_sec: None,
@@ -2287,7 +2295,10 @@ async fn install_plugin_materializes_default_command_skills() {
         resolved
             .skills
             .iter()
-            .map(|skill| skill.path_to_skills_md.clone())
+            .map(|skill| skill
+                .path_to_skills_md
+                .to_abs_path()
+                .expect("host skill path"))
             .collect::<Vec<_>>(),
         vec![
             AbsolutePathBuf::from_absolute_path_checked(
@@ -2413,7 +2424,12 @@ async fn load_plugin_skills_dedupes_overlapping_manifest_roots() {
     let skill_paths = resolved
         .skills
         .iter()
-        .map(|skill| skill.path_to_skills_md.clone())
+        .map(|skill| {
+            skill
+                .path_to_skills_md
+                .to_abs_path()
+                .expect("host skill path")
+        })
         .collect::<Vec<_>>();
     let canonical_skill_path = |path| {
         AbsolutePathBuf::from_absolute_path_checked(
@@ -2525,7 +2541,9 @@ async fn load_plugins_ignores_manifest_component_paths_without_dot_slash() {
                 environment_id: "local".to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -2780,7 +2798,9 @@ fn capability_index_filters_inactive_and_zero_capability_plugins() {
         environment_id: "local".to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,

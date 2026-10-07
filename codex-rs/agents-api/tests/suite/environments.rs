@@ -3,7 +3,7 @@ use app_test_support::create_command_execution_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_api::AuthProvider;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_exec_server::RemoteEnvironmentConfig;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -32,7 +32,7 @@ fn executor(remote_url: &str, environment_id: &str) -> anyhow::Result<tokio::tas
         Arc::new(EnvironmentKey),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )?;
-    let paths = ExecServerRuntimePaths::new(
+    let paths = ExecServerRuntimeOptions::new(
         std::env::current_exe()?,
         /*codex_linux_sandbox_exe*/ None,
     )?;

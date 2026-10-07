@@ -14,6 +14,7 @@ base64 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 codex-app-server-client = { workspace = true }
 codex-app-server-protocol = { workspace = true }
+codex-config = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-http-client = { workspace = true }
 codex-keyring-store = { workspace = true }
@@ -52,7 +53,6 @@ tokio-tungstenite = { workspace = true }
 app_test_support = { path = "../app-server/tests/common" }
 codex-api = { workspace = true }
 codex-arg0 = { workspace = true }
-codex-config = { workspace = true }
 codex-feedback = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rollout = { workspace = true }

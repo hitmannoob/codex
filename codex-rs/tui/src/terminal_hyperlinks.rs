@@ -7,6 +7,8 @@ mod paragraph;
 mod source;
 
 pub(crate) use paragraph::HyperlinkParagraph;
+pub(crate) use paragraph::HyperlinkRows;
+pub(crate) use paragraph::HyperlinkText;
 pub(crate) use source::LineWrapPolicy;
 pub(crate) use source::LogicalLineSource;
 
@@ -426,10 +428,16 @@ pub(crate) fn remap_wrapped_line(
     wrapped: Vec<Line<'static>>,
 ) -> Vec<HyperlinkLine> {
     let mut out = plain_hyperlink_lines(wrapped);
-    if source.hyperlinks.is_empty() {
+    if source.hyperlinks.is_empty() && source.source.is_none() {
         return out;
     }
     let source_text = line_text(&source.line);
+    if source_text.trim().is_empty() {
+        for line in &mut out {
+            line.source = source.source.clone();
+        }
+        return out;
+    }
     let mut source_byte = 0usize;
     let mut source_column = 0usize;
     let mut link_index = 0usize;
@@ -447,6 +455,10 @@ pub(crate) fn remap_wrapped_line(
             continue;
         };
         let mapped = &rendered[rendered_start..];
+        line.source = source
+            .source
+            .as_ref()
+            .map(|source| source.wrapped(source_byte..source_byte + mapped.len(), rendered_start));
         let mut output_column = display_width(&rendered[..rendered_start]);
         for grapheme in mapped.graphemes(/*is_extended*/ true) {
             let width = display_width(grapheme);
@@ -576,6 +588,14 @@ fn trailing_url_end(candidate: &str) -> usize {
             unmatched
         } else {
             matches!(ch, ',' | '.' | ';' | '!' | '\'' | '"')
+                || ch == '?'
+                    && match remaining.chars().rev().nth(1) {
+                        Some(')') => balances[0] < 0,
+                        Some(']') => balances[1] < 0,
+                        Some('}') => balances[2] < 0,
+                        Some('>') => balances[3] < 0,
+                        _ => false,
+                    }
         };
         if !trim {
             break;
@@ -880,13 +900,18 @@ mod tests {
 
     #[test]
     fn discovers_punctuated_web_url_columns() {
-        assert_eq!(
-            web_links_in_text("See (https://example.com/a)."),
-            vec![TerminalHyperlink::web(
-                /*columns*/ 5..26,
-                "https://example.com/a".to_string(),
-            )]
-        );
+        for text in [
+            "See (https://example.com/a).",
+            "See (https://example.com/a)?",
+        ] {
+            assert_eq!(
+                web_links_in_text(text),
+                vec![TerminalHyperlink::web(
+                    /*columns*/ 5..26,
+                    "https://example.com/a".to_string(),
+                )]
+            );
+        }
     }
 
     #[test]
@@ -910,14 +935,18 @@ mod tests {
 
     #[test]
     fn preserves_balanced_parentheses_in_bare_web_urls() {
-        let destination = "https://en.wikipedia.org/wiki/Function_(mathematics)";
-        assert_eq!(
-            web_links_in_text(&format!("See ({destination}).")),
-            vec![TerminalHyperlink::web(
-                /*columns*/ 5..5 + usize::from(destination.cell_width()),
-                destination.to_string(),
-            )]
-        );
+        for destination in [
+            "https://en.wikipedia.org/wiki/Function_(mathematics)",
+            "https://en.wikipedia.org/wiki/Function_(mathematics)?q=(alpha)?",
+        ] {
+            assert_eq!(
+                web_links_in_text(&format!("See ({destination}).")),
+                vec![TerminalHyperlink::web(
+                    /*columns*/ 5..5 + usize::from(destination.cell_width()),
+                    destination.to_string(),
+                )]
+            );
+        }
     }
 
     #[test]

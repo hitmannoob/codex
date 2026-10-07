@@ -80,6 +80,8 @@ impl Workspace {
                         url.to_owned(),
                         environment_id.to_owned(),
                         state.registry.harness_token().to_owned(),
+                        // The service's own connection needs no skills.
+                        codex_config::ScopedSkillsConfig::default(),
                     )
                     .map_err(anyhow::Error::from)?;
                 state

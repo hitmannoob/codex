@@ -27,6 +27,7 @@ use crate::bwrap::WSLG_DISTRO_ROOT;
 use crate::bwrap::create_bwrap_command_args;
 use crate::landlock::apply_permission_profile_to_current_thread;
 use crate::launcher::exec_bwrap;
+use crate::launcher::initialize_bwrap_launcher;
 use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
 use crate::proxy_routing::prepare_host_proxy_route_spec;
@@ -147,6 +148,11 @@ pub struct LandlockCommand {
     #[arg(long = "no-proc", default_value_t = false)]
     pub no_proc: bool,
 
+    /// Reuse the caller's PID namespace and `/proc` together.
+    /// Only trusted executor startup may select this mode.
+    #[arg(long = "inherit-pid-namespace", hide = true)]
+    pub inherit_pid_namespace: bool,
+
     /// Full command args to run under the Linux sandbox helper.
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
@@ -170,6 +176,7 @@ pub fn run_main() -> ! {
         proxy_route_spec,
         verify_fd_mounts,
         no_proc,
+        inherit_pid_namespace,
         command,
     } = LandlockCommand::parse();
     let allow_network_for_proxy = managed_network.is_some();
@@ -298,7 +305,8 @@ pub fn run_main() -> ! {
             (None, Vec::new())
         };
         let options = BwrapOptions {
-            mount_proc: !no_proc,
+            mount_proc: !no_proc && !inherit_pid_namespace,
+            inherit_pid_namespace,
             network_mode: bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy),
             mask_wsl_interop: !file_system_sandbox_policy.has_full_disk_write_access()
                 && Path::new(WSL_INTEROP_DIR).is_dir(),
@@ -420,6 +428,9 @@ fn run_bwrap_with_proc_fallback(
     proxy_controls: Vec<File>,
 ) -> ! {
     let command_cwd = command_cwd.unwrap_or(sandbox_policy_cwd);
+
+    // Select before the preflight, whose synthetic policy omits writable roots.
+    initialize_bwrap_launcher(file_system_sandbox_policy, sandbox_policy_cwd);
 
     if options.mount_proc
         && !preflight_proc_mount_support(options)

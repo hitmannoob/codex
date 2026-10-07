@@ -3,6 +3,7 @@ use crate::TS;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
+use codex_utils_redacted_string::RedactedString;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -40,6 +41,12 @@ pub struct EnvironmentAddParams {
     /// `noiseRegistry` must be set.
     #[ts(optional = nullable)]
     pub exec_server_url: Option<String>,
+    /// Optional raw bearer token for executor authentication, including reconnects.
+    /// Requires a secure transport or a loopback destination. Applies to
+    /// `execServerUrl`.
+    #[ts(type = "string | null")]
+    #[ts(optional = nullable)]
+    pub auth_bearer_token: Option<RedactedString>,
     /// Environment registry that an exec-server started with `--remote` has
     /// registered with. The connection is Noise-encrypted end to end, and
     /// every connection obtains fresh rendezvous credentials from the registry.
@@ -49,6 +56,9 @@ pub struct EnvironmentAddParams {
     #[ts(type = "number | null")]
     #[ts(optional = nullable)]
     pub connect_timeout_ms: Option<u64>,
+    /// Required skills supplied by this environment, checked before model inference.
+    #[ts(optional = nullable)]
+    pub skills: Option<EnvironmentSkillsParams>,
 }
 
 /// A Noise environment registry reached for one registered executor.
@@ -85,6 +95,15 @@ pub struct EnvironmentRemoveResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct EnvironmentAddResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct EnvironmentSkillsParams {
+    /// Exact catalog names that must be available from this environment.
+    #[ts(optional = nullable)]
+    pub required: Option<Vec<String>>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

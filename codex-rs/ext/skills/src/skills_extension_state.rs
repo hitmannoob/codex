@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_mcp::McpResourceClient;
 use codex_mcp::McpResourceClientAuthKey;
+use codex_mcp::McpResourceServerCacheKey;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 
 use crate::catalog::SkillAuthority;
@@ -22,30 +23,29 @@ const MAX_CACHED_CLOUD_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 /// Stores published cloud and executor catalogs for a thread.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SkillsExtensionState {
-    pub(crate) executor_catalog_selection: ExecutorCatalogSelection,
     pub(crate) executor_cache: Vec<CachedExecutorCatalog>,
     pub(crate) executor_discovery_cache: Option<CachedExecutorDiscoveryCatalog>,
     pub(crate) cloud_cache: Option<Arc<CloudSkillGeneration>>,
 }
 
-/// Selects the existing cache entries published by the most recent refresh.
-#[derive(Clone, Debug, Default)]
-pub(crate) enum ExecutorCatalogSelection {
-    #[default]
-    Discovery,
-    Roots(Vec<SelectedCapabilityRoot>),
-}
-
 /// Keeps cloud metadata and contents within one published auth scope and Apps availability state.
-/// A successful turn refresh replaces the Arc so late reads cannot populate its successor.
+/// Warning-free discovery is reused until the Apps resource generation changes.
+/// A successful refresh replaces the Arc so late reads cannot populate its successor.
 pub(crate) struct CloudSkillGeneration {
     pub(crate) auth_cache_key: Option<McpResourceClientAuthKey>,
+    pub(crate) resource_cache_key: Option<McpResourceServerCacheKey>,
     pub(crate) mcp_resources: Option<McpResourceClient>,
     pub(crate) catalog: Option<SkillCatalog>,
     pub(crate) resources: Mutex<CloudResourceCache>,
 }
 
 impl CloudSkillGeneration {
+    pub(crate) fn current_resource_cache_key(&self) -> Option<McpResourceServerCacheKey> {
+        self.mcp_resources
+            .as_ref()
+            .and_then(|client| client.server_cache_key(codex_mcp::CODEX_APPS_MCP_SERVER_NAME))
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         self.auth_cache_key
             == self.mcp_resources.as_ref().map(|client| {
@@ -70,7 +70,7 @@ pub(crate) struct CachedExecutorCatalog {
     pub(crate) catalog: SkillCatalog,
 }
 
-/// Retains the latest projection for snapshots; refresh only reuses successful unchanged inputs.
+/// Keeps the latest result; only successful results for unchanged inputs can be reused.
 #[derive(Clone, Debug)]
 pub(crate) struct CachedExecutorDiscoveryCatalog {
     pub(crate) roots: Vec<SelectedCapabilityRoot>,

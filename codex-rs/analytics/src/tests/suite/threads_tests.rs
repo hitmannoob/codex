@@ -398,6 +398,7 @@ async fn thread_originator_overrides_shared_connection_across_thread_events() {
                     status: CompactionStatus::Completed,
                     codex_error_kind: None,
                     codex_error_http_status_code: None,
+                    usage_limit_window_minutes: None,
                     active_context_tokens_before: 131_000,
                     active_context_tokens_after: 64_000,
                     retained_image_count: None,
@@ -554,6 +555,7 @@ fn subagent_thread_started_review_serializes_expected_shape() {
             ephemeral: false,
             thread_source: Some(ThreadSource::Subagent),
             subagent_source: SubAgentSource::Review,
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 123,
         },
     ));
@@ -613,6 +615,7 @@ fn subagent_thread_started_thread_spawn_serializes_thread_lineage() {
                 agent_nickname: None,
                 agent_role: None,
             },
+            initialization_mode: ThreadInitializationMode::Resumed,
             created_at: 124,
         },
     ));
@@ -620,6 +623,8 @@ fn subagent_thread_started_thread_spawn_serializes_thread_lineage() {
     let payload = serde_json::to_value(&event).expect("serialize thread spawn subagent event");
     assert_eq!(payload["event_params"]["thread_id"], "thread-spawn");
     assert_eq!(payload["event_params"]["thread_source"], "subagent");
+    assert_eq!(payload["event_params"]["initialization_mode"], "resumed");
+    assert_eq!(payload["event_params"]["created_at"], 124);
     assert_eq!(payload["event_params"]["subagent_source"], "thread_spawn");
     assert_eq!(
         payload["event_params"]["parent_thread_id"],
@@ -647,6 +652,7 @@ fn subagent_thread_started_memory_consolidation_serializes_expected_shape() {
             ephemeral: false,
             thread_source: Some(ThreadSource::Subagent),
             subagent_source: SubAgentSource::MemoryConsolidation,
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 125,
         },
     ));
@@ -675,6 +681,7 @@ fn subagent_thread_started_other_serializes_expected_shape() {
             ephemeral: false,
             thread_source: Some(ThreadSource::GuardianReview),
             subagent_source: SubAgentSource::Other("guardian".to_string()),
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 126,
         },
     ));
@@ -703,6 +710,7 @@ fn subagent_thread_started_other_serializes_explicit_parent_thread_id() {
             ephemeral: false,
             thread_source: Some(ThreadSource::GuardianReview),
             subagent_source: SubAgentSource::Other("guardian".to_string()),
+            initialization_mode: ThreadInitializationMode::New,
             created_at: 126,
         },
     ));
@@ -735,6 +743,7 @@ async fn subagent_thread_started_publishes_without_initialize() {
                     ephemeral: false,
                     thread_source: Some(ThreadSource::Subagent),
                     subagent_source: SubAgentSource::Review,
+                    initialization_mode: ThreadInitializationMode::New,
                     created_at: 127,
                 },
             )),
@@ -773,6 +782,7 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
                     ephemeral: false,
                     thread_source: Some(ThreadSource::Subagent),
                     subagent_source: SubAgentSource::Review,
+                    initialization_mode: ThreadInitializationMode::New,
                     created_at: 128,
                 },
             )),

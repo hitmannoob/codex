@@ -143,7 +143,7 @@ async fn worker_reasoning_overrides_follow_effective_client_policy(
     options.thread_source = Some(thread_source);
     let forked = test
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::Interrupted,
             options,
             parent.rollout_path().expect("parent rollout path"),
@@ -265,7 +265,7 @@ async fn reasoning_effort_override_recovery_reuses_trusted_tail_update() -> anyh
             text_elements: Vec::new(),
         }]))
         .await?;
-    let TurnInputSubmission::Started { turn_id } = submission else {
+    let TurnInputSubmission::Started { turn_id, .. } = submission else {
         panic!("expected a new turn");
     };
     wait_for_event(&test.codex, |event| {
@@ -314,7 +314,10 @@ async fn reasoning_effort_override_recovery_reuses_trusted_tail_update() -> anyh
                 cyber_access_program: None,
             })
             .await?,
-        StartIfIdleSubmission::Started { turn_id },
+        StartIfIdleSubmission::Started {
+            root_turn_id: turn_id.clone(),
+            turn_id
+        },
     );
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -619,7 +622,7 @@ async fn reasoning_effort_override_websocket_prewarm_preserves_baseline(
             configure_prewarm(&mut config);
             let forked = previous
                 .thread_manager
-                .fork_thread(
+                .fork_legacy_thread(
                     ForkSnapshot::Interrupted,
                     codex_core::StartThreadOptions::new(config.clone()),
                     previous.codex.rollout_path().expect("rollout path"),

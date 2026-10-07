@@ -1,3 +1,4 @@
+use crate::LinuxSandboxPidNamespace;
 #[cfg(target_os = "linux")]
 use crate::bwrap::WSL1_BWRAP_WARNING;
 #[cfg(target_os = "linux")]
@@ -266,6 +267,7 @@ impl std::error::Error for SandboxTransformError {
 
 #[derive(Clone, Default)]
 pub struct SandboxManager {
+    linux_sandbox_pid_namespace: LinuxSandboxPidNamespace,
     #[cfg(target_os = "macos")]
     seatbelt_profile: MacosSeatbeltProfile,
     #[cfg(target_os = "macos")]
@@ -280,11 +282,18 @@ impl SandboxManager {
     /// Creates a manager that applies the narrower runtime profile required by filesystem helpers.
     pub fn for_file_system_helpers() -> Self {
         Self {
+            linux_sandbox_pid_namespace: LinuxSandboxPidNamespace::default(),
             #[cfg(target_os = "macos")]
             seatbelt_profile: MacosSeatbeltProfile::FileSystemHelper,
             #[cfg(target_os = "macos")]
             allowed_symlinked_codex_home: None,
         }
+    }
+
+    /// Applies a trusted executor startup policy, never a command or repository setting.
+    pub fn with_linux_sandbox_pid_namespace(mut self, mode: LinuxSandboxPidNamespace) -> Self {
+        self.linux_sandbox_pid_namespace = mode;
+        self
     }
 
     /// Allows otherwise-authorized writable roots beneath the opted-in user home
@@ -500,6 +509,11 @@ impl SandboxManager {
                     use_legacy_landlock,
                     managed_network.as_ref(),
                 );
+                // Keep default invocations compatible with older helpers. Only the
+                // startup opt-in requires a helper that understands PID inheritance.
+                if self.linux_sandbox_pid_namespace == LinuxSandboxPidNamespace::Inherit {
+                    args.insert(0, "--inherit-pid-namespace".to_string());
+                }
                 let mut full_command = Vec::with_capacity(1 + args.len());
                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));
                 full_command.append(&mut args);
@@ -568,15 +582,19 @@ impl SandboxManager {
     ) -> Result<SandboxExecRequest, SandboxTransformError> {
         let workspace_roots = request.workspace_roots;
         let proxy_settings_mode = request.windows_sandbox_proxy_settings_mode;
+        let sandbox_exe = request.transform.sandbox_exe.ok_or_else(|| {
+            SandboxTransformError::WindowsSandboxPreparation(
+                "missing Codex executable path".to_string(),
+            )
+        })?;
         let mut request = self.transform(request.transform)?;
-        if request.sandbox == SandboxType::WindowsRestrictedToken {
-            wrap_windows_sandbox_exec_request_for_direct_spawn(
-                &mut request,
-                workspace_roots,
-                codex_home,
-                proxy_settings_mode,
-            )?;
-        }
+        wrap_windows_sandbox_exec_request_for_direct_spawn(
+            &mut request,
+            workspace_roots,
+            codex_home,
+            sandbox_exe,
+            proxy_settings_mode,
+        )?;
         Ok(request)
     }
 }
@@ -586,6 +604,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
     request: &mut SandboxExecRequest,
     workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
+    sandbox_exe: &Path,
     proxy_settings_mode: codex_windows_sandbox::WindowsSandboxProxySettingsMode,
 ) -> Result<(), SandboxTransformError> {
     // TODO(anp): Keep PathUri through the Windows sandbox wrapper boundary.
@@ -608,9 +627,12 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
             "sandbox command was empty".to_string(),
         ));
     };
-    let source = std::path::PathBuf::from(&program);
-    let helper = codex_windows_sandbox::resolve_exe_for_launch(source.as_path(), codex_home);
-    *program = helper.to_string_lossy().into_owned();
+    // transform() may have made the inner command a Codex helper. Only that
+    // helper needs materializing; an arbitrary workload such as cmd.exe does not.
+    if Path::new(program.as_str()) == sandbox_exe {
+        let helper = codex_windows_sandbox::resolve_exe_for_launch(sandbox_exe, codex_home);
+        *program = helper.to_string_lossy().into_owned();
+    }
 
     let inner_command = std::mem::take(&mut request.command);
     let proxy_enforced = request.network.is_some();
@@ -634,6 +656,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
             &request.permission_profile,
             &native_sandbox_policy_cwd,
             use_elevated,
+            &request.env,
         )
     } else {
         resolve_windows_restricted_token_filesystem_overrides(
@@ -665,7 +688,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
             inner_command,
             &native_cwd,
             workspace_roots,
-            &request.env,
+            &mut request.env,
             &request.permission_profile,
             request.windows_sandbox_level,
             proxy_enforced,
@@ -681,7 +704,11 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
         .map_err(|err| SandboxTransformError::WindowsSandboxPreparation(err.to_string()))?;
 
     request.command = Vec::with_capacity(1 + wrapper_args.len());
-    request.command.push(source.to_string_lossy().into_owned());
+    // This outer process interprets Codex wrapper arguments, so it must be the
+    // supplied Codex executable even when the inner command is another program.
+    request
+        .command
+        .push(sandbox_exe.to_string_lossy().into_owned());
     request.command.append(&mut wrapper_args);
     request.sandbox = SandboxType::None;
     request.arg0 = None;

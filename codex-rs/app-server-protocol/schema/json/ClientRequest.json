@@ -762,7 +762,7 @@
       "type": "string"
     },
     "CyberAccessProgram": {
-      "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
+      "description": "Requested cyber treatment for an OpenAI model turn. Authorization and model-tier restrictions remain server-owned.",
       "enum": [
         "standard",
         "daybreakBlue",
@@ -888,6 +888,21 @@
         "environmentId",
         "url"
       ],
+      "type": "object"
+    },
+    "EnvironmentSkillsParams": {
+      "properties": {
+        "required": {
+          "description": "Exact catalog names that must be available from this environment.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "ExperimentalFeatureEnablementSetParams": {
@@ -1756,6 +1771,13 @@
             "null"
           ]
         },
+        "serverName": {
+          "description": "Limit discovery to one server. With a thread ID, reuse that thread's MCP connection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": [
             "string",
@@ -2214,7 +2236,7 @@
       "type": "string"
     },
     "MessagePhase": {
-      "description": "Classifies an assistant message as interim commentary or final answer text.\n\nProviders do not emit this consistently, so callers must treat `None` as \"phase unknown\" and keep compatibility behavior for legacy models.",
+      "description": "Classifies assistant text as commentary, a partial answer, or a terminal answer.\n\nProviders do not emit this consistently, so callers must treat `None` as \"phase unknown\" and keep compatibility behavior for legacy models.",
       "oneOf": [
         {
           "description": "Mid-turn assistant text (for example preamble/progress narration).\n\nAdditional tool calls or assistant output may follow before turn completion.",
@@ -2224,7 +2246,14 @@
           "type": "string"
         },
         {
-          "description": "The assistant's terminal answer text for the current turn.",
+          "description": "Stable answer text that may be followed by more assistant output or tools.",
+          "enum": [
+            "partial_answer"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The assistant's declared terminal answer text for the current turn.",
           "enum": [
             "final_answer"
           ],
@@ -2927,6 +2956,37 @@
     },
     "ResponseItem": {
       "oneOf": [
+        {
+          "properties": {
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "role": {
+              "type": "string"
+            },
+            "tools": {
+              "items": true,
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "additional_tools"
+              ],
+              "title": "AdditionalToolsResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "tools",
+            "type"
+          ],
+          "title": "AdditionalToolsResponseItem",
+          "type": "object"
+        },
         {
           "properties": {
             "content": {
@@ -4269,6 +4329,43 @@
       ],
       "type": "object"
     },
+    "ThreadAttachmentOwnerListParams": {
+      "description": "Parameters for reverse lookup by attachment identity within this server's store.",
+      "properties": {
+        "archived": {
+          "description": "Omitted or null returns all matches; false returns non-archived threads only.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "attachmentType": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identityKey": {
+          "type": "string"
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attachmentType",
+        "identityKey"
+      ],
+      "type": "object"
+    },
     "ThreadAttachmentRemoveParams": {
       "description": "Parameters for deleting an attachment by its stable thread-local identity.",
       "properties": {
@@ -4425,6 +4522,17 @@
     },
     "ThreadGoalClearParams": {
       "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Missing provenance does not supply user authorization."
+        },
         "threadId": {
           "type": "string"
         }
@@ -4445,6 +4553,14 @@
       ],
       "type": "object"
     },
+    "ThreadGoalMutationOrigin": {
+      "description": "Distinguishes explicit user actions from automatic goal lifecycle mutations.",
+      "enum": [
+        "user",
+        "automatic"
+      ],
+      "type": "string"
+    },
     "ThreadGoalSetParams": {
       "properties": {
         "objective": {
@@ -4452,6 +4568,17 @@
             "string",
             "null"
           ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Missing provenance does not supply user authorization."
         },
         "status": {
           "anyOf": [
@@ -4514,14 +4641,54 @@
       ],
       "type": "object"
     },
+    "ThreadItemsListAnchor": {
+      "description": "An exclusive item position within the requested visible turn.",
+      "oneOf": [
+        {
+          "properties": {
+            "itemId": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "item"
+              ],
+              "title": "ItemThreadItemsListAnchorType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "itemId",
+            "type"
+          ],
+          "title": "ItemThreadItemsListAnchor",
+          "type": "object"
+        }
+      ]
+    },
+    "ThreadItemsListCursor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/definitions/ThreadItemsListAnchor"
+        }
+      ],
+      "description": "Starting position for an item-history page."
+    },
     "ThreadItemsListParams": {
       "properties": {
         "cursor": {
-          "description": "Opaque cursor to pass to the next call to continue after the last item.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadItemsListCursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Opaque continuation cursor or an exclusive item anchor in the requested visible turn. An item anchor requires a non-empty `turnId`; ascending (the default) returns items after it, and descending returns items before it. Continue with the returned string cursor."
         },
         "limit": {
           "description": "Optional item page size.",
@@ -5592,6 +5759,13 @@
         "outputSchema": {
           "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
         },
+        "parentTurnId": {
+          "description": "ID of the turn that caused this new turn to start.\n\nSet this when starting work on behalf of another turn, such as delegated work in a different thread. Leave unset for work started directly by the user. Ignored when this request adds input to an active turn.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "personality": {
           "anyOf": [
             {
@@ -5602,6 +5776,13 @@
             }
           ],
           "description": "@deprecated `friendly` and `pragmatic` no longer select a style. Changing this does not rewrite the thread's existing instructions."
+        },
+        "rootTurnId": {
+          "description": "ID of the first turn in the chain of work that led to this new turn.\n\nWhen setting `parentTurnId`, set this to the parent turn's `rootTurnId` when known. This keeps descendant work attributed to the original turn. If omitted, the new turn becomes its own root. Ignored when this request adds input to an active turn.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "sandboxPolicy": {
           "anyOf": [
@@ -6286,6 +6467,30 @@
         "params"
       ],
       "title": "Thread/attachment/listRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/attachmentOwner/list"
+          ],
+          "title": "Thread/attachmentOwner/listRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadAttachmentOwnerListParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/attachmentOwner/listRequest",
       "type": "object"
     },
     {

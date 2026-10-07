@@ -2,6 +2,7 @@
 mod bwrap;
 mod denial;
 pub mod landlock;
+mod linux_pid_namespace;
 mod manager;
 pub mod policy_transforms;
 #[cfg(target_os = "macos")]
@@ -14,6 +15,8 @@ mod windows;
 mod windows_mxc;
 
 #[cfg(target_os = "linux")]
+pub use bwrap::find_pre_sandbox_executable_in_path;
+#[cfg(target_os = "linux")]
 pub use bwrap::find_system_bwrap_in_path;
 #[cfg(target_os = "linux")]
 pub use bwrap::system_bwrap_warning;
@@ -23,6 +26,7 @@ pub use codex_mxc_sandbox::run_main as run_windows_mxc_main;
 pub use codex_windows_sandbox::WindowsSandboxProxySettingsMode;
 pub use denial::is_likely_executor_managed_sandbox_denied;
 pub use denial::is_likely_sandbox_denied;
+pub use linux_pid_namespace::LinuxSandboxPidNamespace;
 pub use manager::SandboxCommand;
 pub use manager::SandboxDirectSpawnTransformRequest;
 pub use manager::SandboxExecRequest;
@@ -57,6 +61,7 @@ use codex_protocol::error::CodexErr;
 #[cfg(not(target_os = "linux"))]
 pub fn system_bwrap_warning(
     _permission_profile: &codex_protocol::models::PermissionProfile,
+    _sandbox_policy_cwd: &std::path::Path,
 ) -> Option<String> {
     None
 }

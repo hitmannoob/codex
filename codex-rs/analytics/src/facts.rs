@@ -18,6 +18,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 pub use codex_protocol::error::CodexErrKind;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -32,6 +33,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_utils_path_uri::PathUri;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -206,6 +208,7 @@ pub struct TurnResolvedConfigFact {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub guardian_v2_enabled: bool,
+    pub multi_agent_version: codex_protocol::protocol::MultiAgentVersion,
     pub sandbox_network_access: bool,
     pub collaboration_mode: ModeKind,
     pub personality: Option<Personality>,
@@ -251,6 +254,7 @@ pub struct TurnProfile {
     pub after_last_sampling_ms: u64,
     pub sampling_request_count: u32,
     pub sampling_retry_count: u32,
+    pub tools_change_count: u32,
 }
 
 #[derive(Clone)]
@@ -280,6 +284,7 @@ impl TurnCodexErrorFact {
 pub(crate) struct TurnCodexError {
     pub(crate) kind: CodexErrKind,
     pub(crate) http_status_code: Option<u16>,
+    pub(crate) usage_limit_window_minutes: Option<u16>,
 }
 
 impl TurnCodexError {
@@ -287,6 +292,10 @@ impl TurnCodexError {
         Self {
             kind: error.into(),
             http_status_code: error.http_status_code_value(),
+            usage_limit_window_minutes: match error.details() {
+                CodexErrorDetails::UsageLimitReached(error) => error.limit_window_minutes,
+                _ => None,
+            },
         }
     }
 }
@@ -379,7 +388,7 @@ pub struct SkillInvocation {
 #[derive(Clone, Debug)]
 pub enum SkillInvocationLocation {
     Host {
-        path: PathBuf,
+        path: PathUri,
         scope: SkillScope,
     },
     Resource {
@@ -436,6 +445,7 @@ pub struct SubAgentThreadStartedInput {
     pub ephemeral: bool,
     pub thread_source: Option<ThreadSource>,
     pub subagent_source: SubAgentSource,
+    pub initialization_mode: ThreadInitializationMode,
     pub created_at: u64,
 }
 
@@ -498,6 +508,7 @@ pub struct CodexCompactionEvent {
     pub status: CompactionStatus,
     pub codex_error_kind: Option<CodexErrKind>,
     pub codex_error_http_status_code: Option<u16>,
+    pub usage_limit_window_minutes: Option<u16>,
     pub active_context_tokens_before: i64,
     pub active_context_tokens_after: i64,
     pub retained_image_count: Option<usize>,

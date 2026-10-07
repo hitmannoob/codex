@@ -12,6 +12,7 @@ use crate::agent::types::SpawnAgentForkMode;
 use crate::agent::types::SpawnAgentOptions;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v1;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolSpec;
 
 #[derive(Default)]
@@ -108,31 +109,46 @@ async fn handle_spawn_agent(
     .await
     .map_err(FunctionCallError::RespondToModel)?;
     let config = prepared.config;
-    let result = Box::pin(session.services.agent_control.spawn(SpawnRequest {
-        caller: session.thread_id,
-        config,
-        input: AgentInput::UserInput(input_items),
-        source: thread_spawn_source(
-            session.thread_id,
-            &turn.session_source,
-            child_depth,
-            prepared.role_name.as_deref(),
-            /*task_name*/ None,
-        )?,
-        options: SpawnAgentOptions {
-            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
-            fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
-            parent_thread_id: Some(session.thread_id),
-            parent_turn_id: Some(turn.sub_id.clone()),
-            root_turn_id: turn.turn_metadata_state.root_turn_id(),
-            turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
-            environments: Some(step_context.environments.to_selections()),
-            multi_agent_v2_usage_hints: None,
-            cyber_access_program: turn.cyber_access_program,
-        },
-    }))
-    .await
-    .map_err(collab_spawn_error);
+    let fork_mode = args.fork_context.then_some(SpawnAgentForkMode::FullHistory);
+    let result = session
+        .services
+        .agent_control
+        .spawn(SpawnRequest {
+            caller: session.thread_id,
+            config,
+            input: AgentInput::UserInput(input_items),
+            source: thread_spawn_source(
+                session.thread_id,
+                &turn.session_source,
+                child_depth,
+                prepared.role_name.as_deref(),
+                /*task_name*/ None,
+            )?,
+            options: SpawnAgentOptions {
+                fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+                fork_mode: fork_mode.clone(),
+                parent_thread_id: Some(session.thread_id),
+                parent_turn_id: Some(turn.sub_id.clone()),
+                root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
+                environments: Some(step_context.environments.clone()),
+                multi_agent_v2_usage_hints: None,
+                cyber_access_program: turn.cyber_access_program,
+            },
+        })
+        .await
+        .map_err(|err| {
+            record_collab_spawn_failure(
+                &turn.session_telemetry,
+                turn.config.apps_mcp_product_sku.as_deref(),
+                &err,
+                &call_id,
+                &turn.sub_id,
+                fork_mode.as_ref(),
+                MultiAgentVersion::V1,
+            );
+            collab_spawn_error(err)
+        });
     let (new_thread_id, status) = match &result {
         Ok((spawned_agent, _)) => (Some(spawned_agent.thread_id), spawned_agent.status.clone()),
         Err(_) => (None, AgentStatus::NotFound),

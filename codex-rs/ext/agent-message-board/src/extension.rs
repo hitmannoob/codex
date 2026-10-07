@@ -5,7 +5,7 @@
 //! Tool namespaces follow the host's configuration at runtime startup.
 
 use crate::AgentMessageBoard;
-use crate::message_board_tools;
+use crate::tools::message_board_tools_with_descriptions;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
@@ -19,12 +19,17 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::openai_models::MultiAgentToolMessages;
 use codex_tools::ToolCall;
 use codex_tools::ToolExecutor;
 use futures::future::BoxFuture;
 use std::sync::Arc;
 
-type BoardFactory<C> = dyn Fn(&C, SessionId, ThreadId) -> BoxFuture<'static, Result<Option<Arc<dyn AgentMessageBoard>>>>
+type BoardFactory<C> = dyn for<'a> Fn(
+        &'a ThreadStartInput<'_, C>,
+        SessionId,
+        ThreadId,
+    ) -> BoxFuture<'a, Result<Option<Arc<dyn AgentMessageBoard>>>>
     + Send
     + Sync;
 type NamespaceResolver<C> = dyn Fn(&C) -> Option<String> + Send + Sync;
@@ -54,7 +59,7 @@ impl<C: Sync> ThreadLifecycleContributor<C> for BoardExtension<C> {
                     ThreadId::from_string(input.thread_store.level_id()).map_err(|_| {
                         CodexErr::InvalidRequest("invalid board caller identity".into())
                     })?;
-                if let Some(board) = (self.open)(input.config, tree, caller).await? {
+                if let Some(board) = (self.open)(&input, tree, caller).await? {
                     if board.identity() != tree {
                         return Err(CodexErr::InvalidRequest(
                             "message-board factory returned another tree".into(),
@@ -89,15 +94,36 @@ impl<C: Sync> ToolContributor for BoardExtension<C> {
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        self.tools_with_descriptions(thread_store, /*tool_messages*/ None)
+    }
+
+    fn tools_for_step(
+        &self,
+        _session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        step_store: &ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        let tool_messages = step_store.get::<MultiAgentToolMessages>();
+        self.tools_with_descriptions(thread_store, tool_messages.as_deref())
+    }
+}
+
+impl<C> BoardExtension<C> {
+    fn tools_with_descriptions(
+        &self,
+        thread_store: &ExtensionData,
+        tool_messages: Option<&MultiAgentToolMessages>,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         thread_store
             .get::<Binding>()
             .map_or_else(Vec::new, |binding| {
-                message_board_tools(
+                message_board_tools_with_descriptions(
                     binding.board.clone(),
                     binding.caller,
                     binding.path.clone(),
                     binding.namespace.as_deref(),
                     self.namespace_description,
+                    tool_messages,
                 )
             })
     }
@@ -107,16 +133,17 @@ impl<C: Sync> ToolContributor for BoardExtension<C> {
 /// a local or remote backend, or returns None when disabled. Configuration is
 /// read at runtime startup, including resume; no board is created by installation.
 /// The host supplies its shared namespace description and resolves the namespace
-/// name from the runtime's startup configuration.
+/// name from the runtime's startup configuration. The factory may retain its
+/// backend in the existing thread store for other extension contributions.
 pub fn install<C: Sync + 'static>(
     registry: &mut ExtensionRegistryBuilder<C>,
     namespace_description: &'static str,
     tool_namespace: impl Fn(&C) -> Option<String> + Send + Sync + 'static,
-    open: impl Fn(
-        &C,
+    open: impl for<'a> Fn(
+        &'a ThreadStartInput<'_, C>,
         SessionId,
         ThreadId,
-    ) -> BoxFuture<'static, Result<Option<Arc<dyn AgentMessageBoard>>>>
+    ) -> BoxFuture<'a, Result<Option<Arc<dyn AgentMessageBoard>>>>
     + Send
     + Sync
     + 'static,

@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::function_tool::FunctionCallError;
+use crate::function_tool::OrCancelToolExt;
 use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
@@ -54,6 +55,11 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// The handler observes its cancellation token and must finish before dispatch is aborted.
+    fn finishes_on_cancellation(&self) -> bool {
+        false
+    }
+
     /// Whether this built-in control tool needs a structured tool-call event.
     fn is_builtin_control_tool(&self) -> bool {
         false
@@ -64,14 +70,24 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         None
     }
 
-    /// Returns lazily cached Code Mode definitions owned by this runtime.
-    fn cached_code_mode_definitions(&self) -> Option<&[codex_code_mode::ToolDefinition]> {
+    /// Returns lazily cached, augmented Code Mode definitions owned by this runtime.
+    /// Input and output schemas must be cleared after rendering their declarations.
+    fn cached_code_mode_definitions(
+        &self,
+        _code_mode_input_schema_max_bytes: Option<usize>,
+    ) -> Option<&[codex_code_mode::ToolDefinition]> {
         None
     }
 
     /// Returns a readiness wait for this exact tool before taking the execution gate.
     fn wait_until_ready<'a>(&'a self, _session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
         None
+    }
+
+    /// True for MCP/app and client-supplied dynamic tools.
+    /// A built-in stays false even if a client's tool has the same name.
+    fn is_third_party_tool(&self) -> bool {
+        false
     }
 
     /// Returns the owning server only for MCP-backed tool runtimes.
@@ -430,6 +446,13 @@ impl ToolRegistry {
         self.tools.values_mut()
     }
 
+    /// Returns configured MCP server names and their registered callable namespaces.
+    pub(crate) fn mcp_namespaces(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tools.iter().filter_map(|(name, tool)| {
+            Some((tool.runtime.mcp_server_name()?, name.namespace.as_deref()?))
+        })
+    }
+
     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
         let mut namespaces = BTreeMap::<String, String>::new();
         for (name, tool) in &self.tools {
@@ -518,17 +541,31 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        let cancellation_token = invocation.cancellation_token.clone();
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
-        let otel = invocation.step_context.session_telemetry.clone();
+        let otel = invocation
+            .step_context
+            .session_telemetry
+            .clone()
+            .with_product_sku(invocation.turn.config.apps_mcp_product_sku.as_deref());
         // TODO(anp): Reconcile these tags with TurnEnvironment::sandbox_context
         // instead of reporting the thread-wide backend for environment-scoped tools.
         let sandbox_tags = invocation.turn.turn_metadata_state.sandbox_tags;
 
         {
-            let mut active = invocation.session.active_turn.lock().await;
+            let mut active = invocation
+                .session
+                .active_turn
+                .lock()
+                .or_cancel_tool(&cancellation_token)
+                .await?;
             if let Some(active_turn) = active.as_mut() {
-                let mut turn_state = active_turn.turn_state.lock().await;
+                let mut turn_state = active_turn
+                    .turn_state
+                    .lock()
+                    .or_cancel_tool(&cancellation_token)
+                    .await?;
                 turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
             }
         }
@@ -593,7 +630,8 @@ impl ToolRegistry {
                 &pre_tool_use_payload.tool_name,
                 &pre_tool_use_payload.tool_input,
             )
-            .await
+            .or_cancel_tool(&cancellation_token)
+            .await?
             {
                 PreToolUseHookResult::Blocked(message) => {
                     if tool.is_builtin_control_tool() {
@@ -640,7 +678,9 @@ impl ToolRegistry {
         }
 
         if tool.mcp_server_name().is_none() {
-            notify_tool_start(&invocation, /*mcp_tool*/ None).await;
+            notify_tool_start(&invocation, /*mcp_tool*/ None)
+                .or_cancel_tool(&cancellation_token)
+                .await?;
         }
         let mut control_tool_analytics = tool
             .is_builtin_control_tool()
@@ -711,7 +751,8 @@ impl ToolRegistry {
                     post_tool_use_payload.tool_input,
                     post_tool_use_payload.tool_response,
                 )
-                .await,
+                .or_cancel_tool(&cancellation_token)
+                .await?,
             )
         } else {
             None
@@ -722,11 +763,17 @@ impl ToolRegistry {
                 &invocation.turn,
                 outcome.additional_contexts.clone(),
             )
-            .await;
+            .or_cancel_tool(&cancellation_token)
+            .await?;
         }
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
         let lifecycle_outcome = match &result {
+            _ if tool.finishes_on_cancellation()
+                && invocation.cancellation_token.is_cancelled() =>
+            {
+                ToolCallOutcome::Aborted
+            }
             Ok(_) => ToolCallOutcome::Completed { success },
             Err(_) => ToolCallOutcome::Failed {
                 handler_executed: true,
@@ -802,12 +849,7 @@ async fn handle_any_tool(
         result: output,
         post_tool_use_payload,
     };
-    // Capture confirmed delivery before any further await, including post-tool hooks.
-    if let Some(call_state) = call_state
-        && let Some(text) = result.delivered_assistant_message()
-    {
-        let _ = call_state.delivered_assistant_message.set(text);
-    }
+    super::user_messaging::capture_delivery(&result, call_state);
     if result.result.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context
     {
@@ -816,7 +858,8 @@ async fn handle_any_tool(
             invocation.session.thread_id,
             "tool_output",
         )
-        .await;
+        .or_cancel_tool(&invocation.cancellation_token)
+        .await?;
     }
     Ok(result)
 }

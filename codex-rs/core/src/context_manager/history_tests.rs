@@ -1,8 +1,10 @@
 use super::*;
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
 use crate::context::UserInstructions;
+use crate::context::world_state::SectionTransition;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
+use crate::context::world_state::WorldStateUpdateContent;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_history::CodexHarnessMetadata;
@@ -112,6 +114,13 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
     }
 }
 
+fn root_history() -> ContextManager {
+    ContextManager::for_session(
+        &SessionSource::Cli,
+        &ManagedFeatures::from(codex_features::Features::with_defaults()),
+    )
+}
+
 fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
     let mut h = ContextManager::new();
     // Use a generous but fixed token budget; tests only rely on truncation
@@ -122,6 +131,56 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
 
 fn raw_items(history: &ContextManager) -> Vec<ResponseItem> {
     history.raw_items().cloned().collect()
+}
+
+#[test]
+fn delivered_assistant_context_invalidates_reviews_without_changing_authorization() {
+    let revisions = |history: &ContextManager| {
+        let snapshot = history.conversation_history_snapshot();
+        (
+            snapshot.guardian_review_context_revision(),
+            snapshot.user_message_revision(),
+        )
+    };
+    let mut history = create_history_with_items(vec![user_msg("Yes.")]);
+    let before_delivery = history.conversation_history_snapshot();
+    let authorization = before_delivery.user_message_revision();
+    let event = RetainedContextEvent::DeliveredAssistantMessage {
+        message: codex_history::RetainedUserMessage {
+            origin: codex_history::UserInputOrigin::User,
+            turn_id: "turn".to_owned(),
+            message_id: Some("send".to_owned()),
+            text: "Deploy publicly?".to_owned(),
+            complete: true,
+            phase: None,
+        },
+        acceptance_order: history.reserve_input_order(),
+    };
+    assert!(history.record_retained_context(&event));
+    let delivered_revision = revisions(&history).0;
+    assert_ne!(
+        before_delivery.guardian_review_context_revision(),
+        delivered_revision
+    );
+    assert!(!history.record_retained_context(&event));
+    assert_eq!(revisions(&history), (delivered_revision, authorization));
+    let mut resumed = ContextManager::new();
+    resumed.restore_retained_context(Some(history.retained_context()));
+    assert_ne!(revisions(&resumed).0, delivered_revision);
+
+    let answer = RetainedContextEvent::VerifiedAnswer {
+        answer: codex_history::VerifiedAnswer {
+            turn_id: "turn".to_owned(),
+            call_id: "ask".to_owned(),
+            questions: vec![codex_history::VerifiedQuestionAnswer {
+                question: "Run tests?".to_owned(),
+                answer: "Yes.".to_owned(),
+            }],
+        },
+        acceptance_order: Some(history.reserve_input_order()),
+    };
+    assert!(history.record_retained_context(&answer));
+    assert_eq!(revisions(&history), (delivered_revision, authorization + 1));
 }
 
 #[test]
@@ -170,10 +229,7 @@ fn conversation_history_snapshot_binds_review_mode_and_hash_to_the_latest_item(
             ..Default::default()
         }),
     };
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Cli,
-    );
+    let mut history = root_history();
     history.replace_annotated(vec![checkpoint.clone()]);
     history.restore_review_context(
         /*retained_context*/ None,
@@ -249,11 +305,15 @@ fn conversation_history_snapshot_binds_review_mode_and_hash_to_the_latest_item(
         "text": "Only publish to a private repository.", "complete": true
     }]
 }); "retained instructions")]
+#[test_case(serde_json::json!({
+    "verified_answers": [], "incomplete": false, "next_order": 1,
+    "assistant_messages": [{
+        "turn_id": "turn", "message_id": "question",
+        "text": "May I publish to the private repository?", "complete": true
+    }]
+}); "retained assistant context")]
 fn checkpoint_retained_evidence_survives_legacy_review(saved_context: serde_json::Value) {
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Cli,
-    );
+    let mut history = root_history();
     history.replace_annotated(vec![ResponseItemEnvelope::new(
         serde_json::from_value(serde_json::json!({
             "type": "compaction", "id": "unknown", "encrypted_content": "opaque checkpoint"
@@ -265,9 +325,9 @@ fn checkpoint_retained_evidence_survives_legacy_review(saved_context: serde_json
     for (checkpoint, expected_mode) in [
         (None, GuardianContextMode::ThreadOwned),
         (
-            Some(GuardianHistoryCheckpoint(vec![assistant_msg(
-                "Original transcript",
-            )])),
+            Some(GuardianHistoryCheckpoint(vec![
+                assistant_msg("Original transcript").into(),
+            ])),
             GuardianContextMode::Legacy,
         ),
     ] {
@@ -288,11 +348,8 @@ fn checkpoint_retained_evidence_survives_legacy_review(saved_context: serde_json
 }
 
 #[test]
-fn checkpoint_replayed_instructions_keep_legacy_review_when_the_source_survives() {
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Cli,
-    );
+fn checkpoint_replayed_messages_keep_legacy_review_when_the_source_survives() {
+    let mut history = root_history();
     history.replace_annotated(vec![ResponseItemEnvelope::new(
         serde_json::from_value(serde_json::json!({
             "type": "compaction", "id": "unknown", "encrypted_content": "opaque checkpoint"
@@ -304,7 +361,10 @@ fn checkpoint_replayed_instructions_keep_legacy_review_when_the_source_survives(
         /*reviewer_compaction_hash*/ None,
     );
     history.record_items(
-        &[user_input_text_msg("Only publish privately.")],
+        &[
+            user_input_text_msg("Only publish privately."),
+            assistant_msg("May I publish to the private repository?"),
+        ],
         TruncationPolicy::Bytes(10_000),
     );
     let retained = history.retained_context().clone();
@@ -319,6 +379,120 @@ fn checkpoint_replayed_instructions_keep_legacy_review_when_the_source_survives(
         GuardianContextMode::Legacy,
     );
     assert_eq!(history.retained_context(), &retained);
+}
+
+#[test_case(None; "no retained checkpoint")]
+#[test_case(Some(serde_json::json!({
+    "verified_answers": [], "incomplete": false
+})); "legacy retained checkpoint without instructions")]
+fn plaintext_checkpoint_without_backup_preserves_root_instructions(
+    saved_context: Option<serde_json::Value>,
+) {
+    let instruction = serde_json::from_value(serde_json::json!({
+        "type": "message", "id": "original-restriction", "role": "user",
+        "content": [{"type": "input_text", "text": "Only publish privately."}]
+    }))
+    .expect("old instruction without ordering metadata");
+    let saved_context: Option<RetainedContext> =
+        saved_context.map(|value| serde_json::from_value(value).expect("legacy retained context"));
+    let mut history = root_history();
+    history.replace(vec![instruction]);
+    history.restore_review_context(
+        saved_context.as_ref(),
+        /*checkpoint*/ None,
+        Some("reviewer"),
+    );
+
+    // Compaction removes the only plaintext copy. Resume must keep it available
+    // to worker authorization without adding it back to the reviewer's model window.
+    let compacted = vec![ResponseItemEnvelope {
+        item: serde_json::from_value(serde_json::json!({
+            "type": "compaction", "id": "new-checkpoint", "encrypted_content": "opaque"
+        }))
+        .expect("new checkpoint"),
+        metadata: Some(CodexHarnessMetadata {
+            compaction_model_hash: Some("reviewer".to_owned()),
+            ..Default::default()
+        }),
+    }];
+    history.replace_compacted(compacted.clone(), Some("reviewer"));
+    let mut resumed = root_history();
+    resumed.replace_annotated(compacted.clone());
+    resumed.restore_review_context(
+        Some(history.retained_context()),
+        history.guardian_history_checkpoint().as_ref(),
+        Some("reviewer"),
+    );
+    let snapshot = resumed.conversation_history_snapshot();
+    assert_eq!(
+        (
+            GuardianContextMode::from_history(snapshot.as_ref()),
+            snapshot.review_items().cloned().collect::<Vec<_>>(),
+            resumed
+                .legacy_user_messages()
+                .map(|message| message.text)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            GuardianContextMode::ThreadOwned,
+            compacted
+                .into_iter()
+                .map(|envelope| envelope.item)
+                .collect::<Vec<_>>(),
+            vec!["Only publish privately.".to_owned()],
+        ),
+    );
+}
+
+#[test]
+fn legacy_checkpoint_rollback_keeps_answers_before_a_same_turn_steer() {
+    let mut checkpoint: codex_history::CompactedItem = serde_json::from_value(serde_json::json!({
+        "message": "Legacy checkpoint without accepted-input metadata.",
+        "replacement_history": [
+            {"type": "message", "id": "initial", "role": "user",
+             "content": [{"type": "input_text", "text": "Inspect the release."}]},
+            {"type": "function_call", "call_id": "before", "name": "request_user_input", "arguments": "{}"},
+            {"type": "message", "id": "steer", "role": "user",
+             "content": [{"type": "input_text", "text": "Inspect the README too."}]},
+            {"type": "function_call", "call_id": "after", "name": "request_user_input", "arguments": "{}"}
+        ],
+        "retained_context": {"verified_answers": [
+            {"turn_id": "shared-turn", "call_id": "before",
+             "questions": [{"question": "Publish?", "answer": "Only privately."}]},
+            {"turn_id": "shared-turn", "call_id": "after",
+             "questions": [{"question": "Publish the README?", "answer": "Never."}]}
+        ], "incomplete": false}
+    })).expect("legacy checkpoint");
+    for envelope in checkpoint.replacement_history.as_mut().unwrap() {
+        envelope.item.set_turn_id_if_missing("shared-turn");
+    }
+    let expected = checkpoint
+        .retained_context
+        .as_ref()
+        .unwrap()
+        .verified_answers()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut history = root_history();
+    history.replace_annotated(checkpoint.replacement_history.take().unwrap());
+    history.restore_review_context(
+        checkpoint.retained_context.as_ref(),
+        /*checkpoint*/ None,
+        /*reviewer_compaction_hash*/ None,
+    );
+    // The old checkpoint has no acceptance order; use the surviving source calls
+    // to remove only the answer belonging to each rolled-back input.
+    for remaining in [1, 0] {
+        history.drop_last_n_user_turns(/*num_turns*/ 1);
+        assert_eq!(
+            history
+                .retained_context()
+                .verified_answers()
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected[..remaining],
+        );
+    }
 }
 
 #[test]
@@ -352,10 +526,6 @@ impl WorldStateSection for TestWorldStateSection {
     const ID: &'static str = "test";
     type Snapshot = bool;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        true
-    }
-
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "user" && UserInstructions::matches_text(text)
     }
@@ -363,18 +533,23 @@ impl WorldStateSection for TestWorldStateSection {
     fn render_diff(
         &self,
         previous: crate::context::world_state::PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn crate::context::ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = true;
         let text = match previous {
-            crate::context::world_state::PreviousSectionState::Known(true) => return None,
+            crate::context::world_state::PreviousSectionState::Known(true) => {
+                return (None, Vec::new());
+            }
             crate::context::world_state::PreviousSectionState::Unknown => "unknown",
             crate::context::world_state::PreviousSectionState::Absent
             | crate::context::world_state::PreviousSectionState::Known(false) => "test",
         };
-        Some(Box::new(UserInstructions {
-            directory: None,
-            text: text.to_string(),
-        })
-            as Box<dyn crate::context::ContextualUserFragment>)
+        (
+            Some(current),
+            vec![WorldStateUpdate::fragment(UserInstructions {
+                directory: None,
+                text: text.to_string(),
+            })],
+        )
     }
 }
 
@@ -403,6 +578,48 @@ fn world_state_baseline_deduplicates_until_history_is_replaced() {
 }
 
 #[test]
+fn world_state_transitions_persist_changed_state_and_skip_unchanged_state() {
+    use codex_extension_api::PreviousWorldStateSection;
+    use codex_extension_api::RenderedWorldStateFragment;
+    use codex_extension_api::WorldStateSectionContribution;
+
+    let world_state = |value: &'static str| {
+        let mut state = WorldState::default();
+        state.add_extension_section(WorldStateSectionContribution::new("test", move |previous| {
+            let snapshot = serde_json::json!(value);
+            if matches!(previous, PreviousWorldStateSection::Known(previous) if previous == &snapshot) {
+                return (None, None);
+            }
+            (Some(snapshot), Some(RenderedWorldStateFragment::new(
+                "developer", ("<test>", "</test>"), value,
+            )))
+        }));
+        state
+    };
+    let mut history = ContextManager::new();
+    let (_, full) = history.update_world_state(&world_state("before"));
+    let full = full.expect("full checkpoint");
+    assert!(full.full);
+
+    let (snapshot, fragments, patch) = history.render_step_world_state(&world_state("after"));
+    let WorldStateUpdateContent::Fragment(fragment) = &fragments[0].content else {
+        panic!("expected a text fragment");
+    };
+    assert_eq!(fragment.body(), "after");
+    let patch = patch.expect("changed snapshot must be persisted");
+    assert!(!patch.full);
+    let mut replayed = WorldStateSnapshot::from(&full.state);
+    replayed.apply_merge_patch(&patch.state);
+    assert_eq!(snapshot, replayed);
+    history.set_world_state_baseline(snapshot.clone());
+
+    let (unchanged, fragments, patch) = history.render_step_world_state(&world_state("after"));
+    assert_eq!(unchanged, snapshot);
+    assert!(fragments.is_empty());
+    assert_eq!(patch, None);
+}
+
+#[test]
 fn world_state_reconciles_matching_legacy_history_once() {
     let item = crate::context::ContextualUserFragment::into(UserInstructions {
         directory: None,
@@ -412,12 +629,17 @@ fn world_state_reconciles_matching_legacy_history_once() {
     let mut world_state = WorldState::default();
     world_state.add_section(TestWorldStateSection);
 
-    let (fragments, rollout_item) = history.update_world_state(&world_state);
+    let (snapshot, fragments, rollout_item) = history.render_step_world_state(&world_state);
+    history.set_world_state_baseline(snapshot);
     assert_eq!(
         vec!["\n\n<INSTRUCTIONS>\nunknown\n"],
         fragments
             .into_iter()
-            .map(|fragment| fragment.body())
+            .map(|update| match update.content {
+                WorldStateUpdateContent::Fragment(fragment) => fragment.body(),
+                WorldStateUpdateContent::Item(item) =>
+                    panic!("expected a text fragment, got {item:?}"),
+            })
             .collect::<Vec<_>>()
     );
     assert!(rollout_item.is_some_and(|item| item.full));
@@ -492,26 +714,20 @@ fn reference_context_item() -> TurnContextItem {
                 .join("reference-cwd"),
         )
         .expect("absolute reference cwd"),
-        workspace_roots: None,
-        current_date: Some("2026-03-23".to_string()),
-        timezone: Some("America/Los_Angeles".to_string()),
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
         active_permission_profile: None,
-        network: None,
         file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
         comp_hash: None,
-        personality: None,
         collaboration_mode: None,
         multi_agent_version: None,
-        multi_agent_mode: None,
         realtime_active: Some(false),
         cyber_access_program: None,
         effort: None,
-        summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
     }
 }
 
@@ -601,7 +817,7 @@ fn retains_only_harness_authored_configuration_updates() {
     };
 
     history.record_annotated_items(
-        &[
+        &mut [
             ResponseItemEnvelope::new(update.clone()),
             ResponseItemEnvelope {
                 item: update,
@@ -657,7 +873,7 @@ fn drop_last_n_user_turns_removes_post_input_configuration_update_with_its_turn(
         updates[1].clone(),
         ResponseItemEnvelope::new(assistant_msg("removed answer")),
     ]);
-    history.record_annotated_items(&items, TruncationPolicy::Tokens(10_000));
+    history.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
 
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
@@ -793,7 +1009,7 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
     expected_token_limit: usize,
     expected_truncation: bool,
 ) {
-    let envelope = ResponseItemEnvelope {
+    let mut envelope = ResponseItemEnvelope {
         item: ResponseItem::FunctionCallOutput {
             id: None,
             call_id: Some("call-1".to_string()),
@@ -812,7 +1028,10 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
     };
     let mut history = ContextManager::new();
 
-    history.record_annotated_items(std::slice::from_ref(&envelope), TruncationPolicy::Tokens(4));
+    history.record_annotated_items(
+        std::slice::from_mut(&mut envelope),
+        TruncationPolicy::Tokens(4),
+    );
 
     assert_eq!(history.annotated_items().len(), 1);
     assert_eq!(history.annotated_items()[0].metadata, envelope.metadata);
@@ -1274,6 +1493,24 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
 }
 
 #[test]
+fn estimate_token_count_counts_recorded_base_instructions_once() {
+    use crate::context::ContextualUserFragment;
+
+    let base = BaseInstructions {
+        text: "base instructions ".repeat(100),
+        provenance: None,
+    };
+    let item =
+        ContextualUserFragment::into(crate::context::BaseInstructionsFragment(base.text.clone()));
+    let expected = estimate_item_token_count(&item);
+    let history = create_history_with_items(vec![item]);
+    assert_eq!(
+        history.estimate_token_count_with_base_instructions(&base),
+        Some(expected)
+    );
+}
+
+#[test]
 fn remove_first_item_removes_matching_output_for_function_call() {
     let items = vec![
         ResponseItem::FunctionCall {
@@ -1408,10 +1645,7 @@ fn drop_last_n_user_turns_preserves_prefix() {
 
     // A steered message shares its source turn, but rollback must keep the earlier
     // instruction and answer as complete evidence, including after the next compaction.
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Exec,
-    );
+    let mut history = root_history();
     let mut expected = None;
     for (id, text) in [
         ("restriction", "Never publish publicly."),
@@ -1457,6 +1691,38 @@ fn drop_last_n_user_turns_preserves_prefix() {
     // Rollback removes evidence, but does not reuse its arrival-order sequence numbers.
     expected["next_order"] = serde_json::json!(3);
     assert_eq!(serde_json::to_value(retained).unwrap(), expected);
+}
+
+#[test]
+fn rollback_removes_assistant_sources_recorded_ahead_of_queued_input() {
+    let mut history = root_history();
+    let original = user_msg("Staging only.");
+    let mut items = [
+        (original.clone(), 0),
+        (assistant_msg("Deploy staging?"), 2),
+        (user_msg("Also run tests."), 1),
+    ]
+    .map(|(item, order)| ResponseItemEnvelope {
+        item,
+        metadata: Some(CodexHarnessMetadata {
+            user_input_order: Some(order),
+            ..Default::default()
+        }),
+    });
+    history.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+    assert_eq!(raw_items(&history), vec![original]);
+    assert!(
+        !history
+            .retained_context()
+            .ordered_entries()
+            .any(|(_, entry)| {
+                matches!(
+                    entry,
+                    codex_history::RetainedContextEntry::AssistantMessage(_)
+                )
+            })
+    );
 }
 
 #[test]

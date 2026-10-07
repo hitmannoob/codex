@@ -1,5 +1,16 @@
 //! Model-history and persisted-rollout domain types.
 
+mod heartbeat;
+pub use heartbeat::HEARTBEAT_CONTENT_KIND;
+pub use heartbeat::Heartbeat;
+pub use heartbeat::UserInputOrigin;
+
+mod compaction_resume_metadata;
+pub use codex_protocol::turn_input::TurnAttribution;
+pub use compaction_resume_metadata::CompactionResumeMetadata;
+pub use compaction_resume_metadata::PreviousTurnSettings;
+pub use compaction_resume_metadata::resume_multi_agent_version;
+
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
 
@@ -51,6 +62,26 @@ pub struct ResponseItemEnvelope {
 ///
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
+    /// Complete retained records actually delivered by this Guardian message. Host-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardian_sources: Vec<RetainedSource>,
+
+    /// Completed sync reviews delivered by this complete Guardian message. Host-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardian_review_ids: Vec<codex_protocol::ResponseItemId>,
+
+    /// This complete message delivered the meaning of retained source-order labels.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guardian_source_order_guidance: bool,
+
+    /// Section-scoped omission delivery proof; None means unknown, not complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_retained_omissions: Option<GuardianRetainedOmissions>,
+
+    /// Original retained evidence represented by this exact history item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_source: Option<RetainedSource>,
+
     /// Whether a developer message was supplied by an app-server client.
     #[serde(default)]
     pub client_authored: bool,
@@ -77,11 +108,17 @@ pub struct CodexHarnessMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model_hash: Option<String>,
 
-    /// Thread acceptance order, independent of when queued user input reaches model history.
+    /// User acceptance or assistant delivery order, independent of queued input recording.
+    /// The serialized name is retained for compatibility with saved history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input_order: Option<u64>,
 
-    /// Copied parent context stays model-visible but must not become child-local authorization.
+    /// Output generated for compaction is not an original user-visible assistant message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compaction_output: bool,
+
+    /// Copied parent user/assistant context must not become child-local authorization.
+    /// The serialized field name is retained for compatibility with saved history.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_user_message: bool,
 
@@ -108,9 +145,25 @@ where
     Ok(Some(serde_json::from_value(value).unwrap_or_else(|_| {
         McpAttribution {
             status: McpAttributionStatus::AttributionError,
+            error_reason: None,
             sources: Vec::new(),
         }
     })))
+}
+
+impl CodexHarnessMetadata {
+    /// Shortened messages no longer prove complete instruction or review delivery.
+    pub fn mark_retained_sources_incomplete(&mut self) {
+        self.guardian_review_ids.clear();
+        self.guardian_source_order_guidance = false;
+        self.guardian_retained_omissions = None;
+        if let Some(source) = &mut self.retained_source {
+            source.complete = false;
+        }
+        for source in &mut self.guardian_sources {
+            source.complete = false;
+        }
+    }
 }
 
 impl ResponseItemEnvelope {
@@ -219,12 +272,16 @@ pub use retained_context::RetainedContextEntry;
 pub use retained_context::RetainedContextEvent;
 pub use retained_context::RetainedContextOrder;
 pub use retained_context::RetainedInputSource;
+pub use retained_context::RetainedSource;
+pub use retained_context::RetainedSourceId;
+pub use retained_context::RetainedSourceRole;
 pub use retained_context::RetainedUserMessage;
 pub use retained_context::VerifiedAnswer;
 pub use retained_context::VerifiedQuestionAnswer;
 mod rollout_payload;
 
 pub use guardian_history::GuardianHistoryCheckpoint;
+pub use guardian_history::GuardianRetainedOmissions;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactedItem {
@@ -244,6 +301,9 @@ pub struct CompactedItem {
     /// `thread/resume` can restore token usage totals from this field without scanning arbitrarily
     /// far past the compaction.
     pub latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Resume metadata for values not represented by the companion rollout records.
+    /// Presence distinguishes explicitly persisted values from legacy fallback reconstruction.
+    pub resume_metadata: Option<CompactionResumeMetadata>,
 }
 
 impl Serialize for CompactedItem {
@@ -311,6 +371,9 @@ pub struct RolloutLine {
 pub struct ResumedHistory {
     pub conversation_id: ThreadId,
     pub history: Arc<Vec<RolloutItem>>,
+    /// Store-issued revision for this exact snapshot; clear it when modifying the history.
+    #[serde(skip)]
+    pub history_revision: Option<String>,
     pub rollout_path: Option<PathBuf>,
 }
 
@@ -358,31 +421,6 @@ impl InitialHistory {
             Self::New | Self::Cleared => &[],
             Self::Resumed(resumed) => &resumed.history,
             Self::Forked(items) => items,
-        }
-    }
-
-    pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
-        match self {
-            Self::New | Self::Cleared => None,
-            Self::Resumed(resumed) => Some(
-                resumed
-                    .history
-                    .iter()
-                    .filter_map(|item| match item {
-                        RolloutItem::EventMsg(event) => Some(event.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            Self::Forked(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        RolloutItem::EventMsg(event) => Some(event.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
         }
     }
 
@@ -534,22 +572,7 @@ fn multi_agent_version_from_items(
         _ => None,
     });
 
-    session_meta_version.or_else(|| {
-        items.iter().rev().find_map(|item| match item {
-            RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TokenUsageRecord(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::RetainedContext(_)
-            | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::RealtimeItem(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
-    })
+    session_meta_version.or_else(|| items.iter().rev().find_map(resume_multi_agent_version))
 }
 
 #[cfg(test)]

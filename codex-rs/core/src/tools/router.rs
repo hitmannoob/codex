@@ -148,8 +148,6 @@ impl ToolRouter {
     }
 
     /// The normalized nested identities chosen after exclusions and collisions.
-    // Consumed by the follow-up cell-origin migration.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn code_mode_tool_names(&self) -> &BTreeMap<String, ToolName> {
         &self.code_mode_tool_names
     }
@@ -173,7 +171,7 @@ impl ToolRouter {
     }
 
     // Answers if the tool plan lets the model invoke the tool directly, through code mode, or deferred tool search.
-    fn exposes_tool(&self, name: &ToolName) -> bool {
+    pub(crate) fn exposes_tool(&self, name: &ToolName) -> bool {
         let name = name.clone().with_default_namespace();
         if self
             .code_mode_tool_names
@@ -208,6 +206,10 @@ impl ToolRouter {
 
     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
         self.registry.deferred_tool_namespaces()
+    }
+
+    pub(crate) fn mcp_namespaces(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.registry.mcp_namespaces()
     }
 
     #[cfg(test)]

@@ -14,7 +14,7 @@ use codex_core::config::ConfigLoadOptions;
 use codex_core::config::bootstrap_auth_config;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
@@ -23,6 +23,7 @@ use codex_login::is_workload_identity_selected;
 use codex_login::read_codex_access_token_from_env;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use codex_websocket_auth::WebsocketAuthArgs;
 
 use crate::exec_server_auth;
 use crate::exec_server_telemetry;
@@ -42,6 +43,21 @@ pub(super) struct ExecServerCommand {
     )]
     pub(super) strict_config: bool,
 
+    /// Linux PID namespace: isolate (default) or inherit. Inherit allows signals to
+    /// other same-UID processes; enable only when provisioning a dedicated environment.
+    #[arg(long, value_name = "MODE", default_value = "isolate", global = true)]
+    linux_sandbox_pid_namespace: codex_sandboxing::LinuxSandboxPidNamespace,
+
+    /// Allow permitted private IP destinations to use the configured upstream proxy.
+    /// If no valid upstream proxy applies to the request protocol, connect directly.
+    /// Loopback stays local. This flag does not require upstream routing.
+    #[arg(
+        long,
+        env = "CODEX_EXEC_SERVER_PROXY_PRIVATE_IPS_VIA_UPSTREAM",
+        global = true
+    )]
+    proxy_private_ips_via_upstream: bool,
+
     /// Maximum number of requests to process concurrently on each connection.
     #[arg(
         long = "concurrent-requests",
@@ -57,6 +73,9 @@ pub(super) struct ExecServerCommand {
         conflicts_with = "exec_server_remote"
     )]
     listen: Option<String>,
+
+    #[command(flatten)]
+    websocket_auth: WebsocketAuthArgs,
 
     /// Register this exec-server as a remote environment using the given base URL.
     #[arg(
@@ -158,14 +177,29 @@ impl ExecServerCommand {
     ) -> anyhow::Result<()> {
         let strict_config = self.strict_config;
         self.validate_remote_transport()?;
+        let websocket_auth = self.websocket_auth.try_into_settings()?;
+        if websocket_auth.config.is_some() && (self.remote.is_some() || self.command.is_some()) {
+            anyhow::bail!("WebSocket listener auth cannot be used with --remote or forward");
+        }
         let codex_self_exe = arg0_paths
             .codex_self_exe
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Codex executable path is not configured"))?;
-        let runtime_paths = ExecServerRuntimePaths::new(
+        let mut runtime_paths = ExecServerRuntimeOptions::new(
             codex_self_exe,
             arg0_paths.codex_linux_sandbox_exe.clone(),
-        )?;
+        )?
+        .with_linux_sandbox_pid_namespace(self.linux_sandbox_pid_namespace)
+        .with_proxy_private_ips_via_upstream(self.proxy_private_ips_via_upstream);
+        // Config loading below owns error handling (non-strict stdio can proceed
+        // without config). Never retain other startup flags in the executor.
+        if let Ok(overrides) = root_config_overrides.parse_overrides() {
+            let cli_flags = codex_config::build_cli_overrides_layer(&overrides);
+            runtime_paths.prefer_mxc = cli_flags
+                .get("features")
+                .and_then(|features| features.get("prefer_mxc"))
+                .and_then(toml::Value::as_bool);
+        }
         if let Some(base_url) = self.remote.take() {
             let environment_id = self.environment_id.take().ok_or_else(|| {
                 anyhow::anyhow!("--environment-id is required when --remote is set")
@@ -179,11 +213,14 @@ impl ExecServerCommand {
             let direct_transport = self.remote_transport == ExecServerRemoteTransport::Direct;
             let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
             let auth_provider = if self.aws_sigv4 {
-                exec_server_auth::aws_sigv4_auth_provider(codex_aws_auth::AwsAuthConfig {
-                    profile: self.aws_profile,
-                    region: self.aws_region,
-                    service: self.aws_service,
-                })
+                exec_server_auth::aws_sigv4_auth_provider(
+                    codex_aws_auth::AwsAuthConfig {
+                        profile: self.aws_profile,
+                        region: self.aws_region,
+                        service: self.aws_service,
+                    },
+                    config.http_client_factory(),
+                )
                 .await?
             } else {
                 load_exec_server_remote_auth_provider(
@@ -288,6 +325,7 @@ impl ExecServerCommand {
                     telemetry,
                     http_client_factory,
                     self.request_dispatch_mode,
+                    websocket_auth,
                 ),
                 exec_server_telemetry::ParentLifetime::Independent,
                 exec_server_telemetry::ShutdownBehavior::Immediate,

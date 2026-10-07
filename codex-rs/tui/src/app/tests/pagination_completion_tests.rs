@@ -19,7 +19,7 @@ use pretty_assertions::assert_eq;
 
 pub(super) async fn completed_history_app(
     names: &[&str],
-) -> Result<(App, tempfile::TempDir, ThreadId)> {
+) -> Result<(Box<App>, tempfile::TempDir, ThreadId)> {
     let mut app = make_test_app().await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
@@ -57,6 +57,7 @@ pub(super) async fn completed_history_app(
         let turn_id = format!("turn-{index}");
         let finished = completed_at.timestamp() + index as i64 * 60;
         let mut events = vec![EventMsg::TurnStarted(TurnStartedEvent {
+            turn_attribution: None,
             turn_id: turn_id.clone(),
             root_turn_id: None,
             trace_id: None,
@@ -94,6 +95,7 @@ pub(super) async fn completed_history_app(
             })
         }));
         events.push(EventMsg::TurnComplete(TurnCompleteEvent {
+            root_turn_id: None,
             turn_id,
             last_agent_message: Some(format!("{name} answer")),
             error: None,

@@ -7,14 +7,17 @@ mod coverage;
 mod decision;
 mod feedback;
 mod input_budget;
+mod permissions;
 mod prompt;
 pub(crate) use input_budget::PendingReviewContext;
 pub(crate) use input_budget::check_pending as check_pending_guardian_input;
 pub(crate) use input_budget::finalize as finalize_guardian_input;
+pub(crate) use input_budget::should_compact as should_compact_guardian_input;
+pub(crate) use permissions::for_tool as tool_permission_context;
 mod request_budget;
 pub(crate) use request_budget::ExhaustedReviewBudget;
-pub(crate) use request_budget::check_prompt as check_guardian_prompt_budget;
 pub(crate) use request_budget::observe as observe_guardian_request;
+pub(crate) use request_budget::prepare_prompt as prepare_guardian_prompt;
 mod review;
 mod review_session;
 mod reviewer_config;
@@ -76,7 +79,7 @@ pub(crate) const GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS: usize = 6_000;
 /// Background network approvals and Unix interception use the active task's resolved settings.
 /// Startup reviewer prewarming intentionally uses turn-only inputs because it has no issuing step.
 ///
-/// MCP elicitation reviews continue to use turn-only inputs.
+/// MCP elicitations use their live invocation's issuing step when available, otherwise turn inputs.
 #[derive(Clone)]
 pub(crate) struct GuardianReviewContext {
     /// The latest response ID received in this turn when review was requested.

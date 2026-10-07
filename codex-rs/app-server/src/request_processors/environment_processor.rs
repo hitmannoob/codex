@@ -1,4 +1,6 @@
 use super::*;
+use codex_config::ScopedSkillsConfig;
+use codex_exec_server::RemoteEnvironmentOptions;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -17,17 +19,46 @@ impl EnvironmentRequestProcessor {
         &self,
         params: EnvironmentAddParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let skills = ScopedSkillsConfig {
+            required: params
+                .skills
+                .and_then(|skills| skills.required)
+                .unwrap_or_default(),
+        };
         let added = match (params.exec_server_url, params.noise_registry) {
-            (Some(exec_server_url), None) => self.environment_manager.upsert_environment(
-                params.environment_id,
-                exec_server_url,
-                params.connect_timeout_ms.map(Duration::from_millis),
-            ),
+            (Some(exec_server_url), None) => {
+                let options = RemoteEnvironmentOptions {
+                    exec_server_url,
+                    connect_timeout: params.connect_timeout_ms.map(Duration::from_millis),
+                    http_headers: params
+                        .auth_bearer_token
+                        .into_iter()
+                        .map(|token| {
+                            (
+                                "Authorization".to_string(),
+                                format!("Bearer {}", token.into_inner()),
+                            )
+                        })
+                        .collect(),
+                };
+                self.environment_manager.upsert_environment_with_options(
+                    params.environment_id,
+                    options,
+                    skills,
+                )
+            }
+            // The registry issues each connection's credentials itself.
+            (None, Some(_)) if params.auth_bearer_token.is_some() => {
+                return Err(invalid_request(
+                    "authBearerToken applies only to execServerUrl",
+                ));
+            }
             (None, Some(registry)) => self.environment_manager.upsert_noise_environment(
                 params.environment_id,
                 registry.url,
                 registry.environment_id,
                 registry.auth_token,
+                skills,
             ),
             _ => {
                 return Err(invalid_request(

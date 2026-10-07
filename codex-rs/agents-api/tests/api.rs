@@ -55,6 +55,7 @@ async fn backend(home: &Path) -> anyhow::Result<AppServerClient> {
             client_name: "codex_agents_api_test".into(),
             client_version: "0.0.0".into(),
             experimental_api: true,
+            embedded_network_policy: Default::default(),
             mcp_server_openai_form_elicitation: false,
             opt_out_notification_methods: vec![],
             channel_capacity: 128,
